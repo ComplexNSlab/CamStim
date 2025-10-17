@@ -1,0 +1,23 @@
+#Experiment config file
+# Basic file for parameters of the experiment
+# All delays in seconds
+name: "LocallySparseNoise"
+
+
+# the delay before starting and after ending the experiment (black square comes on at half of this time)
+experiment_delay: 2
+# stim on length
+stim_length: 1.0
+
+# this experiment has no ITI, every time the stimulus changes at 'stim_length' intervals
+
+#Parameters of visual stimuli
+n_iterations: 1
+n_repeats: 20
+probe_size: [10, 10]
+min_distance: 30
+sign: 'ON-OFF'
+
+
+
+trial_params_columns: ["trial_number", "clock_time", "orientation", "sf", "size", "stim_info_str"]

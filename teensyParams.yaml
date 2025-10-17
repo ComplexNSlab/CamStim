@@ -1,0 +1,36 @@
+# UART Command Format (send via serial terminal or script):
+
+#     1. "S <fps> <led_pulse_us> <offset_us> <camera_start_mode> <ttls_start_mode> <dual_mode> <Timestamping_TTL_Pulse_us>""
+
+#     Parameters:
+#       <fps>                = Pulse frequency for LED toggling (Hz)
+#       <led_pulse_us>       = Pulse width for each LED (in microseconds)
+#       <offset_us>          = Delay (in µs) from LED ON to when TTL is sent to Task Teensy
+#       <camera_start_mode>  = 0 = Camera TTL starts with external TTL (pin 9)
+#                              1 = Camera TTL starts when 'X' command is received
+#       <ttls_start_mode>    = 0 = Task Teensy TTLs start with external TTL (pin 9)
+#                              1 = Task Teensy TTLs start immediately after 'S'
+#                              2 = Task Teensy TTLs start when 'X' command is received
+#       <dual_mode>          = 0 = TTL to Task Teensy fires only on LED 1
+#                              1 = TTL fires on both LED 1 and LED 2 pulses
+#       <TTL_Width>          = Pulse width for timestamping TTLs in microseconds (after the offset time)
+  
+#     2. "X" = starts the camera TTL (held high), if not set to an external TTL start. Can also be configured to start timesamping (see above)
+
+#     3. "Q" = Stop all TTLs and reset session
+
+# Example S for testing: S 50 18000 1000 0 0 1 1000
+
+# See WF_Teensy40_V3.ino for script.
+
+
+port: "COM7" # port the teensy board is connected to via USB
+BAUD: 115200 # leave this 
+
+F_LED: 30 # LED frequency in Hz
+E_LED: 31667 # Duration of LED pulse in microseconds
+O_CAM: 1000 # Delay from LED ON to TTL to Task Teensy (microseconds)
+cam_start_mode: 0 # 0 = external TTL, 1 = 'X' command
+ttls_start_mode: 0 # 0 = external TTL, 1 = immediate ('S'), 2 = 'X'
+dual_mode: 1 # 0 = TTL on LED1 only, 1 = TTLs on both LEDs
+ttl_width: 1000 # V4: Default duration for timestamping TTLs (microseconds)

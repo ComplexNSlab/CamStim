@@ -1,0 +1,45 @@
+
+# 2photon experimental procedure for the texture project
+
+!!!!!!Do not forget to take a picture of the surface of the brain at 1X and then 1.5X!!!!!!
+1. Perform a texture experiment
+2. Perform a orientation tuning experiment
+3. Perform a RF mapping experiment
+
+# first activate the environment 
+conda activate simple-vs
+
+Command for the texture experiment:
+python Y:\Personal\Federico\GitRepos\simple-vs\run_TEX_experiment.py
+
+Command for the orientation experiment:
+python Y:\Personal\Federico\GitRepos\simple-vs\run_DYN_experiment.py
+
+Command for the receptive field experiment (V1 4 degree patches):
+python Y:\Personal\Federico\GitRepos\simple-vs\run_LSN4_experiment.py
+
+Command for the receptive field experiment (LM and PM 8 degree patches):
+python Y:\Personal\Federico\GitRepos\simple-vs\run_LSN8_experiment.py 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### WIDE-FIELD STUFF
+
+# WF setup
+python U:\Personal\Federico\GitRepos\simple-vs\wf_main.py
+
+
+## 2p debugging
+python Y:\Personal\Federico\GitRepos\simple-vs\main.py

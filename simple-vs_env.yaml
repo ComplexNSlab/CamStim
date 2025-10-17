@@ -1,0 +1,17 @@
+name: simple-vs
+channels:
+- conda-forge
+dependencies:
+- python=3.6
+- psychopy
+- pip
+- pip:
+  - psychtoolbox
+  - pygame
+  - pyo
+  - pyparallel; platform_system != "Windows"
+  - SoundFile; platform_system == "Windows"
+  - websocket_client
+  - numpy
+  - pyyaml
+  - nidaqmx; platform_system == "Windows"
