@@ -1,0 +1,27 @@
+#Experiment config file
+# Basic file for parameters of the experiment
+# All delays in seconds
+name: "SimpleOrientationTuning"
+
+n_trials: 60
+
+# the delay before starting and after ending the experiment (black square comes on at half of this time)
+experiment_delay: 10
+stim_length: 1
+inter_trial_delay: 2
+
+#Parameters of visual stimuli
+
+# 4 moving orientation gratings
+grating_sf: 0.08
+grating_position: [0, 0]
+#grating_position: [30, 0] # 30 works for a small right shift in the FOV
+grating_orientations: [0, 90]
+give_blanks: True
+grating_phases_range: [0, 1]
+grating_phase_temporal_frequency: 1 # in Hz
+grating_size: [120, 120]
+grating_mask: 'circle'
+
+
+trial_params_columns: ["trial_number", "clock_time", "orientation", "stim_info_str"]

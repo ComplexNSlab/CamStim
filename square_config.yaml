@@ -1,0 +1,10 @@
+#Experiment config file
+# Basic file for parameters of the experiment
+# All delays in seconds
+name: "SquareExperiment"
+
+
+square_position: [0, 0]
+square_size: [180, 180]
+
+

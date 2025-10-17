@@ -1,0 +1,39 @@
+#Experiment config file
+# Basic file for parameters of the experiment
+# All delays in seconds
+name: "ElevationMapper"
+
+n_trials_per_stimulus: 3
+
+# the delay before starting and after ending the experiment (black square comes on at half of this time)
+experiment_delay: 1
+# stim on length
+#stim_length: 1
+
+stim_duration: 3 # duration the stimulus will be shown for (the number of full cycles will be stim_duration*temporal_frequency)
+temporal_frequency: 2 # frequency (in Hz) of the flickering
+
+# stim off length (iti)
+inter_trial_delay: 1.0
+
+# Texture to used on the stimulus as a grating (aka carrier). (sin, sqr, saw, tri) (sine, square, saw, triangle)
+tex: 'sin'
+
+#Parameters of visual stimuli
+
+# As per our original rationale:
+# spatial frequency, orientation, stimulus size
+# phase alternates at the half period of the stimulus
+grating_positions: [[0, 0], [0, 20], [0, -20]]
+grating_orientations: [90]
+grating_sfs: [0.07]
+grating_size: [12 , 110] # [width, length] degrees
+
+
+give_blanks: False
+
+
+grating_mask: None
+
+
+trial_params_columns: ["trial_number", "clock_time", "orientation", "sf", "location-azi", "location-alt", "null"]

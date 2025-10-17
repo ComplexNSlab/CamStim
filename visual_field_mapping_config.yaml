@@ -1,0 +1,34 @@
+#Experiment config file
+# Basic file for parameters of the experiment
+# All delays in seconds
+name: "SandCProtocol"
+
+#n_trials: 18
+n_repeats: 6
+
+# the delay before starting and after ending the experiment (black square comes on at half of this time)
+experiment_delay: 10
+# stim on length
+stim_length: 5
+
+# stim off length (iti)
+inter_trial_delay: 2
+
+#Parameters of visual stimuli
+
+# As per our original rationale:
+# spatial frequency, orientation, stimulus size
+# phase alternates at the half period of the stimulus
+grating_position: [[40, 15], [0, 15], [-40, 15], [40, -15], [0, -15], [-40, -15]] 
+grating_orientations: [0]
+grating_sfs: [0.5]
+grating_sizes: [[20, 20]] 
+
+
+give_blanks: False
+
+
+grating_mask: 'gauss'
+
+
+trial_params_columns: ["trial_number", "clock_time", "position", "orientation", "sf", "size", "stim_info_str"]

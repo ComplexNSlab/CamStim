@@ -1,0 +1,19 @@
+[33ma097461[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mlive-speckle[m[33m)[m HEAD@{0}: rebase (finish): returning to refs/heads/live-speckle
+[33ma097461[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mlive-speckle[m[33m)[m HEAD@{1}: rebase (continue): All changes made throughout summer 2025 by Marina.
+[33m7d389df[m HEAD@{2}: rebase (continue): Fixed a crash that would happen when quitting the app while the ROI was being plotted.
+[33m2aae8ce[m HEAD@{3}: rebase (continue): Added feature to plot a ROI, must switch to live-speckle branch.
+[33m5844694[m HEAD@{4}: rebase (continue): Added ability to do simple clipping but needs to be turned into parameters.
+[33m4ecfeb8[m HEAD@{5}: rebase (continue): Testing a different method for live speckle imaging.
+[33md2c68c8[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m HEAD@{6}: pull origin main --rebase (start): checkout d2c68c8b5147cc24e3635bb4c538868cbf5292a3
+[33me63139e[m HEAD@{7}: checkout: moving from live-speckle to live-speckle
+[33me63139e[m HEAD@{8}: commit: All changes made throughout summer 2025 by Marina.
+[33m7e322a6[m[33m ([m[1;31morigin/live-speckle[m[33m)[m HEAD@{9}: commit: Fixed a crash that would happen when quitting the app while the ROI was being plotted.
+[33ma2521b2[m HEAD@{10}: commit: Added feature to plot a ROI, must switch to live-speckle branch.
+[33m2b71f9c[m HEAD@{11}: pull: Fast-forward
+[33m9efe80e[m HEAD@{12}: commit: Testing a different method for live speckle imaging.
+[33m6bb6502[m[33m ([m[1;32mmain[m[33m)[m HEAD@{13}: checkout: moving from main to live-speckle
+[33m6bb6502[m[33m ([m[1;32mmain[m[33m)[m HEAD@{14}: commit: Modified README
+[33m19470ef[m HEAD@{15}: commit: Added the ability to have a configuration fileto setup the camera parameters. This will help if you have different kinds of experiments to avoid having to edit parameters every time. Some other general refactoring of the code to improve readability.
+[33m0dc003d[m HEAD@{16}: pull: Fast-forward
+[33m2bc8abf[m HEAD@{17}: commit: First version. Need to implement yaml config file features.
+[33m59fed45[m HEAD@{18}: clone: from https://github.com/ubcbraincircuits/fb-cam.git
