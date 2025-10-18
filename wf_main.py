@@ -1,13 +1,11 @@
-""" Simple example of digital output
-
-    This example outputs the values of data on line 0 to 7
-"""
 import sys
 import numpy as np
 import socket
 import json
+import threading
 
-# sys.stdout.reconfigure(line_buffering=True)
+sys.stdout.reconfigure(line_buffering=True)
+sys.stdin.reconfigure(line_buffering=True)
 
 from time import sleep, time
 from datetime import datetime
@@ -29,30 +27,15 @@ from ElevationMapperExperiment import ElevationMapperExperiment
 from RetinotopyExperiment import RetinotopyExperiment
 from visual_field_mapping import protocolTest
 
-
+current_exp = None
+teensy_board = None
+current_exp_thread = None
+stop_flag = False
+experiment_running = False
 bool_DEBUG = True
 
-# def create_experiment_name():
-#     #this if doesn't work 
-#     if not bool_DEBUG:
-#         experiment_id = input("Enter Experiment name: (MXXXX_XXXXX_XX): ")
-#         mouse_id = input("Enter mouse ID (XXXXX): ")
-#     else:
-#         # when debugging we make a fake tag 
-#         # now = datetime.now()
-#         # date = str(now).split(" ")[0].replace("-", "")[2:]
-#         # experiment_id = "M{}_123411_FB".format(date)
-#         # mouse_id = "12345"
 
-#         experiment_id = input("Enter Experiment name: (MXXXX_XXXXX_XX): ")
-#         mouse_id = input("Enter mouse ID (XXXXX): ")
-
-#     return experiment_id, mouse_id
-
-
-
-def execute_exp(exp_name, experiment_id, mouse_id):
-    exp_types = {"Locally Sparse Noise": LocallySparseNoiseExperiment,
+exp_types = {"Locally Sparse Noise": LocallySparseNoiseExperiment,
             "Dynamic Battery": DynamicBatteryExperiment,
             "Simple Orientation": SimpleOrientationExperiment,
             "Elevation Mapper": ElevationMapperExperiment,
@@ -63,6 +46,51 @@ def execute_exp(exp_name, experiment_id, mouse_id):
             "Square": SquareExperiment,
             "Visual Field Mapping": protocolTest}
 
+
+def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
+    global current_exp, teensy_board, experiment_running, current_exp_thread
+
+    try:
+        config_file = f"{exp_name.replace(' ', '_').lower()}_config.yaml"
+
+        exp_type = exp_types.get(exp_name)
+        if exp_type is None:
+            print("Experiment name error.")
+            return
+
+
+        data_aq = PCODAQ(experiment_id, bool_DEBUG)
+        teensy_board = Teensy(experiment_id, bool_DEBUG, "teensyParams.yaml")
+        print("Teensy started.")
+
+        current_exp = exp_type(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "save_settings_config.yaml", config_file, debug=bool_DEBUG)
+
+        current_exp.load_experiment_config()
+        current_exp.start_data_acquisition()
+        teensy_board.start_teensy()
+
+        experiment_running = True
+        print("STARTING experiment...")
+
+        current_exp.run_experiment()
+        experiment_running = False
+
+        # threading.Thread(target=listen_for_stop, args=(teensy_board, exp), daemon=True).start()
+
+        print("ALL DONE with experiment {}! ".format(experiment_id))
+
+    except Exception as e:
+        print(f"Error in experiment: {e}")
+        experiment_running = False
+
+    # return teensy_board, exp
+
+
+def execute_exp(exp_name, experiment_id, mouse_id):
+    data_aq = PCODAQ(experiment_id, bool_DEBUG)
+    teensy_board = Teensy(experiment_id, bool_DEBUG, "teensyParams.yaml")
+    print("Teensy started.")
+
     config_file = f"{exp_name.replace(' ', '_').lower()}_config.yaml"
 
     exp_type = exp_types.get(exp_name)
@@ -70,31 +98,70 @@ def execute_exp(exp_name, experiment_id, mouse_id):
         print("Experiment name error.")
         return
 
-    data_aq = PCODAQ(experiment_id, bool_DEBUG)
-    teensy_board = Teensy(experiment_id, bool_DEBUG, "teensyParams.yaml")
-    print("Teensy started.")
-
     exp = exp_type(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "save_settings_config.yaml", config_file, debug=bool_DEBUG)
 
     exp.load_experiment_config()
     exp.start_data_acquisition()
     teensy_board.start_teensy()
-    print("STARTING expriment...")
 
-    exp.run_experiment()
-    teensy_board.stop_teensy()
-    exp.stop_data_acquisition()
+    experiment_running = True
+    print("STARTING experiment...")
+
+    current_exp.run_experiment()
+    experiment_running = False
+
+    threading.Thread(target=listen_for_stop, args=(teensy_board, exp), daemon=True).start()
+
     print("ALL DONE with experiment {}! ".format(experiment_id))
+
+    return teensy_board, exp
+
+
+def listen_for_stop(teensy_board, exp):
+    global stop_flag
+    for line in sys.stdin:
+        if line.strip().upper() == "STOP":
+            print("Received STOP command via subprocess.", flush=True)
+            stop_flag = True
+
+            # Stop Teensy if available
+            if teensy_board:
+                try:
+                    teensy_board.stop_teensy()
+                    print("Teensy stopped.", flush=True)
+                except Exception as e:
+                    print(f"Error stopping Teensy: {e}")
+
+            # Stop experiment if available
+            if exp:
+                try:
+                    if hasattr(exp, "stop_experiment"):
+                        exp.stop_experiment()
+                    if hasattr(exp, "stop_data_acquisition"):
+                        exp.stop_data_acquisition()
+                    exp.experiment_running = False
+                    print("Experiment stopped.", flush=True)
+                except Exception as e:
+                    print(f"Error stopping experiment: {e}")
+            break
 
 
 if __name__ == "__main__":
     try:
-
         if len(sys.argv) > 1:
             exp_name = sys.argv[1]
             experiment_id = sys.argv[2]
             mouse_id = sys.argv[3]
-            execute_exp(exp_name, experiment_id, mouse_id)
+            teensy_board, exp = execute_exp(exp_name, experiment_id, mouse_id)
+
+            while not stop_flag:
+                sleep(0.1)
+
+            if teensy_board:
+                teensy_board.stop_teensy()
+            if exp:
+                exp.stop_data_acquisition()
+                exp.stop_experiment()
 
         else:
             print("Error in receiving experiment inputs. Starting UDP trigger mode.")
@@ -103,9 +170,6 @@ if __name__ == "__main__":
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.bind((UDP_IP, UDP_PORT))
             print(f"Waiting for commands on {UDP_IP}:{UDP_PORT}")
-
-            current_exp = None
-            teensy_board = None
 
             while True:
                 data, address = sock.recvfrom(1024)
@@ -121,24 +185,35 @@ if __name__ == "__main__":
                 cmd = payload.get("cmd")
 
                 if cmd == "START":
+                    if experiment_running:
+                        print("Experiment already running. Ignoring START.")
+                        continue
+
                     print("Received START command.")
                     exp_name = payload["exp_name"]
                     experiment_id = payload["experiment_id"]
                     mouse_id = payload["mouse_id"]
-                    execute_exp(exp_name, experiment_id, mouse_id)
+
+                    current_exp_thread = threading.Thread(target=execute_exp_in_thread, args=(exp_name, experiment_id, mouse_id), daemon=True).start()
+
+                    # teensy_board, current_exp = execute_exp(exp_name, experiment_id, mouse_id)
 
                 elif cmd == "STOP":
                     print("Received STOP command.")
-                    try:
-                        if current_exp and current_exp.experiment_running:
-                            current_exp.stop_data_acquisition()
-                            teensy_board.stop_teensy()
+                    if experiment_running and current_exp:
+                        try:
+                            current_exp_thread.stop_data_acquisition()
+                            if teensy_board:
+                                teensy_board.stop_teensy()
+                            experiment_running = False
                             print("Experiment stopped.")
-                        else:
-                            print("No active experiment.")
-                    except Exception as e:
-                        print(f"Error: {e}")
+                        except Exception as e:
+                            print(f"Error: {e}")
+                    else:
+                        print("No active experiment.")
 
+                else:
+                    print(f"Unknown command: {cmd}.")
 
         # experiment_id, mouse_id = create_experiment_name()
         # change the line below to use PCO or NIS (2p)
@@ -147,11 +222,11 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print("Received CTRL-C event")
-        if exp.experiment_running:
+        if current_exp.experiment_running:
             # We need to run the stopping functions.
             pass
-        if exp.acquisition_running:
-            exp.stop_data_acquisition()
+        if current_exp.acquisition_running:
+            current_exp.stop_data_acquisition()
         try:
             teensy_board.stop_teensy()
         finally:

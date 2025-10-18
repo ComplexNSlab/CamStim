@@ -197,6 +197,7 @@ class App(object):
             print("Stopping stim via subprocess...")
             self.stim_progress.stdin.write("STOP\n")
             self.stim_progress.stdin.flush()
+            self.stim_progress = None
             print("Stim stopped.")
 
         elif self.stim_progress is True:
@@ -206,6 +207,7 @@ class App(object):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as send_sock:
                 send_sock.sendto(json.dumps(msg).encode(), (UDP_IP, UDP_PORT))
                 print(f"\nSent stop to visual stim at {UDP_IP}:{UDP_PORT}")
+            self.stim_progress = None
 
         else:
             print("Unable to stop properly.")
