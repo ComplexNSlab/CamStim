@@ -107,12 +107,13 @@ def execute_exp(exp_name, experiment_id, mouse_id):
     experiment_running = True
     print("STARTING experiment...")
 
-    current_exp.run_experiment()
-    experiment_running = False
-
     threading.Thread(target=listen_for_stop, args=(teensy_board, exp), daemon=True).start()
 
-    print("ALL DONE with experiment {}! ".format(experiment_id))
+    exp.run_experiment()
+    experiment_running = False
+
+    global stop_flag
+    stop_flag = True
 
     return teensy_board, exp
 
@@ -152,16 +153,20 @@ if __name__ == "__main__":
             exp_name = sys.argv[1]
             experiment_id = sys.argv[2]
             mouse_id = sys.argv[3]
-            teensy_board, exp = execute_exp(exp_name, experiment_id, mouse_id)
+            teensy_board, current_exp = execute_exp(exp_name, experiment_id, mouse_id)
 
             while not stop_flag:
                 sleep(0.1)
 
             if teensy_board:
                 teensy_board.stop_teensy()
-            if exp:
-                exp.stop_data_acquisition()
-                exp.stop_experiment()
+                print("Teensy stopped.")
+            if current_exp:
+                current_exp.stop_data_acquisition()
+                print("Data acquisition stopped.")
+                # exp.stop_experiment()
+
+            print("ALL DONE with experiment {}! ".format(experiment_id))
 
         else:
             print("Error in receiving experiment inputs. Starting UDP trigger mode.")
@@ -214,11 +219,7 @@ if __name__ == "__main__":
 
                 else:
                     print(f"Unknown command: {cmd}.")
-
-        # experiment_id, mouse_id = create_experiment_name()
-        # change the line below to use PCO or NIS (2p)
-        
-
+    
 
     except KeyboardInterrupt:
         print("Received CTRL-C event")

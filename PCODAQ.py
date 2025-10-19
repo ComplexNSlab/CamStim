@@ -18,17 +18,17 @@ class PCODAQ:
         self.experiment_id = experiment_id
         self.DEBUG = DEBUG
 
-        # # TODO make it a yaml settings
-        # self.ip_address_list = ["137.82.137.183"]
-        # if platform == "win32":
-        #     self.port = 1001
-        # else:
-        #     self.port = 10001
+        # TODO make it a yaml settings
+        self.ip_address_list = ["137.82.137.183"]
+        if platform == "win32":
+            self.port = 1001
+        else:
+            self.port = 10001
 
-        # # TODO make into a proper setting????
-        # self.sampling_rate = 4000
-        # self.sock = socket.socket(socket.AF_INET,
-        #                           socket.SOCK_DGRAM)
+        # TODO make into a proper setting????
+        self.sampling_rate = 4000
+        self.sock = socket.socket(socket.AF_INET,
+                                  socket.SOCK_DGRAM)
 
         # self.ni_log_filename = None
         # self.data = []
