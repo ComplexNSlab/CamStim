@@ -21,7 +21,7 @@ from tkinter import simpledialog
 import json
 ###
 
-CONFIG_FILE = 'config.yml'
+CONFIG_FILE = 'cam_config.yml'
 
 def load_camera_config(yaml_file_path):
     if Path(yaml_file_path).is_file():
@@ -91,6 +91,7 @@ class App(object):
 ###
         self.exp_thread = None
         self.stim_progress = None
+        self.logic_progress = None
         self.exp_list = {1: "Locally Sparse Noise", 
             2:"Dynamic Battery", 
             3: "Simple Orientation", 
@@ -149,9 +150,55 @@ class App(object):
         experiment_id = simpledialog.askstring("Experiment ID", "Enter experiment ID:")
         mouse_id = simpledialog.askstring("Mouse ID", "Enter mouse ID:")
 
-        method = simpledialog.askstring("Method", "Send inputs via 'subprocess' or 'udp'?")
+        method = simpledialog.askstring("Method", "Send inputs via 'subprocess (s)' or '(u)'?")
+
+        self.start_logic_analyzer(experiment_id, mouse_id)
 
         self.start_stim(exp_name, experiment_id, mouse_id, method)
+
+
+    def start_logic_analyzer(self, experiment_id, mouse_id):
+        if getattr(self, 'logic_progress', None):
+            print("Logic analyzer session currently running. Stopping...")
+            if hasattr(self.logic_progress, 'terminate'):
+                self.logic_progress.terminate()
+            self.stop_logic_analyzer()
+
+        print("Starting logic analyzer...")
+
+        self.logic_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/camstim/manage_sigrok.py", experiment_id, mouse_id],
+            stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True, cwd="C:/Data/logicAnalyzer_Recordings")
+        threading.Thread(target=self.track_logic, daemon=True).start()
+
+
+    def stop_logic_analyzer(self):
+        if getattr(self, 'logic_progress', None) is None:
+            print("No current logic analyzer session running.")
+            return
+
+        if isinstance(self.logic_progress, subprocess.Popen):
+            print("Stopping logic analyzer session...")
+            try:
+                # Check if process is still running before trying to write to stdin
+                if self.logic_progress.poll() is None:  # Process is still running
+                    self.logic_progress.stdin.write("STOP\n")
+                    self.logic_progress.stdin.flush()
+                    print("Sent STOP command to logic analyzer.")
+                else:
+                    print("Logic analyzer process has already finished.")
+            except OSError as e:
+                print(f"Error sending STOP command (process may have already finished): {e}")
+            finally:
+                self.logic_progress = None
+        else:
+            print("Unable to stop logic analyzer properly.")
+
+
+    def track_logic(self):
+        if isinstance(self.logic_progress, subprocess.Popen):
+            for line in self.logic_progress.stdout:
+                print(f"{line.strip()}")
+            # self.logic_progress.wait()
 
 
     def start_stim(self, exp_name, experiment_id, mouse_id, method):
@@ -163,14 +210,13 @@ class App(object):
 
         print(f"\nStarting {exp_name} with exp. ID {experiment_id} and mouse {mouse_id}...")
 
-
-        if method.lower() == 'subprocess':
-            self.stim_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/simple-vs/wf_main.py", exp_name, experiment_id, mouse_id],
+        if method.lower() == 's':
+            self.stim_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/camstim/wf_main.py", exp_name, experiment_id, mouse_id],
                 stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True)
             threading.Thread(target=self.track_stim, daemon=True).start()
             print("Started stim via subprocess.")
 
-        elif method.lower() == 'udp':
+        elif method.lower() == 'u':
             msg = {"cmd": "START", 
                 'exp_name': exp_name, 
                 "experiment_id": experiment_id, 
@@ -210,7 +256,7 @@ class App(object):
             self.stim_progress = None
 
         else:
-            print("Unable to stop properly.")
+            print("Unable to stop stim properly.")
 
         self.stim_progress = None
 
@@ -219,13 +265,15 @@ class App(object):
         if isinstance(self.stim_progress, subprocess.Popen):
             for line in self.stim_progress.stdout:
                 print(f"{line.strip()}")
-            self.stim_progress.wait()
-                # if "STARTING" in line:
-                #     print("Stim start detected, beginning to save frames...")
-                #     # self.saving = True
-                # elif "ALL DONE" in line:
-                #     print("Stim completed, stopping frame saving...")
-                #     # self.saving = False
+            # self.stim_progress.wait()
+            print("Stim finished.")
+            
+            # Only stop logic analyzer if it's still running
+            if (getattr(self, 'logic_progress', None) and 
+                isinstance(self.logic_progress, subprocess.Popen) and 
+                self.logic_progress.poll() is None):
+                print("Stopping logic analyzer after stim completion...")
+                self.stop_logic_analyzer()
 ###         
 
 
@@ -393,7 +441,9 @@ class App(object):
             elif pressed_key == ord('h'):
                 if getattr(self, 'stim_progress', None):
                     self.stop_stim()
+                    self.stop_logic_analyzer()
                     self.stim_progress = None
+                    self.logic_progress = None
                     
                 else:
                     print("No current experiment running.")
@@ -536,8 +586,8 @@ class App(object):
                 self.minI = np.percentile(frame[:], self.autoI)
                 self.maxI = np.percentile(frame[:], 100-self.autoI)
                 print("\n Changing dynamical range to: {}, {} pixel values. Percentiles: {}, {}".format(self.minI, self.maxI, self.autoI, 100-self.autoI))
-            # elif pressed_key == ord('h'):
-            #     self.print_keyboard_commands()
+            elif pressed_key == ord('h'):
+                self.print_keyboard_commands()
             elif pressed_key == ord('m'):
                 # initiate PWM signal of raspberry pi pico (not used for speckle)
                 self.send_command_and_wait_for_response('init_pwm()')
@@ -607,6 +657,7 @@ class App(object):
             "c -- switch camera mode to continuous capture\n" +\
             "s -- if in continuous capture, switches to hardware trigger mode (ready to save frames); \n if in hardware trigger mode, switches to continuous capture (save frames off)\n" +\
             "e -- enter experiment/stimulus parameters (make sure to hit 's' before this!)\n" +\
+            "i -- interrupt experiment (stop data acquistion, teensy, logic analyzer)\n" +\
             "g -- edit gain\n" +\
             "r -- draw ROI\n" +\
             "a -- display pixel intensity histogram for current frame\n" +\

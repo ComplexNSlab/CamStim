@@ -1,5 +1,5 @@
 # The ID of your experiment 
-EXPERIMENT: "SC_DW2_0801"
+EXPERIMENT: "1026Test"
 
 # Whether to use the live speckle feature
 USE_LIVE_SPECKLE: true
@@ -10,7 +10,7 @@ EXPOSURE_TIME: 15
 # Analog gain of the camera, try to keep as low as possible
 ANALOG_GAIN: 1
 # Where should the data be saved
-SAVE_DIR: 'C:\\Data\\WF'
+SAVE_DIR: 'C:\\Data\\WF_Recordings'
 
 # Whether the data should be binned during the experiment
 # raw data is huge (2048, 2048) images

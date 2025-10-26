@@ -8,7 +8,6 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stdin.reconfigure(line_buffering=True)
 
 from time import sleep, time
-from datetime import datetime
 
 # the imports below are no longer needed, since for now there is no need to support NIDAQMX anymore
 #from NISDAQ import NISDAQ
