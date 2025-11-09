@@ -63,7 +63,7 @@ class App(object):
         self.live_speck = config['USE_LIVE_SPECKLE']
         self.exposure = config['EXPOSURE_TIME'] # in ms
         self.analog_gain = config['ANALOG_GAIN'] 
-        self.save_dir = config['SAVE_DIR']
+        # self.save_dir = config['SAVE_DIR']
         self.filename = config['EXPERIMENT']
         self.bin_exp = config['BIN_EXP_LIVE']
         self.bin_size = config['BIN_SIZE']
@@ -84,11 +84,11 @@ class App(object):
         self.roi_plotter = ROIPlotter()
         self.plot_roi = False
 
+###
         self.histogram_open = False
         self.dFoF_open = False
         self.F0 = None
 
-###
         self.exp_thread = None
         self.stim_progress = None
         self.logic_progress = None
@@ -102,9 +102,13 @@ class App(object):
             8: "Texture FB-VGGMultiTime", 
             9: "Square", 
             10: "Visual Field Mapping"}
+
+        self.save_dir = None
+        self.save_dir_ready = False
+        self.save_file_handle = None
 ###
 
-        self.check_and_fix_existing_experiment()
+        # self.check_and_fix_existing_experiment()
 
         # To control the RPi pico that triggers the camera
         if config['PICO_SERIAL_PORT'] is not None:
@@ -148,6 +152,10 @@ class App(object):
                 print("\nInvalid input. Enter one of the listed experiment numbers:")
         
         experiment_id = simpledialog.askstring("Experiment ID", "Enter experiment ID:")
+
+        self.save_dir = f"C:\\\\Data\\{experiment_id}\\WF_Recordings"
+        self.save_dir_ready = True
+
         mouse_id = simpledialog.askstring("Mouse ID", "Enter mouse ID:")
 
         method = simpledialog.askstring("Method", "Send inputs via 'subprocess (s)' or '(u)'?")
@@ -288,7 +296,7 @@ class App(object):
         self.buffer_loop_reached = False
 
     def check_and_fix_existing_experiment(self):
-        if os.path.exists(os.path.join(self.save_dir, self.filename+'.bin')):
+        if self.save_dir and os.path.exists(os.path.join(self.save_dir, self.filename+'.bin')):
             print("WARNING!!! Experiment file already exists, modifying name to avoid overwriting.")
             self.filename += "1"
             
@@ -306,56 +314,75 @@ class App(object):
         return binned_frame
 
     def save_frames(self):
-        with open(os.path.join(self.save_dir, self.filename+'.bin'), 'ab') as f:  # Open a binary file for appending
-            while True:
-                if self.saving or not self.frame_queue.empty():
-                    # Process frames if available
-                    if not self.frame_queue.empty():
-                        frame_data, count, timestamp, sys_stamp = self.frame_queue.get()
-                        self.frame_timestamps.append(timestamp)
-                        self.sys_clock_timestamps.append(sys_stamp)
+        # with open(os.path.join(self.save_dir, self.filename+'.bin'), 'ab') as f:  # Open a binary file for appending
+        while True:
+            if self.saving or not self.frame_queue.empty():
 
-                        ###
-                        frame = np.frombuffer(frame_data, dtype=self.dtype).reshape((self.height, self.width))
-                        frame = cv2.flip(frame, 1)
-                        ###
-                        
-                        if self.bin_exp:
-                            frame = self.bin_frame(frame)
+                ###
+                if not self.save_dir_ready or self.save_dir is None:
+                    time.sleep(0.01)
+                    continue
 
-                        frame.tofile(f)
-                        f.flush()
+                if self.save_file_handle is None:
+                    file_path = os.path.join(self.save_dir, self.filename + '.bin')
+                    self.save_file_handle = open(file_path, 'ab')
+                ###
 
-                        self.frames_written += 1
-                    # Check if it's time to exit: quit is True and no frames left in the queue
-                    elif self.quit and self.frame_queue.empty():
-                        break
-                    else:
-                        # Optionally, sleep for a very short time to prevent high CPU usage
-                        time.sleep(0.005)
+                # Process frames if available
+                if not self.frame_queue.empty():
+                    frame_data, count, timestamp, sys_stamp = self.frame_queue.get()
+                    self.frame_timestamps.append(timestamp)
+                    self.sys_clock_timestamps.append(sys_stamp)
+
+                    frame = np.frombuffer(frame_data, dtype=self.dtype).reshape((self.height, self.width))
+                    frame = cv2.flip(frame, 1)
+
+                    if self.bin_exp:
+                        frame = self.bin_frame(frame)
+
+                    ###
+                    frame.tofile(self.save_file_handle)
+                    self.save_file_handle.flush()
+                    ###
+
+                    self.frames_written += 1
+                # Check if it's time to exit: quit is True and no frames left in the queue
+                elif self.quit and self.frame_queue.empty():
+                    break
                 else:
-                    if self.quit:
-                        break
+                    # Optionally, sleep for a very short time to prevent high CPU usage
                     time.sleep(0.005)
-        
-        # After processing all frames, save metadata
-        metadata = {
-            'num_frames': self.frames_written,
-            'frame_width': self.width if not self.bin_exp else self.width//self.bin_size,
-            'frame_height': self.height if not self.bin_exp else self.height//self.bin_size,
-            'data_type': self.dtype  if not self.bin_exp else 'uint16',
-            'frame_timestamps': self.frame_timestamps,
-            'sys_clock_timestamps': self.sys_clock_timestamps,
-            'frame_exposure': self.exposure,
-            'frame_gain': self.analog_gain,
-            'pwm_frequency': self.pwm_freq,
-            'pwm_duty': self.pwm_duty,
-            'binned_live': self.bin_exp,
-            'bin_size': self.bin_size,
-            'force_framerate': self.force_framerate,
-            'special_framerate': self.special_framerate
-        }
-        np.save(os.path.join(self.save_dir, '{}_metadata.npy'.format(self.filename)), metadata)
+            else:
+                if self.quit:
+                    break
+                time.sleep(0.005)
+
+        ###
+        if self.save_file_handle is not None:
+            self.save_file_handle.close()
+            self.save_file_handle = None
+
+        if self.frames_written > 0 and self.save_dir_ready:
+            # After processing all frames, save metadata
+            metadata = {
+                'num_frames': self.frames_written,
+                'frame_width': self.width if not self.bin_exp else self.width//self.bin_size,
+                'frame_height': self.height if not self.bin_exp else self.height//self.bin_size,
+                'data_type': self.dtype  if not self.bin_exp else 'uint16',
+                'frame_timestamps': self.frame_timestamps,
+                'sys_clock_timestamps': self.sys_clock_timestamps,
+                'frame_exposure': self.exposure,
+                'frame_gain': self.analog_gain,
+                'pwm_frequency': self.pwm_freq,
+                'pwm_duty': self.pwm_duty,
+                'binned_live': self.bin_exp,
+                'bin_size': self.bin_size,
+                'force_framerate': self.force_framerate,
+                'special_framerate': self.special_framerate
+            }
+            np.save(os.path.join(self.save_dir, '{}_metadata.npy'.format(self.filename)), metadata)
+
+        ###
 
     def display_frames(self):
         cv2.namedWindow("Live View")
