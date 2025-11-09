@@ -7,9 +7,7 @@ from pathlib import Path
 stop_flag = None
 LA = None
 
-sigrok_exe = 'C:/Program Files/sigrok/sigrok-cli/sigrok-cli.exe' 
-save_dir = Path('C:/Data/logicAnalyzer_Recordings').absolute()
-save_dir.mkdir(parents=True, exist_ok=True)  
+sigrok_exe = 'C:/Program Files/sigrok/sigrok-cli/sigrok-cli.exe'  
 
 def check_sigrok_environment(sigrok_exe):
     """Check what drivers and devices are available"""
@@ -73,6 +71,8 @@ def listen_for_stop(process):
 year, month, day = datetime.now().year, datetime.now().month, datetime.now().day
 date = f"{year}{month:02d}{day:02d}"
 experiment_id, mouse_id = sys.argv[1], sys.argv[2]
+save_dir = Path(f"C:\\\\Data\\{experiment_id}\\logicAnalyzer_Recordings").absolute()
+save_dir.mkdir(parents=True, exist_ok=True) 
 output_file = save_dir / f"{date}_{experiment_id}_{mouse_id}.sr"
 output_file = output_file.absolute()
 samplerate = "1MHz"
