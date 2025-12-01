@@ -39,14 +39,14 @@ def capture_sigrok_data(sigrok_exe, output_file, samplerate="1MHz", duration=30)
         f'--output-file={str(output_file)}',
     ]
     
-    print(f"Running command: {' '.join(cmd)}")
+    print(f"\nRunning command: {' '.join(cmd)}")
     
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return process
             
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"\nUnexpected error: {e}")
         return None
 
 
@@ -54,17 +54,17 @@ def listen_for_stop(process):
     global stop_flag
     for line in sys.stdin:
         if line.strip().upper() == "STOP":
-            print("Logic analyzer received STOP command.", flush=True)
+            print("\nLogic analyzer received STOP command.", flush=True)
             stop_flag = True
 
             if process and process.poll() is None:  # Only if still running
                 try:
                     process.terminate()
-                    print("Logic analyzer stopped early by user.", flush=True)
+                    print("\nLogic analyzer stopped early by user.", flush=True)
                 except Exception as e:
-                    print(f"Error stopping logic analyzer: {e}")
+                    print(f"\nError stopping logic analyzer: {e}")
             else:
-                print("Logic analyzer was already finished.", flush=True)
+                print("\nLogic analyzer was already finished.", flush=True)
             break
 
 
@@ -85,13 +85,13 @@ stop_thread = threading.Thread(target=listen_for_stop, args=(process,), daemon=T
 stdout, stderr = process.communicate()
 
 if stop_flag:
-    print(f"Logic recording stopped early by user. Partial data saved to: {output_file.resolve()}")
+    print(f"\nLogic recording stopped early by user. Partial data saved to: {output_file.resolve()}")
 else:
-    print(f"Logic recording completed normally. File saved to: {output_file.resolve()}")
+    print(f"\nLogic recording completed normally. File saved to: {output_file.resolve()}")
 
 if stdout:
-    print("STDOUT:", stdout)
+    print("\nSTDOUT:", stdout)
 if stderr:
-    print("STDERR:", stderr)
+    print("\nSTDERR:", stderr)
 
-print('Sigrok process complete.')
+print('\nSigrok process complete.')

@@ -1,4 +1,4 @@
-#coding=utf-8
+# coding=utf-8
 import cv2
 import numpy as np
 import mvsdk
@@ -13,13 +13,12 @@ import yaml
 from pathlib import Path
 import os
 from roi_module import ROIDrawer, ROIPlotter
-###
 import matplotlib.pyplot as plt
 import subprocess
 import tkinter as tk
 from tkinter import simpledialog
 import json
-###
+
 
 CONFIG_FILE = 'cam_config.yml'
 
@@ -37,7 +36,7 @@ def load_camera_config(yaml_file_path):
 
 
 class App(object):
-    def __init__(self, config):
+    def __init__(self, config, gui_mode=False):
         super(App, self).__init__()
 
         self.config = config
@@ -51,8 +50,6 @@ class App(object):
         self.acquiring = False
         self.saving = False
         self.normalizeImage = False
-        self.experiment_mode = False
-        self.experiment_ongoing = False
         self.removeBackground = False
         self.frame_queue = queue.Queue()  # Buffer for frames
         self.display_queue = queue.Queue()  # Queue for displaying frames
@@ -63,7 +60,6 @@ class App(object):
         self.live_speck = config['USE_LIVE_SPECKLE']
         self.exposure = config['EXPOSURE_TIME'] # in ms
         self.analog_gain = config['ANALOG_GAIN'] 
-        # self.save_dir = config['SAVE_DIR']
         self.filename = config['EXPERIMENT']
         self.bin_exp = config['BIN_EXP_LIVE']
         self.bin_size = config['BIN_SIZE']
@@ -84,12 +80,15 @@ class App(object):
         self.roi_plotter = ROIPlotter()
         self.plot_roi = False
 
-###
         self.histogram_open = False
+        self.histogram_thread_running = False
+        self.histogram_thread = None
         self.dFoF_open = False
         self.F0 = None
 
         self.exp_thread = None
+        self.stim_thread = None
+        self.logic_thread = None
         self.stim_progress = None
         self.logic_progress = None
         self.exp_list = {1: "Locally Sparse Noise", 
@@ -106,18 +105,10 @@ class App(object):
         self.save_dir = None
         self.save_dir_ready = False
         self.save_file_handle = None
-###
+        self.gui_mode = gui_mode
 
         # self.check_and_fix_existing_experiment()
 
-        # To control the RPi pico that triggers the camera
-        if config['PICO_SERIAL_PORT'] is not None:
-            self.ser = serial.Serial(config['PICO_SERIAL_PORT'], 115200, timeout=1)
-            self.pwm_duty = config['PICO_PWM_DUTY']
-            self.pwm_freq = config['PICO_PWM_FREQUENCY']
-        else:
-            self.pwm_duty = None
-            self.pwm_freq = None
 
         # UDP socket to listen for the commands
         self.udp_port = config['UDP_TRIGGER_PORT']
@@ -130,84 +121,120 @@ class App(object):
 
         self.dtype = 'uint16' if self.USE_MONO16 else 'uint8'
 
+    def cleanup_udp(self):
+        self.quit = True
+        if hasattr(self, 'sock') and self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+        if hasattr(self, 'udp_thread') and self.udp_thread.is_alive():
+            self.udp_thread.join(timeout=2.0)
 
-###
+    def get_frame_for_display(self):
+        if not self.display_queue.empty():
+            try:
+                return self.display_queue.get_nowait()
+            except:
+                return None
+        return None
+
     def get_exp_params(self):
+        if hasattr(self, 'exp_thread') and self.exp_thread and self.exp_thread.is_alive():
+            print('\nExperiment selection already in progress.')
+            return
+
         print("\n The available experiments are listed:")
         for num, name in self.exp_list.items():
             print(f"{num}: {name}")
 
+        self.exp_thread = threading.Thread(target=self.run_exp, daemon=True)
+        self.exp_thread.start()
+
+    def run_exp(self):
         root = tk.Tk()
         root.withdraw()
 
-        while True:
-            exp_num = simpledialog.askinteger("Experiment", "Enter experiment number:")
-            if exp_num is None:
-                print("\nUser cancelled selection. Please restart software to try again.")
+        try:
+            while True:
+                exp_num = simpledialog.askinteger("Experiment", "Enter experiment number:")
+                if exp_num is None:
+                    print("\nUser cancelled selection. Please restart software to try again.")
+                    return
+                exp_name = self.exp_list.get(exp_num)
+                if exp_name:
+                    break
+                else:
+                    print("\nInvalid input. Enter one of the listed experiment numbers:")
+            
+            experiment_id = simpledialog.askstring("Experiment ID", "Enter experiment ID:")
+            if experiment_id is None:
+                print('\nUser cancelled selection.')
                 return
-            exp_name = self.exp_list.get(exp_num)
-            if exp_name:
-                break
-            else:
-                print("\nInvalid input. Enter one of the listed experiment numbers:")
-        
-        experiment_id = simpledialog.askstring("Experiment ID", "Enter experiment ID:")
 
-        self.save_dir = f"C:\\\\Data\\{experiment_id}\\WF_Recordings"
-        self.save_dir_ready = True
+            self.save_dir = f"C:\\\\Data\\{experiment_id}\\WF_Recordings"
+            self.save_dir_ready = True
 
-        mouse_id = simpledialog.askstring("Mouse ID", "Enter mouse ID:")
+            mouse_id = simpledialog.askstring("Mouse ID", "Enter mouse ID:")
+            if mouse_id is None:
+                print('\nUser cancelled selection.')
+                return
 
-        method = simpledialog.askstring("Method", "Send inputs via 'subprocess (s)' or '(u)'?")
+            method = simpledialog.askstring("Method", "Send inputs via 'subprocess (s)' or '(u)'?")
+            if method is None:
+                print('\nUser cancelled selection.')
+                return
 
-        self.start_logic_analyzer(experiment_id, mouse_id)
+            self.start_logic_analyzer(experiment_id, mouse_id)
+            self.start_stim(exp_name, experiment_id, mouse_id, method)
 
-        self.start_stim(exp_name, experiment_id, mouse_id, method)
-
+        except Exception as e:
+            print(f'\nError in experiment selection: {e}.')
+        finally:
+            self.exp_thread = None
 
     def start_logic_analyzer(self, experiment_id, mouse_id):
-        if getattr(self, 'logic_progress', None):
-            print("Logic analyzer session currently running. Stopping...")
-            if hasattr(self.logic_progress, 'terminate'):
-                self.logic_progress.terminate()
-            self.stop_logic_analyzer()
+        self.stop_logic_analyzer()
 
-        print("Starting logic analyzer...")
+        print("\nStarting logic analyzer...")
 
         self.logic_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/camstim/manage_sigrok.py", experiment_id, mouse_id],
             stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True, cwd="C:/Data/logicAnalyzer_Recordings")
-        threading.Thread(target=self.track_logic, daemon=True).start()
 
+        self.logic_thread = threading.Thread(target=self.track_logic, daemon=True)
+        self.logic_thread.start()
 
     def stop_logic_analyzer(self):
         if getattr(self, 'logic_progress', None) is None:
             print("No current logic analyzer session running.")
             return
 
+        print("\nStopping logic analyer session...")
+
         if isinstance(self.logic_progress, subprocess.Popen):
-            print("Stopping logic analyzer session...")
             try:
-                # Check if process is still running before trying to write to stdin
-                if self.logic_progress.poll() is None:  # Process is still running
-                    self.logic_progress.stdin.write("STOP\n")
-                    self.logic_progress.stdin.flush()
-                    print("Sent STOP command to logic analyzer.")
+                if self.logic_progress.poll() is None:  
+                    self.logic_progress.terminate()
+                    self.logic_progress.wait(timeout=2.0)
+                    print("\nLogic analyzer terminated.")
                 else:
                     print("Logic analyzer process has already finished.")
-            except OSError as e:
-                print(f"Error sending STOP command (process may have already finished): {e}")
-            finally:
-                self.logic_progress = None
-        else:
-            print("Unable to stop logic analyzer properly.")
+            except subprocess.TimeoutExpired:
+                print(f"\nLogic analyzer didn't terminate gracefully, forcing kill...")
+                self.logic_progress.kill()
+            except Exception as e:
+                print(f'\nError stopping logic analyzer: {e}.')
 
+        self.logic_progress = None
 
+        if hasattr(self, 'logic_thread') and self.logic_thread and self.logic_thread.is_alive():
+            self.logic_thread.join(timeout=1.0)
+            self.logic_thread = None
+       
     def track_logic(self):
         if isinstance(self.logic_progress, subprocess.Popen):
             for line in self.logic_progress.stdout:
                 print(f"{line.strip()}")
-            # self.logic_progress.wait()
-
 
     def start_stim(self, exp_name, experiment_id, mouse_id, method):
         if getattr(self, 'stim_progress', None):
@@ -222,7 +249,7 @@ class App(object):
             self.stim_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/camstim/wf_main.py", exp_name, experiment_id, mouse_id],
                 stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True)
             threading.Thread(target=self.track_stim, daemon=True).start()
-            print("Started stim via subprocess.")
+            print("\nStarted stim via subprocess.")
 
         elif method.lower() == 'u':
             msg = {"cmd": "START", 
@@ -239,51 +266,56 @@ class App(object):
 
             self.stim_progress = True
         else:
-            raise ValueError(f"Unknown method {method}. Choose 'subprocess' or 'udp.")
-
+            raise ValueError(f"Unknown method {method}. Choose 's' or 'u''.")
 
     def stop_stim(self):
         if getattr(self, 'stim_progress', None) is None:
             print("No current experiment running.")
-            return
-
-        if isinstance(self.stim_progress, subprocess.Popen):
-            print("Stopping stim via subprocess...")
-            self.stim_progress.stdin.write("STOP\n")
-            self.stim_progress.stdin.flush()
-            self.stim_progress = None
-            print("Stim stopped.")
-
-        elif self.stim_progress is True:
-            msg = {"cmd": "STOP"}
-            UDP_IP = "127.0.0.1"
-            UDP_PORT = 5005
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as send_sock:
-                send_sock.sendto(json.dumps(msg).encode(), (UDP_IP, UDP_PORT))
-                print(f"\nSent stop to visual stim at {UDP_IP}:{UDP_PORT}")
-            self.stim_progress = None
-
         else:
-            print("Unable to stop stim properly.")
+            if isinstance(self.stim_progress, subprocess.Popen):
+                print("Stopping stim via subprocess...")
+                try:
+                    if self.stim_progress.poll() is None:
+                        self.stim_progress.stdin.write("STOP\n")
+                        self.stim_progress.stdin.flush()
+                        self.stim_progress.terminate()
+                        self.stim_progress.wait(timeout=2.0)
+                        print("\nStim stopped.")
+                    else:
+                        print("\nStim process already finished.")
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    print(f'\nError stopping stim: {e}.')
+                    if self.stim_progress.poll() is None:
+                        self.stim_progress.kill()
 
-        self.stim_progress = None
+            elif self.stim_progress is True:
+                msg = {"cmd": "STOP"}
+                UDP_IP = "127.0.0.1"
+                UDP_PORT = 5005
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as send_sock:
+                    send_sock.sendto(json.dumps(msg).encode(), (UDP_IP, UDP_PORT))
+                    print(f"\nSent stop to visual stim at {UDP_IP}:{UDP_PORT}")
+                
+            self.stim_progress = None
 
+        self.stop_logic_analyzer()
+
+        if hasattr(self, 'stim_thread') and self.stim_thread and self.stim_thread.is_alive():
+            self.stim_thread.join(timeout=1.0)
+            self.stim_thread = None
 
     def track_stim(self):
         if isinstance(self.stim_progress, subprocess.Popen):
             for line in self.stim_progress.stdout:
                 print(f"{line.strip()}")
-            # self.stim_progress.wait()
             print("Stim finished.")
             
-            # Only stop logic analyzer if it's still running
-            if (getattr(self, 'logic_progress', None) and 
-                isinstance(self.logic_progress, subprocess.Popen) and 
-                self.logic_progress.poll() is None):
-                print("Stopping logic analyzer after stim completion...")
-                self.stop_logic_analyzer()
-###         
-
+            # # Only stop logic analyzer if it's still running
+            # if (getattr(self, 'logic_progress', None) and 
+            #     isinstance(self.logic_progress, subprocess.Popen) and 
+            #     self.logic_progress.poll() is None):
+            #     print("Stopping logic analyzer after stim completion...")
+            #     self.stop_logic_analyzer()        
 
     def setup_live_speckle_variables(self):
         self.buffer_size = self.config['BUFFER_SIZE']
@@ -299,26 +331,20 @@ class App(object):
         if self.save_dir and os.path.exists(os.path.join(self.save_dir, self.filename+'.bin')):
             print("WARNING!!! Experiment file already exists, modifying name to avoid overwriting.")
             self.filename += "1"
-            
 
     def bin_frame(self, frame):
         # Binning
         binned_frame = frame.reshape((self.height//self.bin_size, self.bin_size, self.width//self.bin_size, self.bin_size)).sum(axis=(1, 3), dtype=np.uint16)
-
         return binned_frame
 
     def std_filter_frame(self, frame):
         # Binning
         binned_frame = frame.reshape((self.height//self.bin_size, self.bin_size, self.width//self.bin_size, self.bin_size)).std(axis=(1, 3), dtype=np.float32)
-
         return binned_frame
 
     def save_frames(self):
-        # with open(os.path.join(self.save_dir, self.filename+'.bin'), 'ab') as f:  # Open a binary file for appending
         while True:
             if self.saving or not self.frame_queue.empty():
-
-                ###
                 if not self.save_dir_ready or self.save_dir is None:
                     time.sleep(0.01)
                     continue
@@ -326,7 +352,6 @@ class App(object):
                 if self.save_file_handle is None:
                     file_path = os.path.join(self.save_dir, self.filename + '.bin')
                     self.save_file_handle = open(file_path, 'ab')
-                ###
 
                 # Process frames if available
                 if not self.frame_queue.empty():
@@ -340,12 +365,10 @@ class App(object):
                     if self.bin_exp:
                         frame = self.bin_frame(frame)
 
-                    ###
                     frame.tofile(self.save_file_handle)
                     self.save_file_handle.flush()
-                    ###
-
                     self.frames_written += 1
+
                 # Check if it's time to exit: quit is True and no frames left in the queue
                 elif self.quit and self.frame_queue.empty():
                     break
@@ -357,7 +380,6 @@ class App(object):
                     break
                 time.sleep(0.005)
 
-        ###
         if self.save_file_handle is not None:
             self.save_file_handle.close()
             self.save_file_handle = None
@@ -382,24 +404,29 @@ class App(object):
             }
             np.save(os.path.join(self.save_dir, '{}_metadata.npy'.format(self.filename)), metadata)
 
-        ###
-
     def display_frames(self):
+        print(f"DEBUG: display_frames started, gui_mode = {self.gui_mode}")
+        if self.gui_mode:
+            while not self.quit:
+                if not self.display_queue.empty():
+                    frame_data = self.display_queue.get()
+                    time.sleep(0.001)
+                else:
+                    time.sleep(0.005)
+            return
+
+        print("DEBUG: Running in OpenCV mode.")
         cv2.namedWindow("Live View")
-        
         cv2.setMouseCallback("Live View", self.roi_drawer.handle_mouse_events)
 
         while not self.quit or not self.display_queue.empty():
             if not self.display_queue.empty():
                 frame_data = self.display_queue.get()
 
-                 # Display frame
+                # Display frame
                 frame = np.frombuffer(frame_data, dtype=self.dtype)
                 frame = frame.reshape((self.height, self.width))
-
-                ###
                 frame = cv2.flip(frame, 1)
-                ###
 
                 self.n_saturated_pixels = (frame.flatten() == 255).sum()
                 
@@ -416,33 +443,37 @@ class App(object):
                     # Scale the values to the full 0-255 range
                     scaled = ((clipped - self.vmin) / (self.vmax - self.vmin)) * 255
                     frame = scaled.astype(np.uint8)
-
-                    #frame = 255-frame
             
                 if self.removeBackground:
                     frame = frame - self.backgroundImg
                     frame = np.clip(frame, 0, 255)
+
                 if self.normalizeImage:
                     clipped = np.clip(frame, self.minI, self.maxI)
                     scaled = ((clipped - self.minI) / (self.maxI - self.minI)) * 255
                     frame = scaled.astype(np.uint8)
-###
+
                 if self.dFoF_open and self.F0 is not None:
                     dfof = (frame.astype(np.float32) - self.F0) / self.F0
                     dfof = np.nan_to_num(dfof, nan=0.0)
-
-                    fmin, fmax = dfof.min(), dfof.max()
-                    if fmax > fmin:
-                        frame = ((dfof - fmin) / (fmax - fmin) * 255).astype(np.uint8)
+                    
+                    if self.normalizeImage:
+                        clipped = np.clip(dfof, self.minI, self.maxI)
+                        frame = ((clipped - self.minI) / (self.maxI - self.minI)) * 255
                     else:
-                        frame = np.zeros_like(dfof, dtype=np.uint8)
-###
+                        fmin, fmax = dfof.min(), dfof.max()
+                        if fmax > fmin:
+                            frame = ((dfof - fmin) / (fmax - fmin)) * 255
+                        else:
+                            frame = np.zeros_like(dfof)
+
+                    frame = frame.astype(np.uint8)
 
                 frame  = cv2.resize(frame, (self.width//2,self.height//2), interpolation = None)
-              #  frame = frame.T
                 
                 frame = cv2.cvtColor(frame,cv2.COLOR_GRAY2RGB)
                 frame = self.roi_drawer.draw_rectangle(frame)    
+
                 if self.plot_roi and self.roi_drawer.top_left_pt != (-1, -1) and self.roi_drawer.bottom_right_pt != (-1, -1):
                     average_intensity = frame[self.roi_drawer.top_left_pt[1]:self.roi_drawer.bottom_right_pt[1], self.roi_drawer.top_left_pt[0]:self.roi_drawer.bottom_right_pt[0]].mean()
                     self.roi_plotter.update_plot(average_intensity)
@@ -452,103 +483,44 @@ class App(object):
 
                 cv2.imshow("Live View", frame)
 
-
             pressed_key = cv2.waitKey(1) & 0xFF
             if pressed_key == 255:
                 continue
+
             elif pressed_key == ord('q'):
                 self.roi_plotter.deinitialize_plot()
                 self.plot_roi = False
                 self.quit = True
                 self.t_end = time.time()
-                ###
 
-
-            ###
-            elif pressed_key == ord('h'):
-                if getattr(self, 'stim_progress', None):
+            elif pressed_key == ord('i'):
+                if getattr(self, 'stim_progress', None) or getattr(self, 'logic_progress', None):
+                    print("\nStopping experiment and logic analyzer...")
                     self.stop_stim()
-                    self.stop_logic_analyzer()
                     self.stim_progress = None
                     self.logic_progress = None
-                    
                 else:
                     print("No current experiment running.")
 
             elif pressed_key == ord('a'):
-                if self.histogram_open:
-                    plt.close('Histogram')
-                    # for num in plt.get_fignums():
-                    #     fig = plt.figure(num)
-                    #     if fig.get_label() == 'Histogram':
-                    #         plt.close(fig)
-                    #        break
-                    self.histogram_open = False
-                else:
-                    if not self.display_queue.empty():
-                        frame_data = self.display_queue.get()
-                        frame = np.frombuffer(frame_data, dtype=self.dtype)
-                        frame = frame.reshape((self.height, self.width))
-                        frame_8bit = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-                        fig = plt.figure('Histogram')
-                        plt.clf()
-                        plt.hist(frame_8bit.ravel(), bins=256, range=(0,256), color='black')
-                        plt.title('Histogram for Frame {}'.format(self.frame_count))
-                        plt.xlabel('Pixel Intensity (0-255)')
-                        plt.ylabel('Number of Pixels')
-                        plt.grid(True)
-                        plt.tight_layout()
-                        fig.canvas.draw()
-                        plt.pause(0.001)
-                        #fig.show()
-                        self.histogram_open = True
+                self.toggle_histogram()
 
             elif pressed_key == ord('y'):
-                if self.dFoF_open:
-                    self.dFoF_open = False
-                    print("\n Stopping live dFoF view.")
-                else:
-                    print("\n Starting live dFoF view.")
-                    baseline_frames = []
-                    F0_n_frames = 50
-                    try:
-                        for i in range(F0_n_frames):
-                            frame_data = self.display_queue.get(timeout=1)
-                            frame = np.frombuffer(frame_data, dtype=self.dtype)
-                            frame = frame.reshape((self.height, self.width))
-                            baseline_frames.append(frame.astype(np.float32))
-                    except queue.Empty:
-                        print("Warning: Not enough frames in queue to compute baseline F0.")
-                        self.dFoF_open = False
-                    else:
-                        if len(baseline_frames) < F0_n_frames:
-                            print("Insufficient baseline frames, cannot start dFoF.")
-                            self.dFoF_open = False
-                        else:
-                            sampled_stack = np.stack(baseline_frames, axis=0) 
-                            self.F0 = np.percentile(sampled_stack, 10, axis=0)
-                            self.F0[self.F0 == 0] = np.nan 
-                            del sampled_stack
-                            self.dFoF_open = True
+                self.toggle_dFoF()
 
-            elif pressed_key == ord('e'):
-                if self.exp_thread is None or not self.exp_thread.is_alive():
-                    self.exp_thread = threading.Thread(target=self.get_exp_params, daemon=True)
-                    self.exp_thread.start()
-                else:
-                    print("Experiment selection in progess. Finish the current prompt.")
-            ###
-
+            elif pressed_key == ord('x'):
+                self.get_exp_params()
 
             elif pressed_key == ord('t'):
                 # Switch camera mode to hardware trigger capture
                 print("\n Switching to hardware trigger mode.")
                 mvsdk.CameraSetTriggerMode(self.hCamera, 2)
+
             elif pressed_key == ord('c'):
                 # Switch camera mode to continuous capture
                 print("\n Switching to continuous capture.")
                 mvsdk.CameraSetTriggerMode(self.hCamera, 0)
+
             elif pressed_key == ord('s'):
                 if not self.saving:
                     print("\n Switching to continuous capture.")
@@ -562,77 +534,28 @@ class App(object):
                     time.sleep(1)
                     print("\n Switching to continuous mode.")
                     mvsdk.CameraSetTriggerMode(self.hCamera, 0)
-            # elif pressed_key == ord('e'):
-            #     try:
-            #         self.exposure = float(input("\nEnter new exposure (current: {}ms): \n".format(self.exposure)))
-            #         mvsdk.CameraSetExposureTime(self.hCamera, self.exposure*1000) 
-            #     except ValueError:
-            #         print("\n Failed to set exposure, invalid value.")
-                
-                #print("TrigCap: ", mvsdk.CameraGetExtTrigCapability(self.hCamera))
-                #print("Trigger delay time: ", mvsdk.CameraGetExtTrigDelayTime(self.hCamera))
+
+            elif pressed_key == ord('e'):
+                self.change_exposure()
+
             elif pressed_key == ord('g'):
-                try:
-                    self.analog_gain = int(input("\nEnter new gain (current: {}): \n".format(self.analog_gain)))
-                    mvsdk.CameraSetAnalogGain(self.hCamera, self.analog_gain) 
-                except ValueError:
-                    print("\n Failed to set gain, invalid value.")
+                self.change_gain()
+
             elif pressed_key == ord('r') and self.roi_drawer.active_roi:
-                self.plot_roi = True if not self.plot_roi else False
-                if not self.plot_roi:
-                    self.roi_drawer.top_left_pt = (-1, -1)
-                    self.roi_drawer.bottom_right_pt = (-1, -1)
-                    self.roi_drawer.active_roi = False
-                    self.roi_plotter.deinitialize_plot()
+                self.toggle_roi_plot()
+
             elif pressed_key == ord('p'):
                 self.print_camera_stats()
+
             elif pressed_key == ord('d'):
-                if self.removeBackground:
-                    self.removeBackground = False
-                    print("\n Stopping background substraction.")
-                else:
-                    self.removeBackground = True
-                    frame_data = self.display_queue.get()
-                    frame = np.frombuffer(frame_data, dtype=self.dtype)
-                    frame = frame.reshape((self.height, self.width))                     
-                    kernel = np.ones((10,10),np.float32)/100
-                    frame = cv2.filter2D(frame,-1,kernel)
-                    self.backgroundImg = frame
-                    print("\n Substracting background image.")
+                self.toggle_background_removal()
+
             elif pressed_key == ord('z'):
-                #if self.normalizeImage:
-                #    self.normalizeImage = False
-                #    print("\n Stopping image normalization.")
-                #else:
-                self.normalizeImage = True
-                self.autoI = self.autoI*2
-                if self.autoI > 49:
-                    self.autoI = 0.05
-                frame_data = self.display_queue.get()
-                frame = np.frombuffer(frame_data, dtype=self.dtype)
-                self.minI = np.percentile(frame[:], self.autoI)
-                self.maxI = np.percentile(frame[:], 100-self.autoI)
-                print("\n Changing dynamical range to: {}, {} pixel values. Percentiles: {}, {}".format(self.minI, self.maxI, self.autoI, 100-self.autoI))
+                self.adjust_dynamic_range()
+
             elif pressed_key == ord('h'):
                 self.print_keyboard_commands()
-            elif pressed_key == ord('m'):
-                # initiate PWM signal of raspberry pi pico (not used for speckle)
-                self.send_command_and_wait_for_response('init_pwm()')
-                self.send_command_and_wait_for_response('start_pwm({}, {})'.format(self.pwm_freq, self.pwm_duty))
-            elif pressed_key == ord('n'):
-                # stop the PWM signal from the pico (not used for speckle)
-                self.send_command_and_wait_for_response('stop_pwm()')
-            elif pressed_key == ord('x'):
-                if not self.experiment_mode:
-                    # set camera in experiment mode
-                    self.send_command_and_wait_for_response('init_pwm()')
-                    # Switch camera mode to hardware trigger capture
-                    mvsdk.CameraSetTriggerMode(self.hCamera, 2)
-                    self.experiment_mode = True
-                else:
-                    mvsdk.CameraSetTriggerMode(self.hCamera, 0)
-                    self.send_command_and_wait_for_response('stop_pwm()')
-                    self.experiment_mode = False
+
             elif self.live_speck and pressed_key == ord('b'):
                 self.enable_live_speckle = True if not self.enable_live_speckle else False
                 if self.enable_live_speckle:
@@ -642,7 +565,231 @@ class App(object):
 
         print("Quit order received for display thread.")
         self.display_queue.queue.clear()
+
+    def toggle_histogram(self):
+        if self.histogram_open:
+            plt.close('Histogram')
+            self.histogram_open = False
+            self.histogram_thread_running = False
+            if hasattr(self, 'histogram_thread') and self.histogram_thread.is_alive():
+                self.histogram_thread.join(timeout=1.0)
+        else:
+            self.histogram_open = True
+            self.histogram_thread_running = True
+            self.histogram_thread = threading.Thread(target=self.update_histogram, daemon=True)
+            self.histogram_thread.start()
+
+
+    def update_histogram(self):
+        hist_width = 512
+        hist_height = 400
+        bin_width = 2
+
+        cv2.namedWindow('Live Histogram', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Live Histogram', hist_width, hist_height)
+
+        max_history = 50
+        intensity_history = []
+
+        while self.histogram_open and self.histogram_thread_running and not self.quit:
+            if not self.display_queue.empty():
+                try:
+                    frame_data = self.display_queue.get_nowait()
+                    frame = np.frombuffer(frame_data, dtype=self.dtype)
+                    frame = frame.reshape((self.height, self.width))
+
+                    if self.dFoF_open and self.F0 is not None:
+                        dfof = (frame.astype(np.float32) - self.F0) / self.F0
+                        dfof = np.nan_to_num(dfof, nan=0.0)
+
+                        if self.normalizeImage:
+                            clipped = np.clip(dfof, self.minI, self.maxI)
+                            normalized_frame = ((clipped - self.minI) / (self.maxI - self.minI)) * 255
+                        else:
+                            fmin, fmax = dfof.min(), dfof.max()
+                            if fmax > fmin:
+                                normalized_frame = ((dfof - fmin) / (fmax - fmin)) * 255
+                            else:
+                                normalized_frame = np.zeros_like(dfof) * 255
+
+                        display_frame = normalized_frame.astype(np.uint8)
+                        title_suffix = " (dFoF)"
+
+                    else:
+                        if self.normalizeImage:
+                            clipped = np.clip(frame, self.minI, self.maxI)
+                            display_frame = ((clipped - self.minI) / (self.maxI - self.minI)) * 255
+                            display_frame = display_frame.astype(np.uint8)
+                        else:
+                            display_frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                        title_suffix = " (Raw)"
+
+                    intensity_history.extend(display_frame.ravel().tolist())
+                    if len(intensity_history) > max_history * self.height * self.width:
+                        intensity_history = intensity_history[-max_history * self.height * self.width:]
+
+                    hist = cv2.calcHist([np.array(intensity_history, dtype=np.uint8)], [0], None, [256], [0, 256])
+
+                    cv2.normalize(hist, hist, 0, hist_height, cv2.NORM_MINMAX)
+
+                    hist_image = np.zeros((hist_height, hist_width, 3), dtype=np.uint8)
+
+                    for i in range(256):
+                        intensity = int(hist[i])
+                        cv2.rectangle(hist_image, (i * bin_width, hist_height - intensity),((i+1) * bin_width - 1, hist_height), (255, 255, 255), -1)
+
+                    if self.normalizeImage:
+                        min_x = int(self.minI * bin_width)
+                        max_x = int(self.maxI * bin_width)
+                        cv2.line(hist_image, (min_x, 0), (min_x, hist_height), (0, 0, 255), 2)
+                        cv2.line(hist_image, (max_x, 0), (max_x, hist_height), (255, 0, 0), 2)
+
+                        cv2.putText(hist_image, f'min: {self.minI:.2f}', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        cv2.putText(hist_image, f'max: {self.maxI:.2f}', (hist_width - 120, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+                    cv2.putText(hist_image, f'Frame {self.frame_count}{title_suffix}', (hist_width // 2 - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                    cv2.imshow('Live Histogram', hist_image)
+                    cv2.waitKey(1)
+
+                except queue.Empty:
+                    pass
+                except Exception as e:
+                    print(f"\nHistogram error: {e}.")
+
+            time.sleep(0.01)
+
+        cv2.destroyWindow('Live Histogram')
+
+
+    def toggle_dFoF(self):
+        if self.dFoF_open:
+            self.dFoF_open = False
+            print("\n Stopping live dFoF view.")
+        else:
+            print("\n Starting live dFoF view.")
+            baseline_frames = []
+            F0_n_frames = 50
+
+            try:
+                for i in range(F0_n_frames):
+                    frame_data = self.display_queue.get(timeout=1)
+                    frame = np.frombuffer(frame_data, dtype=self.dtype)
+                    frame = frame.reshape((self.height, self.width))
+                    baseline_frames.append(frame.astype(np.float32))
+            except queue.Empty:
+                print("Warning: Not enough frames in queue to compute baseline F0.")
+                self.dFoF_open = False
+            else:
+                if len(baseline_frames) < F0_n_frames:
+                    print("Insufficient baseline frames, cannot start dFoF.")
+                    self.dFoF_open = False
+                else:
+                    sampled_stack = np.stack(baseline_frames, axis=0) 
+                    self.F0 = np.percentile(sampled_stack, 10, axis=0)
+
+                    epsilon = 1e-6
+                    self.F0[self.F0 == 0] = epsilon
+
+                    del sampled_stack
+                    
+                    if not self.normalizeImage:
+                        test_dfof = []
+                        for i in range(min(10, len(baseline_frames))):
+                            dfof_test = (baseline_frames[i] - self.F0) / self.F0
+                            test_dfof.append(dfof_test)
+
+                        test_dfof_stack = np.stack(test_dfof)
+
+                        valid_values = test_dfof_stack[~np.isnan(test_dfof_stack)]
+                        if len(valid_values) > 0:
+                            self.minI = np.percentile(valid_values, 1)
+                            self.maxI = np.percentile(valid_values, 99)
+                            self.normalizeImage = True
+                            print(f"\nAuto-set dFoF range: [{self.minI:.3f}, {self.maxI:.3f}]")
+                        else:
+                            print("\nWarning: All dFoF values are NaN..")
+                            return
+
+                    self.dFoF_open = True
+                    print("\ndFoF started with dynamic range normalization.")
+
+    def change_exposure(self):
+        try:
+            self.exposure = float(input("\nEnter new exposure (current: {}ms): \n".format(self.exposure)))
+            mvsdk.CameraSetExposureTime(self.hCamera, self.exposure*1000) 
+        except ValueError:
+            print("\n Failed to set exposure, invalid value.")
         
+        print("TrigCap: ", mvsdk.CameraGetExtTrigCapability(self.hCamera))
+        print("Trigger delay time: ", mvsdk.CameraGetExtTrigDelayTime(self.hCamera))
+
+    def change_gain(self):
+        try:
+            self.analog_gain = int(input("\nEnter new gain (current: {}): \n".format(self.analog_gain)))
+            mvsdk.CameraSetAnalogGain(self.hCamera, self.analog_gain) 
+        except ValueError:
+            print("\n Failed to set gain, invalid value.")
+
+    def toggle_roi_plot(self):
+        self.plot_roi = True if not self.plot_roi else False
+        if not self.plot_roi:
+            self.roi_drawer.top_left_pt = (-1, -1)
+            self.roi_drawer.bottom_right_pt = (-1, -1)
+            self.roi_drawer.active_roi = False
+            self.roi_plotter.deinitialize_plot()
+
+    def toggle_background_removal(self):
+        if self.removeBackground:
+            self.removeBackground = False
+            print("\n Stopping background substraction.")
+        else:
+            self.removeBackground = True
+            frame_data = self.display_queue.get()
+            frame = np.frombuffer(frame_data, dtype=self.dtype)
+            frame = frame.reshape((self.height, self.width))                     
+            kernel = np.ones((10,10),np.float32)/100
+            frame = cv2.filter2D(frame,-1,kernel)
+            self.backgroundImg = frame
+            print("\n Substracting background image.")
+
+    def adjust_dynamic_range(self):
+        if self.normalizeImage:
+            self.normalizeImage = False
+            print("\nDynamic range normalization turned off.")
+            return
+
+        self.normalizeImage = True
+        self.autoI = self.autoI * 2
+        if self.autoI > 49:
+            self.autoI = 0.05
+
+        if not self.display_queue.empty():
+            frame_data = self.display_queue.get()
+            frame = np.frombuffer(frame_data, dtype=self.dtype)
+            frame = frame.reshape((self.height, self.width))
+
+            if self.dFoF_open and self.F0 is not None:
+                dfof = (frame.astype(np.float32) - self.F0) / self.F0
+                dfof = np.nan_to_num(dfof, nan=0.0)
+                data_for_percentile = dfof
+                data_type = "dfof"
+            else:
+                data_for_percentile = frame
+                data_type = "raw"
+            
+            self.minI = np.percentile(data_for_percentile[:], self.autoI)
+            self.maxI = np.percentile(data_for_percentile[:], 100 - self.autoI)
+
+            print("\nDynamic range normalization turned on.")
+            print(f"\nChanging {data_type} dynamic range to: [{self.minI:.3f}, {self.maxI:.3f}]. Percentiles: [{self.autoI}, {100-self.autoI}]")  # FIXED: added closing bracket
+        else:
+            print("\nDynamic range normalization turned on.")
+            print("\nNo frame available for dynamic range adjustment.")
+
+        # self.minI = np.percentile(frame[:], self.autoI)
+        # self.maxI = np.percentile(frame[:], 100-self.autoI)
+        # print("\n Changing dynamical range to: {}, {} pixel values. Percentiles: {}, {}".format(self.minI, self.maxI, self.autoI, 100-self.autoI))
 
     def wait_udp_trigger(self):
         self.sock.setblocking(0)
@@ -650,27 +797,22 @@ class App(object):
             # Receive message
             ready = select.select([self.sock], [], [], 1)
             if ready[0]:
-                data, addr = self.sock.recvfrom(1024)  # buffer size is 1024 bytes
+                try:
+                    data, addr = self.sock.recvfrom(1024)  # buffer size is 1024 bytes
+                    msg = data.decode()
 
-                msg = data.decode()
-
-                if self.experiment_mode:
                     if 'ExpStart' in msg:
-                        #self.send_command_and_wait_for_response('init_pwm()')
-                        self.send_command_and_wait_for_response('start_pwm({}, {})'.format(self.pwm_freq, self.pwm_duty))
-                        self.experiment_ongoing = True
+                        print("Experiment started - waiting for hardware triggers.")
                         self.frame_count = 0
                         self.t_start = time.time()
                     elif 'ExpEnd' in msg:
-                        if self.experiment_ongoing:
-                            self.send_command_and_wait_for_response('stop_pwm()')
-                            self.experiment_ongoing = False
-                        else:
-                            print("Warning, ExpEnd received when no experiment was ongoing. Check things pls")
+                        print("Experiment ended.")
                     else:
                         print("Received: ", msg)
-                else:
-                    print("Not in experiment mode, received: {}".format(msg))
+                except:
+                    if self.quit:
+                        break
+        print("UDP thread stopped.")
 
 
     def print_camera_stats(self):
@@ -683,31 +825,18 @@ class App(object):
             "t -- switch camera mode to hardware trigger capture\n" +\
             "c -- switch camera mode to continuous capture\n" +\
             "s -- if in continuous capture, switches to hardware trigger mode (ready to save frames); \n if in hardware trigger mode, switches to continuous capture (save frames off)\n" +\
-            "e -- enter experiment/stimulus parameters (make sure to hit 's' before this!)\n" +\
+            "x -- enter experiment/stimulus parameters (make sure to hit 's' before this!)\n" +\
             "i -- interrupt experiment (stop data acquistion, teensy, logic analyzer)\n" +\
+            "e -- change exposure\n" +\
             "g -- edit gain\n" +\
             "r -- draw ROI\n" +\
             "a -- display pixel intensity histogram for current frame\n" +\
             "p -- print camera stats\n" +\
             "d -- subtract backgroud image\n" +\
             "z -- normaliZe image dynamic range\n" +\
-            "m -- start pwm\n" +\
             "b -- speckle mode on/off\n" +\
             "r -- ROI selection\n" +\
-            "m -- start pwm\n" +\
-            "n -- stop pwm\n" +\
-            "x -- start experiment mode. Press again to stop experiment mode.\n\n" +\
-
-            "To display these commands again, press h\n")
-
-
-    # Function to send a command and wait for response
-    def send_command_and_wait_for_response(self, command):
-        self.ser.write((command + '\r\n').encode())  # Send command with newline
-        time.sleep(0.05)  # Wait for the response
-        response = self.ser.read(self.ser.in_waiting).decode()
-        print(response)
-    
+            "h -- display these commands again\n")
 
     def main(self):
         # Enumerate cameras
@@ -721,7 +850,6 @@ class App(object):
             print("{}: {} {}".format(i, DevInfo.GetFriendlyName(), DevInfo.GetPortType()))
         i = 0 if nDev == 1 else int(input("Select camera: "))
         DevInfo = DevList[i]
-        #print(DevInfo)
         self.print_keyboard_commands()
 
         # Open camera
@@ -750,10 +878,8 @@ class App(object):
 
         # Switch camera mode to continuous capture
         mvsdk.CameraSetTriggerMode(self.hCamera, 0)
-
         # Switch the camera to full speed transmission
         mvsdk.CameraSetFrameSpeed(self.hCamera, 1)
-
         # Manual exposure, exposure time 
         mvsdk.CameraSetAeState(self.hCamera, 0)
         mvsdk.CameraSetExposureTime(self.hCamera, self.exposure * 1000)
@@ -761,7 +887,8 @@ class App(object):
 
         self.height = cap.sResolutionRange.iHeightMax
         self.width = cap.sResolutionRange.iWidthMax
-        print(self.height, self.width, "##############")
+        print(f"Camera resolution: {self.width}x{self.height}")
+
         if self.live_speck:
             self.setup_live_speckle_variables()
 
@@ -812,22 +939,18 @@ class App(object):
             return
 
         current_time = time.time()
-        #print(pFrameHead)
         FrameHead = pFrameHead[0]
         pFrameBuffer = self.pFrameBuffer
 
         # TODO check ImageProcess
-        #mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
-        #mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+        # mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
+        # mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
 
         # At this time, the image is already stored in pFrameBuffer. 
         # For color cameras, pFrameBuffer=RGB data, for monochrome cameras, pFrameBuffer=8-bit grayscale data
         # Convert pFrameBuffer into OpenCV image format for subsequent algorithm processing
-        #print(FrameHead.uBytes)
-        #print(FrameHead.uiMediaType)
         frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData)
         mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
-        #frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pFrameBuffer)
         
         if not self.acquiring:
             self.acquiring = True
@@ -837,11 +960,7 @@ class App(object):
         if not self.force_framerate:
             if self.saving:
                 frame_timestamp = time.time()
-                # Copy frame data to a new buffer
-                #frame_copy = np.copy(np.frombuffer(frame_data, dtype=np.uint8))
-                #self.frame_queue.put((frame_copy, self.frame_count, frame_timestamp))
                 self.frame_queue.put((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))  # Add frame and timestamp to the buffer
-            
             
             self.display_queue.put(frame_data)  # Add frame to display buffer    
             self.frame_count += 1
@@ -858,20 +977,6 @@ class App(object):
             else:
                 return
 
-    ###
-    def close_all_windows(self):
-        try:
-            plt.close('all')
-        except Exception as e:
-            print(f'Error closing matplotlib figures: {e}')
-        try:
-            cv2.destroyAllWindows()
-        except Exception as e:
-            print(f'Error closing OpenCV windows: {e}')
-    ###
-
-
-
 def main():
     try:
         config = load_camera_config(CONFIG_FILE)
@@ -886,9 +991,6 @@ def main():
         app.display_thread.join()  # Ensure the display thread has finished
         app.udp_thread.join()
         plt.close('all')
-        #app.close_all_windows()
-        t_len = app.t_end-app.t_start 
-
 
 if __name__ == '__main__':
     main()
