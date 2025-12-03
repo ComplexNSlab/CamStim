@@ -61,6 +61,8 @@ class App(object):
         self.exposure = config['EXPOSURE_TIME'] # in ms
         self.analog_gain = config['ANALOG_GAIN'] 
         self.filename = config['EXPERIMENT']
+        self.pwm_freq = config['PICO_PWM_FREQUENCY']
+        self.pwm_duty = config['PICO_PWM_DUTY']
         self.bin_exp = config['BIN_EXP_LIVE']
         self.bin_size = config['BIN_SIZE']
         self.force_framerate = config['FORCE_FRAMERATE']
@@ -172,8 +174,8 @@ class App(object):
                 print('\nUser cancelled selection.')
                 return
 
-            self.save_dir = f"C:\\\\Data\\{experiment_id}\\WF_Recordings"
-            self.save_dir_ready = True
+            self.save_dir = None
+            self.save_dir_ready = False
 
             mouse_id = simpledialog.askstring("Mouse ID", "Enter mouse ID:")
             if mouse_id is None:
@@ -188,10 +190,31 @@ class App(object):
             self.start_logic_analyzer(experiment_id, mouse_id)
             self.start_stim(exp_name, experiment_id, mouse_id, method)
 
+            threading.Thread(target=self.wait_for_directories, args=(experiment_id,), daemon=True).start()
+
         except Exception as e:
             print(f'\nError in experiment selection: {e}.')
         finally:
             self.exp_thread = None
+
+    def wait_for_directories(self, experiment_id):
+        base_dir = f'C:\\\\Data\\{experiment_id}'
+        wf_recordings_dir = os.path.join(base_dir, "WF_Recordings")
+
+        while not os.path.exists(base_dir) and not self.quit:
+            time.sleep(0.1)
+
+        if os.path.exists(base_dir):
+            while not os.path.exists(wf_recordings_dir) and not self.quit:
+                time.sleep(0.1)
+
+            if os.path.exists(wf_recordings_dir):
+                self.save_dir = wf_recordings_dir
+                self.save_dir_ready = True
+            else:
+                print(f'\nWarning: video save directory nout found.')
+        else:
+            print(f'Warning: base directory never created.')
 
     def start_logic_analyzer(self, experiment_id, mouse_id):
         self.stop_logic_analyzer()
@@ -206,7 +229,7 @@ class App(object):
 
     def stop_logic_analyzer(self):
         if getattr(self, 'logic_progress', None) is None:
-            print("No current logic analyzer session running.")
+            print("\nNo current logic analyzer session running.")
             return
 
         print("\nStopping logic analyer session...")
@@ -344,7 +367,7 @@ class App(object):
 
     def save_frames(self):
         while True:
-            if self.saving or not self.frame_queue.empty():
+            if self.saving:
                 if not self.save_dir_ready or self.save_dir is None:
                     time.sleep(0.01)
                     continue
