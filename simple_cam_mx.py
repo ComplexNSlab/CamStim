@@ -150,43 +150,52 @@ class App(object):
         for num, name in self.exp_list.items():
             print(f"{num}: {name}")
 
-        self.exp_thread = threading.Thread(target=self.run_exp, daemon=True)
+        exp_name, experiment_id, mouse_id, method = self.show_exp_dialogs()
+        if not exp_name: 
+            return
+
+        self.exp_thread = threading.Thread(target=self.run_exp, args=(exp_name, experiment_id, mouse_id, method), daemon=True)
         self.exp_thread.start()
 
-    def run_exp(self):
-        root = tk.Tk()
-        root.withdraw()
-
+    def show_exp_dialogs(self):
         try:
+            if not hasattr(self, '_tk_root'):
+                self._tk_root = tk.Tk()
+                self._tk_root.withdraw()
+
+            root = self._tk_root
+
             while True:
-                exp_num = simpledialog.askinteger("Experiment", "Enter experiment number:")
+                exp_num = simpledialog.askinteger("Experiment", "Enter experiment number:", parent=root)
                 if exp_num is None:
-                    print("\nUser cancelled selection. Please restart software to try again.")
-                    return
+                    return (None, None, None, None)
                 exp_name = self.exp_list.get(exp_num)
                 if exp_name:
                     break
-                else:
-                    print("\nInvalid input. Enter one of the listed experiment numbers:")
-            
-            experiment_id = simpledialog.askstring("Experiment ID", "Enter experiment ID:")
+
+            experiment_id = simpledialog.askstring("Experiment ID", "Enter experiment ID:", parent=root)
             if experiment_id is None:
-                print('\nUser cancelled selection.')
-                return
+                return (None, None, None, None)
 
             self.save_dir = None
             self.save_dir_ready = False
 
-            mouse_id = simpledialog.askstring("Mouse ID", "Enter mouse ID:")
+            mouse_id = simpledialog.askstring("Mouse ID", "Enter mouse ID:", parent=root)
             if mouse_id is None:
-                print('\nUser cancelled selection.')
-                return
+                return (None, None, None, None)
 
-            method = simpledialog.askstring("Method", "Send inputs via 'subprocess (s)' or '(u)'?")
+            method = simpledialog.askstring("Method", "Send inputs via 'subprocess (s)' or '(u)'?", parent=root)
             if method is None:
-                print('\nUser cancelled selection.')
-                return
+                return (None, None, None, None)
 
+            return (exp_name, experiment_id, mouse_id, method)
+
+        except Exception as e:
+            print(f"Dialog Error: {e}.")
+            return (None, None, None, None)
+
+    def run_exp(self, exp_name, experiment_id, mouse_id, method):
+        try:
             self.start_logic_analyzer(experiment_id, mouse_id)
             self.start_stim(exp_name, experiment_id, mouse_id, method)
 
@@ -331,7 +340,7 @@ class App(object):
         if isinstance(self.stim_progress, subprocess.Popen):
             for line in self.stim_progress.stdout:
                 print(f"{line.strip()}")
-            print("Stim finished.")
+            print("\nStim finished.")
             
             # # Only stop logic analyzer if it's still running
             # if (getattr(self, 'logic_progress', None) and 
@@ -580,14 +589,17 @@ class App(object):
                 self.print_keyboard_commands()
 
             elif self.live_speck and pressed_key == ord('b'):
-                self.enable_live_speckle = True if not self.enable_live_speckle else False
-                if self.enable_live_speckle:
-                    print("Enabling live speckle imaging, please wait a few seconds for the buffer to fill up.")
-                else:
-                    print("Disabled live speckle imaging.")
+                self.toggle_speckle()
 
         print("Quit order received for display thread.")
         self.display_queue.queue.clear()
+
+    def toggle_speckle(self):
+        self.enable_live_speckle = True if not self.enable_live_speckle else False
+        if self.enable_live_speckle:
+            print("Enabling live speckle imaging, please wait a few seconds for the buffer to fill up.")
+        else:
+            print("Disabled live speckle imaging.")
 
     def toggle_histogram(self):
         if self.histogram_open:

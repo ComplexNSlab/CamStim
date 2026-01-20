@@ -16,6 +16,8 @@ class CameraGUI(QMainWindow):
 		super().__init__()
 		self.config = load_camera_config('cam_config.yml')
 		self.camera_app = None
+		self.preview_mode = False
+		self.preview_exp_thread = None
 		self.init_ui()
 		self.setup_timer()
 
@@ -105,6 +107,16 @@ class CameraGUI(QMainWindow):
 		exp_group = QGroupBox("Experiment Controls")
 		exp_layout = QVBoxLayout()
 
+		self.preview_btn = QPushButton("Preview Experiment")
+		self.preview_btn.clicked.connect(self.preview_experiment)
+		self.preview_btn.setEnabled(False)
+		exp_layout.addWidget(self.preview_btn)
+
+		self.stop_preview_btn = QPushButton("Stop Preview")
+		self.stop_preview_btn.clicked.connect(self.stop_preview)
+		self.stop_preview_btn.setEnabled(False)
+		exp_layout.addWidget(self.stop_preview_btn)
+
 		self.exp_btn = QPushButton("Start Experiment")
 		self.exp_btn.clicked.connect(self.start_experiment)
 		self.exp_btn.setEnabled(False)
@@ -188,6 +200,7 @@ class CameraGUI(QMainWindow):
 			self.stop_btn.setEnabled(True)
 			self.trigger_btn.setEnabled(True)
 			self.exp_btn.setEnabled(False)
+			self.preview_btn.setEnabled(True)
 
 			self.update_status("Camera started successfully in continuous mode.")
 		except Exception as e:
@@ -210,6 +223,7 @@ class CameraGUI(QMainWindow):
 		self.start_btn.setEnabled(True)
 		self.stop_btn.setEnabled(False)
 		self.exp_btn.setEnabled(False)
+		self.preview_btn.setEnabled(False)
 		self.video_label.setText("Camera Stopped.")
 		self.update_status("Camera Stopped.")
 
@@ -237,8 +251,8 @@ class CameraGUI(QMainWindow):
 				self.camera_app.circular_buffer[self.camera_app.current_buffer_item, :, :] = frame
 				self.camera_app.current_buffer_item += 1
 				self.camera_app.current_buffer_item %= self.camera_app.buffer_size
-				frame = self.camera_app.circular_buffer.mean(axis=0)
 
+				frame = self.camera_app.circular_buffer.mean(axis=0)
 				clipped = np.clip(frame, self.camera_app.vmin, self.camera_app.vmax)
 				frame = ((clipped - self.camera_app.vmin) / (self.camera_app.vmax - self.camera_app.vmin)) * 255
 
@@ -313,6 +327,29 @@ class CameraGUI(QMainWindow):
 			except Exception as e:
 				self.update_status(f"Error toggling trigger mode: {e}.")
 
+	def preview_experiment(self):
+		if not self.camera_app:
+			self.update_status('Error: Camera must be started first.')
+			return
+
+		self.preview_mode = True
+		self.camera_app.get_exp_params()
+		self.preview_btn.setEnabled(False)
+		self.stop_preview_btn.setEnabled(True)
+		self.exp_btn.setEnabled(False)
+		self.trigger_btn.setEnabled(False)
+
+		self.update_status('Starting experiment preview...')
+
+	def stop_preview(self):
+		if self.camera_app:
+			self.preview_mode = False
+			self.camera_app.stop_stim()
+			self.preview_btn.setEnabled(True)
+			self.stop_preview_btn.setEnabled(False)
+			self.trigger_btn.setEnabled(True)
+			self.update_status("Preview stopped.")
+
 	def start_experiment(self):
 		if self.camera_app and self.camera_app.saving:
 			self.camera_app.get_exp_params()
@@ -374,18 +411,14 @@ class CameraGUI(QMainWindow):
 ### need to fix this 
 	def toggle_speckle(self, state):
 		if self.camera_app:
-			enabled = (state == Qt.CheckState.Checked.value)
+			if state == Qt.CheckState.Checked.value:
+				self.camera_app.toggle_speckle()
+				self.update_status("Live speckle imaging enabled.")
 
-			if enabled and not hasattr(self.camera_app, 'circular_buffer'):
-				if self.camera_app.live_speck:
-					self.camera_app.setup_live_speckle_variables()
-
-			self.camera_app.enable_live_speckle = enabled
-
-			if enabled:
-				self.update_status('Live speckle imaging enabled.')
 			else:
-				self.update_status('Live speckle imaging disabled.')
+				if self.camera_app.enable_live_speckle:
+					self.camera_app.toggle_speckle()
+				self.update_status('Live speckle imaging disabled.')			
 
 	def toggle_dfof(self, state):
 		if self.camera_app:
