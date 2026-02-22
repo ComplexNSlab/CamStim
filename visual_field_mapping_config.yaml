@@ -1,18 +1,18 @@
 #Experiment config file
 # Basic file for parameters of the experiment
 # All delays in seconds
-name: "SandCProtocol"
+name: "VisualFieldMapping"
 
 #n_trials: 18
-n_repeats: 6
+n_repeats: 10
 
 # the delay before starting and after ending the experiment (black square comes on at half of this time)
 experiment_delay: 10
 # stim on length
-stim_length: 5
+stim_length: 2
 
 # stim off length (iti)
-inter_trial_delay: 2
+inter_trial_delay: 1
 
 #Parameters of visual stimuli
 

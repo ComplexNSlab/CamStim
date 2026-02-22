@@ -246,16 +246,24 @@ class App(object):
         if isinstance(self.logic_progress, subprocess.Popen):
             try:
                 if self.logic_progress.poll() is None:  
-                    self.logic_progress.terminate()
-                    self.logic_progress.wait(timeout=2.0)
+                    print("\nSending STOP command to logic analyzer...")
+                    self.logic_progress.stdin.write("STOP\n")
+                    self.logic_progress.stdin.flush()
+
+                    try:
+                        self.logic_progress.wait(timeout=5.0)
+                        print("\nLogic analyzer stopped gracefully.")
+                    except subprocess.TimeoutExpired:
+                        print("\nLogic analyzer didn't respond to STOP, forcing terminate...")
+                        self.logic_progress.terminate()
+                        self.logic_progress.wait(timeout=2.0)
                     print("\nLogic analyzer terminated.")
                 else:
                     print("Logic analyzer process has already finished.")
-            except subprocess.TimeoutExpired:
-                print(f"\nLogic analyzer didn't terminate gracefully, forcing kill...")
-                self.logic_progress.kill()
-            except Exception as e:
-                print(f'\nError stopping logic analyzer: {e}.')
+            except (OSError, subprocess.TimeoutExpired) as e:
+                print(f"\nError stopping logic analyzer: {e}.")
+                if self.logic_progress.poll() is None:
+                    self.logic_progress.kill()
 
         self.logic_progress = None
 
@@ -338,16 +346,24 @@ class App(object):
 
     def track_stim(self):
         if isinstance(self.stim_progress, subprocess.Popen):
+            exp_completed = False
+
             for line in self.stim_progress.stdout:
                 print(f"{line.strip()}")
-            print("\nStim finished.")
+
+                if "Experiment routine completed." in line:
+                    print("\nStimulus completed message detected, stopping logic analyzer...")
+                    exp_completed = True
+                    self.stop_logic_analyzer()
+
+            print("\nStim process finished.")
             
-            # # Only stop logic analyzer if it's still running
-            # if (getattr(self, 'logic_progress', None) and 
-            #     isinstance(self.logic_progress, subprocess.Popen) and 
-            #     self.logic_progress.poll() is None):
-            #     print("Stopping logic analyzer after stim completion...")
-            #     self.stop_logic_analyzer()        
+            if not exp_completed:
+                if (getattr(self, 'logic_progress', None) and 
+                    isinstance(self.logic_progress, subprocess.Popen) and
+                    self.logic_progress.poll() is None):
+                    print("\nEnsuring logic analyzer is stopped...")
+                    self.stop_logic_analyzer()       
 
     def setup_live_speckle_variables(self):
         self.buffer_size = self.config['BUFFER_SIZE']
