@@ -10,6 +10,7 @@ from simple_cam_mx import App, load_camera_config
 import threading
 import mvsdk
 import cv2
+import yaml
 
 class CameraGUI(QMainWindow):
 	def __init__(self):
@@ -18,6 +19,8 @@ class CameraGUI(QMainWindow):
 		self.camera_app = None
 		self.preview_mode = False
 		self.preview_exp_thread = None
+		self.current_exp_config = None
+		self.current_cam_config = None
 		self.init_ui()
 		self.setup_timer()
 
@@ -49,6 +52,30 @@ class CameraGUI(QMainWindow):
 		self.video_label.setStyleSheet('border: 1px solid gray; background-color: #f0f0f0;')
 
 		layout.addWidget(self.video_label)
+
+		configs_layout = QHBoxLayout()
+
+		exp_config_group = QGroupBox("Experiment Configuation")
+		exp_config_layout = QVBoxLayout()
+		self.config_display = QTextEdit()
+		self.config_display.setMaximumHeight(200)
+		self.config_display.setReadOnly(True)
+		self.config_display.setText("No experiment running. \n\nPreview/start an experiment to load configuration.")
+		exp_config_layout.addWidget(self.config_display)
+		exp_config_group.setLayout(exp_config_layout)
+		configs_layout.addWidget(exp_config_group)
+
+		cam_config_group = QGroupBox("Camera Configuration")
+		cam_config_layout = QVBoxLayout()
+		self.cam_config_display = QTextEdit()
+		self.cam_config_display.setMaximumHeight(200)
+		self.cam_config_display.setReadOnly(True)
+		self.cam_config_display.setText("Camera configuration will display here.")
+		cam_config_layout.addWidget(self.cam_config_display)
+		cam_config_group.setLayout(cam_config_layout)
+		configs_layout.addWidget(cam_config_group)
+
+		layout.addLayout(configs_layout)
 
 		return panel
 
@@ -202,6 +229,8 @@ class CameraGUI(QMainWindow):
 			self.exp_btn.setEnabled(False)
 			self.preview_btn.setEnabled(True)
 
+			self.load_and_display_camera_config()
+
 			self.update_status("Camera started successfully in continuous mode.")
 		except Exception as e:
 			self.update_status(f"Error starting camera: {str(e)}.")
@@ -225,6 +254,8 @@ class CameraGUI(QMainWindow):
 		self.exp_btn.setEnabled(False)
 		self.preview_btn.setEnabled(False)
 		self.video_label.setText("Camera Stopped.")
+		self.cam_config_display.setText("Camera stopped. \n\n Start camera to begin.")
+		self.current_cam_config = None
 		self.update_status("Camera Stopped.")
 
 	def update_display(self):
@@ -334,6 +365,7 @@ class CameraGUI(QMainWindow):
 
 		self.preview_mode = True
 		self.camera_app.get_exp_params()
+		self.load_and_display_exp_config()
 		self.preview_btn.setEnabled(False)
 		self.stop_preview_btn.setEnabled(True)
 		self.exp_btn.setEnabled(False)
@@ -349,10 +381,13 @@ class CameraGUI(QMainWindow):
 			self.stop_preview_btn.setEnabled(False)
 			self.trigger_btn.setEnabled(True)
 			self.update_status("Preview stopped.")
+			self.config_display.setText("Experiment stopped. \n\nStart/preview experiment to load configuration.")
+			self.current_exp_config = None
 
 	def start_experiment(self):
 		if self.camera_app and self.camera_app.saving:
 			self.camera_app.get_exp_params()
+			self.load_and_display_exp_config()
 			self.exp_btn.setEnabled(False)
 			self.stop_exp_btn.setEnabled(True)
 			self.trigger_btn.setEnabled(False)
@@ -367,12 +402,122 @@ class CameraGUI(QMainWindow):
 			self.stop_exp_btn.setEnabled(False)
 			self.trigger_btn.setEnabled(True)
 			self.update_status("Experiment stopped.")
+			self.config_display.setText("Experiment stopped. \n\nStart/preview experiment to load configuration.")
+			self.current_exp_config = None
+
+	def load_and_display_exp_config(self):
+		try:
+			exp_name = getattr(self.camera_app, 'exp_name', None)
+	        
+			if exp_name is None:
+				self.config_display.setText("No experiment selected.\nPlease start an experiment first.")
+				return
+
+			config_file = f"{exp_name.replace(' ', '_').lower()}_config.yaml"
+	        
+			try:
+				with open(config_file, 'r') as f:
+					config_content = f.read()
+
+				try:
+					config_data = yaml.safe_load(config_content)
+	                
+	                # Simple formatted text without YAML syntax
+					formatted_text = f"=== {exp_name} Configuration ===\n\n"
+	                
+					if isinstance(config_data, dict):
+	                    # Find longest key for alignment
+						max_key_len = max(len(str(k)) for k in config_data.keys())
+	                    
+						for key, value in config_data.items():
+	                        # Format the value nicely
+							if isinstance(value, list):
+								list_str = str(value)
+	                            # Remove brackets for cleaner look
+								list_str = list_str.strip('[]')
+								formatted_text += f"{key:<{max_key_len}} : {list_str}\n"
+							elif isinstance(value, dict):
+								formatted_text += f"{key:<{max_key_len}} : [nested parameters]\n"
+							else:
+								formatted_text += f"{key:<{max_key_len}} : {value}\n"
+	                
+					self.config_display.setText(formatted_text)
+					self.current_exp_config = config_data
+	                
+				except Exception as e:
+	                # If YAML parsing fails, show raw content but remove dashes
+					lines = config_content.split('\n')
+					clean_lines = []
+					for line in lines:
+						if line.strip().startswith('-'):
+	                        # Remove the dash and any following space
+							line = line.replace('-', '', 1).lstrip()
+						clean_lines.append(line)
+	                
+					self.config_display.setText('\n'.join(clean_lines))
+	        
+			except Exception as e:
+				self.config_display.setText(f"Error loading configuration file '{config_file}': \n{str(e)}.")
+
+		except Exception as e:
+			self.config_display.setText(f"Error loading configuration: \n{str(e)}.")
+
+	def load_and_display_camera_config(self):
+		try:
+			config_file = 'cam_config.yml'
+
+			try:
+				with open(config_file, 'r') as f:
+					config_content = f.read()
+
+					try:
+						config_data = yaml.safe_load(config_content)
+
+						formatted_text = "===Camera Settings===\n\n"
+
+						if isinstance(config_data, dict):
+	                    # Find longest key for alignment
+							max_key_len = max(len(str(k)) for k in config_data.keys())
+	                    
+							for key, value in config_data.items():
+		                        # Format the value nicely
+								if isinstance(value, list):
+									list_str = str(value)
+		                            # Remove brackets for cleaner look
+									list_str = list_str.strip('[]')
+									formatted_text += f"{key:<{max_key_len}} : {list_str}\n"
+								elif isinstance(value, dict):
+									formatted_text += f"{key:<{max_key_len}} : [nested parameters]\n"
+								else:
+									formatted_text += f"{key:<{max_key_len}} : {value}\n"
+	                
+						self.cam_config_display.setText(formatted_text)
+						self.current_cam_config = config_data
+
+					except Exception as e:
+		                # If YAML parsing fails, show raw content but remove dashes
+						lines = config_content.split('\n')
+						clean_lines = []
+						for line in lines:
+							if line.strip().startswith('-'):
+		                        # Remove the dash and any following space
+								line = line.replace('-', '', 1).lstrip()
+							clean_lines.append(line)
+		                
+						self.cam_config_display.setText('\n'.join(clean_lines))
+	        
+			except Exception as e:
+				self.cam_config_display.setText(f"Error loading configuration file '{config_file}': \n{str(e)}.")
+
+		except Exception as e:
+			self.cam_config_display.setText(f"Error loading configuration: \n{str(e)}.")
 
 	def update_exposure(self, value):
 		if self.camera_app and self.camera_app.hCamera:
 			try:
 				self.camera_app.exposure = value
 				mvsdk.CameraSetExposureTime(self.camera_app.hCamera, value * 1000)
+				self.load_and_display_camera_config()
 				self.update_status(f"Exposure set to {value}ms.")
 			except Exception as e:
 				self.update_status(f'Error setting exposure: {e}.')
@@ -382,6 +527,7 @@ class CameraGUI(QMainWindow):
 			try:
 				self.camera_app.analog_gain = value
 				mvsdk.CameraSetAnalogGain(self.camera_app.hCamera, value)
+				self.load_and_display_camera_config()
 				self.update_status(f"Gain set to {value}.")
 			except Exception as e:
 				self.update_status(f'Error setting gain: {e}.')

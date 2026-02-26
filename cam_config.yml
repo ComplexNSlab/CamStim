@@ -1,5 +1,5 @@
 # The ID of your experiment 
-EXPERIMENT: "1026Test"
+EXPERIMENT: "ID"
 
 # Whether to use the live speckle feature
 USE_LIVE_SPECKLE: true
@@ -9,7 +9,7 @@ BUFFER_SIZE: 10
 EXPOSURE_TIME: 15
 # Analog gain of the camera, try to keep as low as possible
 ANALOG_GAIN: 1
-# Where should the data be saved
+# Where should the data be saved - now determined by user input in cam control 
 SAVE_DIR: 'C:\\Data\\WF_Recordings'
 
 # Whether the data should be binned during the experiment

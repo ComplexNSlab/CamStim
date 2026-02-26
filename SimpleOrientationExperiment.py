@@ -15,7 +15,7 @@ class SimpleOrientationExperiment(BaseExperiment):
         self.exp_protocol = self.exp_parameters['name']
 
         # Load n trials and timing lengths
-        self.n_trials = self.exp_parameters['n_trials']
+        self.n_repeats = self.exp_parameters['n_repeats']
         self.experiment_delay = self.exp_parameters['experiment_delay']
         self.stim_length = self.exp_parameters['stim_length']
         self.inter_trial_delay = self.exp_parameters['inter_trial_delay']
@@ -52,22 +52,23 @@ class SimpleOrientationExperiment(BaseExperiment):
 
     def generate_stimuli(self):
         if self.give_blanks:
-            all_possible_stims = self.grating_orientations
-            all_possible_stims.append('blank')
+            self.stims_per_condition = len(self.grating_orientations) + 1
         else:
-            all_possible_stims = self.grating_orientations
+            self.stims_per_condition = len(self.grating_orientations)
 
-        n_stims_per_condition = (self.n_trials//len(all_possible_stims))
-        if n_stims_per_condition * len(all_possible_stims) != self.n_trials:
-            raise Exception("Please make the number of trials divisible by total possible stims")
+        self.n_trials = self.stims_per_condition * self.n_repeats
 
-        self.experiment_stims = all_possible_stims * (self.n_trials//len(all_possible_stims))
+        self.experiemnt_stims = []
 
-        np.random.shuffle(self.experiment_stims)
+        for i in range(self.n_repeats):
+            repeat_stims = self.grating_orientations.copy()
+            if self.give_blanks:
+                repeat_stims.append('blank')
 
+            np.random.shuffle(repeat_stims)
 
-        
-
+            for stim in repeat_stims:
+                self.experiment_stims.append(stim)
 
     def run_experiment(self, ):
         self.experiment_running = True

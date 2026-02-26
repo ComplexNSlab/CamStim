@@ -3,12 +3,12 @@
 # All delays in seconds
 name: "SimpleOrientationTuning"
 
-n_trials: 60
+n_repeats: 30
 
 # the delay before starting and after ending the experiment (black square comes on at half of this time)
-experiment_delay: 10
+experiment_delay: 5
 stim_length: 1
-inter_trial_delay: 2
+inter_trial_delay: 1
 
 #Parameters of visual stimuli
 

@@ -7,7 +7,7 @@ import numpy as np
 import yaml
 import itertools
 
-class protocolTest(BaseExperiment):
+class VisualFieldMapping(BaseExperiment):
     def load_experiment_config(self):
         with open (self.exp_parameters_filename, 'r') as file:
             self.exp_parameters = yaml.load(file, Loader=yaml.FullLoader)
@@ -17,7 +17,6 @@ class protocolTest(BaseExperiment):
 
 
         # Load n trials and timing lengths
-        #self.n_trials = self.exp_parameters['n_trials']
         self.n_repeats = self.exp_parameters['n_repeats']
         self.experiment_delay = self.exp_parameters['experiment_delay']
         self.stim_length = self.exp_parameters['stim_length']
@@ -78,9 +77,6 @@ class protocolTest(BaseExperiment):
     #     np.random.shuffle(self.experiment_stims)
 
 
-
-
-    ####
     def generate_stimuli(self):
         all_possible_stims = []
 
@@ -104,10 +100,6 @@ class protocolTest(BaseExperiment):
 
             if self.give_blanks:
                 self.experiment_stims.append('blank')
-    ####
-
-
-
 
     def run_experiment(self, ):
         self.experiment_running = True

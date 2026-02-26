@@ -24,7 +24,7 @@ from SquareExperiment import SquareExperiment
 from LocallySparseNoiseExperiment import LocallySparseNoiseExperiment
 from ElevationMapperExperiment import ElevationMapperExperiment
 from RetinotopyExperiment import RetinotopyExperiment
-from visual_field_mapping import protocolTest
+from VisualFieldMapping import VisualFieldMapping
 
 current_exp = None
 teensy_board = None
@@ -43,7 +43,7 @@ exp_types = {"Locally Sparse Noise": LocallySparseNoiseExperiment,
             "Texture FB-VGG": TextureExperimentFBVGG,
             "Texture FB-VGGMultiTime": TextureExperimentFBVGGMultiTime,
             "Square": SquareExperiment,
-            "Visual Field Mapping": protocolTest}
+            "Visual Field Mapping": VisualFieldMapping}
 
 
 def execute_exp_in_thread(exp_name, experiment_id, mouse_id):

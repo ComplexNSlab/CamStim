@@ -196,6 +196,10 @@ class App(object):
 
     def run_exp(self, exp_name, experiment_id, mouse_id, method):
         try:
+            self.exp_name = exp_name
+            self.experiment_id = experiment_id
+            self.mouse_id = mouse_id
+            
             self.start_logic_analyzer(experiment_id, mouse_id)
             self.start_stim(exp_name, experiment_id, mouse_id, method)
 
