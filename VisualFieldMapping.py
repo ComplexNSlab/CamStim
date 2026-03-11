@@ -51,32 +51,6 @@ class VisualFieldMapping(BaseExperiment):
         #self.exp_log.log.create_dataset("daq_sampling_rate", data=self.daq.sampling_rate)
         self.exp_log.log['daq_sampling_rate'] = self.daq.sampling_rate
 
-    # def generate_stimuli(self):
-    #     all_possible_stims = []
-    #     # for ori in self.grating_orientations:
-    #     #     for sf in self.grating_sfs:
-    #     #         for size in self.grating_sizes:
-    #     #             all_possible_stims.append([pos, ori, sf, size])
-    #     for pos in self.grating_position:
-    #         for ori in self.grating_orientations:
-    #             for sf in self.grating_sfs:
-    #                 for size in self.grating_sizes:
-    #                     all_possible_stims.append([pos, ori, sf, size])
-
-    #     if self.give_blanks:
-    #         all_possible_stims.append('blank')
-       
-
-    #     n_stims_per_condition = (self.n_trials//len(all_possible_stims))
-    #     if n_stims_per_condition * len(all_possible_stims) != self.n_trials:
-    #         print(len(all_possible_stims))
-    #         raise Exception("Please make the number of trials divisible by total possible stims")
-
-    #     self.experiment_stims = all_possible_stims * (self.n_trials//len(all_possible_stims))
-
-    #     np.random.shuffle(self.experiment_stims)
-
-
     def generate_stimuli(self):
         all_possible_stims = []
 
@@ -109,6 +83,8 @@ class VisualFieldMapping(BaseExperiment):
         self.clock.reset()
         self.master_clock.reset()
         
+        self.update_status("Starting Visual Field Mapping experiment.")
+
         # Half of the experiment delay there is no black square and then we draw it, that's when the experiment starts.
         while self.clock.getTime() < self.experiment_delay:
             if self.clock.getTime() >= self.experiment_delay/2:
@@ -122,7 +98,9 @@ class VisualFieldMapping(BaseExperiment):
         self.absolute_total_time += self.experiment_delay
 
         for trial in range(self.n_trials):
-            print("Trial {} out of {}.".format(trial+1, self.n_trials))
+            self.update_trial_progress(trial + 1, self.n_trials)
+            # print("Trial {} out of {}.".format(trial+1, self.n_trials))
+
             current_position = self.experiment_stims[trial][0]
             current_orientation = self.experiment_stims[trial][1]
             current_sf = self.experiment_stims[trial][2]
@@ -137,10 +115,7 @@ class VisualFieldMapping(BaseExperiment):
                 self.ps_grating.sf = current_sf
                 self.ps_grating.size = current_size
                 self.ps_grating.phase = current_phase#np.round(np.random.random(), 2)
-                
-            
-
-
+                            
             total_time = 0
             self.clock.reset()
 
@@ -172,8 +147,6 @@ class VisualFieldMapping(BaseExperiment):
 
             total_time += self.stim_length
 
-
-
             while self.clock.getTime() < total_time+self.inter_trial_delay:
                 self.photodiode_square.draw()
                 self.window.flip()
@@ -193,4 +166,4 @@ class VisualFieldMapping(BaseExperiment):
 
         self.exp_log.save_log()
         self.experiment_running = False
-
+        self.update_status("Visual Field Mapping experiment completed.")

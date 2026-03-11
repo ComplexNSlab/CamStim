@@ -21,12 +21,25 @@ class CameraGUI(QMainWindow):
 		self.preview_exp_thread = None
 		self.current_exp_config = None
 		self.current_cam_config = None
+		self.current_teensy_config = None
+		self.exp_status_timer = QTimer()
+		self.exp_status_timer.timeout.connect(self.check_experiment_status)
+		self.exp_status_timer.start(100)
 		self.init_ui()
 		self.setup_timer()
 
+	def check_experiment_status(self):
+		if self.camera_app and hasattr(self.camera_app, 'get_exp_status'):
+			messages = self.camera_app.get_exp_status()
+			for msg in messages:
+				if msg[0] == "status":
+					self.update_status(msg[1])
+				elif msg[0] == "trial":
+					self.update_status(msg[3])
+
 	def init_ui(self):
 		self.setWindowTitle('Camera GUI')
-		self.setGeometry(100, 100, 1200, 800)
+		self.setGeometry(100, 100, 1400, 800)
 
 		central_widget = QWidget()
 		self.setCentralWidget(central_widget)
@@ -35,10 +48,10 @@ class CameraGUI(QMainWindow):
 		central_widget.setLayout(main_layout)
 
 		left_panel = self.create_display_panel()
-		main_layout.addWidget(left_panel, 1)
+		main_layout.addWidget(left_panel, 2)
 
 		right_panel = self.create_control_panel()
-		main_layout.addWidget(right_panel, 2)
+		main_layout.addWidget(right_panel, 1)
 
 	def create_display_panel(self):
 		panel = QWidget()
@@ -55,7 +68,7 @@ class CameraGUI(QMainWindow):
 
 		configs_layout = QHBoxLayout()
 
-		exp_config_group = QGroupBox("Experiment Configuation")
+		exp_config_group = QGroupBox("Experiment Configuration")
 		exp_config_layout = QVBoxLayout()
 		self.config_display = QTextEdit()
 		self.config_display.setMaximumHeight(200)
@@ -74,6 +87,16 @@ class CameraGUI(QMainWindow):
 		cam_config_layout.addWidget(self.cam_config_display)
 		cam_config_group.setLayout(cam_config_layout)
 		configs_layout.addWidget(cam_config_group)
+
+		teensy_config_group = QGroupBox("Teensy Configuration")
+		teensy_config_layout = QVBoxLayout()
+		self.teensy_config_display = QTextEdit()
+		self.teensy_config_display.setMaximumHeight(200)
+		self.teensy_config_display.setReadOnly(True)
+		self.teensy_config_display.setText("Teensy configuration will display here.")
+		teensy_config_layout.addWidget(self.teensy_config_display)
+		teensy_config_group.setLayout(teensy_config_layout)
+		configs_layout.addWidget(teensy_config_group)
 
 		layout.addLayout(configs_layout)
 
@@ -230,6 +253,7 @@ class CameraGUI(QMainWindow):
 			self.preview_btn.setEnabled(True)
 
 			self.load_and_display_camera_config()
+			self.load_and_display_teensy_config()
 
 			self.update_status("Camera started successfully in continuous mode.")
 		except Exception as e:
@@ -364,6 +388,12 @@ class CameraGUI(QMainWindow):
 			return
 
 		self.preview_mode = True
+		if hasattr(self.camera_app, 'exp_list') and self.camera_app.exp_list:
+				self.update_status("Available Experiments:")
+				for num, name in self.camera_app.exp_list.items():
+					self.update_status(f"{num}: {name}")
+		else:
+			self.update_status("No experiment list available.")
 		self.camera_app.get_exp_params()
 		self.load_and_display_exp_config()
 		self.preview_btn.setEnabled(False)
@@ -386,6 +416,12 @@ class CameraGUI(QMainWindow):
 
 	def start_experiment(self):
 		if self.camera_app and self.camera_app.saving:
+			if hasattr(self.camera_app, 'exp_list') and self.camera_app.exp_list:
+				self.update_status("Available Experiments:")
+				for num, name in self.camera_app.exp_list.items():
+					self.update_status(f"{num}: {name}")
+			else:
+				self.update_status("No experiment list available.")
 			self.camera_app.get_exp_params()
 			self.load_and_display_exp_config()
 			self.exp_btn.setEnabled(False)
@@ -421,9 +457,8 @@ class CameraGUI(QMainWindow):
 
 				try:
 					config_data = yaml.safe_load(config_content)
-	                
-	                # Simple formatted text without YAML syntax
-					formatted_text = f"=== {exp_name} Configuration ===\n\n"
+	                	           
+					formatted_text = f"{exp_name} Configuration\n\n"
 	                
 					if isinstance(config_data, dict):
 	                    # Find longest key for alignment
@@ -457,10 +492,10 @@ class CameraGUI(QMainWindow):
 					self.config_display.setText('\n'.join(clean_lines))
 	        
 			except Exception as e:
-				self.config_display.setText(f"Error loading configuration file '{config_file}': \n{str(e)}.")
+				self.config_display.setText(f"Error loading experiment configuration file '{config_file}': \n{str(e)}.")
 
 		except Exception as e:
-			self.config_display.setText(f"Error loading configuration: \n{str(e)}.")
+			self.config_display.setText(f"Error loading experiment configuration: \n{str(e)}.")
 
 	def load_and_display_camera_config(self):
 		try:
@@ -473,7 +508,7 @@ class CameraGUI(QMainWindow):
 					try:
 						config_data = yaml.safe_load(config_content)
 
-						formatted_text = "===Camera Settings===\n\n"
+						formatted_text = "Camera Settings\n\n"
 
 						if isinstance(config_data, dict):
 	                    # Find longest key for alignment
@@ -507,10 +542,60 @@ class CameraGUI(QMainWindow):
 						self.cam_config_display.setText('\n'.join(clean_lines))
 	        
 			except Exception as e:
-				self.cam_config_display.setText(f"Error loading configuration file '{config_file}': \n{str(e)}.")
+				self.cam_config_display.setText(f"Error loading camera configuration file '{config_file}': \n{str(e)}.")
 
 		except Exception as e:
-			self.cam_config_display.setText(f"Error loading configuration: \n{str(e)}.")
+			self.cam_config_display.setText(f"Error loading camera configuration: \n{str(e)}.")
+
+	def load_and_display_teensy_config(self):
+		try:
+			config_file = 'teensyParams.yaml'
+
+			try:
+				with open(config_file, 'r') as f:
+					config_content = f.read()
+
+					try:
+						config_data = yaml.safe_load(config_content)
+
+						formatted_text = "Teensy Parameters\n\n"
+
+						if isinstance(config_data, dict):
+	                    # Find longest key for alignment
+							max_key_len = max(len(str(k)) for k in config_data.keys())
+	                    
+							for key, value in config_data.items():
+		                        # Format the value nicely
+								if isinstance(value, list):
+									list_str = str(value)
+		                            # Remove brackets for cleaner look
+									list_str = list_str.strip('[]')
+									formatted_text += f"{key:<{max_key_len}} : {list_str}\n"
+								elif isinstance(value, dict):
+									formatted_text += f"{key:<{max_key_len}} : [nested parameters]\n"
+								else:
+									formatted_text += f"{key:<{max_key_len}} : {value}\n"
+	                
+						self.teensy_config_display.setText(formatted_text)
+						self.current_teensy_config = config_data
+
+					except Exception as e:
+		                # If YAML parsing fails, show raw content but remove dashes
+						lines = config_content.split('\n')
+						clean_lines = []
+						for line in lines:
+							if line.strip().startswith('-'):
+		                        # Remove the dash and any following space
+								line = line.replace('-', '', 1).lstrip()
+							clean_lines.append(line)
+		                
+						self.teensy_config_display.setText('\n'.join(clean_lines))
+	        
+			except Exception as e:
+				self.teensy_config_display.setText(f"Error loading teensy configuration file '{config_file}': \n{str(e)}.")
+
+		except Exception as e:
+			self.teensy_config_display.setText(f"Error loading teensy configuration: \n{str(e)}.")
 
 	def update_exposure(self, value):
 		if self.camera_app and self.camera_app.hCamera:
@@ -553,8 +638,7 @@ class CameraGUI(QMainWindow):
 				if self.camera_app.removeBackground:
 					self.camera_app.toggle_background_removal()
 				self.update_status('Background subtraction disabled.')
-
-### need to fix this 
+ 
 	def toggle_speckle(self, state):
 		if self.camera_app:
 			if state == Qt.CheckState.Checked.value:
@@ -611,4 +695,3 @@ def main():
 
 if __name__ == '__main__':
 	main()
-

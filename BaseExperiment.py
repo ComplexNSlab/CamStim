@@ -17,13 +17,15 @@ class BaseExperiment(ABC):
         self.mouse_id = mouse_id
         self.debug = debug
 
+        self.status_callback = None
+        self.trial_callback = None
+
         self.acquisition_running = False
         self.experiment_running = False
 
         # the NI daq logging class 
         self.daq = daq
         
-
         self.monitor = None
         self.monitor_settings = None
         self.window = None
@@ -37,7 +39,6 @@ class BaseExperiment(ABC):
 
         self.load_monitor(monitor_config_filename)
         self.load_window()
-
 
         self.save_dir = None
         self.experiment_log_filename = None
@@ -56,13 +57,30 @@ class BaseExperiment(ABC):
         # Common exp log    
         self.exp_log.log['daq_sampling_rate'] = self.daq.sampling_rate
 
+    def set_status_callback(self, callback):
+        self.status_callback = callback
 
+    def set_trial_callback(self, callback):
+        self.trial_callback = callback
 
+    def update_status(self, message):
+        if self.status_callback:
+            self.status_callback(message)
+        else:
+            print(message)
+
+    def update_trial_progress(self, current, total):
+        message = f"Trial {current} out of {total}."
+        if self.trial_callback:
+            self.trial_callback(current, total, message)
+        elif self.status_callback:
+            self.status_callback(message)
+        else:
+            print(message)
 
     def __del__(self):
         self.window.close()
-
-    
+   
     def load_monitor(self, monitor_config_filename):
         with open(monitor_config_filename, 'r') as file:
             self.monitor_settings = yaml.load(file, Loader=yaml.FullLoader)

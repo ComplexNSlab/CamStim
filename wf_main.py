@@ -54,36 +54,53 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
 
         exp_type = exp_types.get(exp_name)
         if exp_type is None:
-            print("\nExperiment name error.")
+            error_msg = "\nExperiment name error."
+            print(error_msg)
+            if status_callback:
+                status_callback(error_msg)
             return
-
 
         data_aq = PCODAQ(experiment_id, bool_DEBUG)
         teensy_board = Teensy(experiment_id, bool_DEBUG, "teensyParams.yaml")
-        print("\nTeensy started.")
+
+        start_msg = "\nTeensy started."
+        print(start_msg)
+        if status_callback:
+            status_callback("Teensy started.")
 
         current_exp = exp_type(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "save_settings_config.yaml", config_file, debug=bool_DEBUG)
+
+        if status_callback:
+            current_exp_set_status_callback(status_callback)
+        if trial_callback:
+            current_exp.set_trial_callback(trial_callback)
 
         current_exp.load_experiment_config()
         current_exp.start_data_acquisition()
         teensy_board.start_teensy()
 
         experiment_running = True
-        print("\nSTARTING experiment...")
+
+        start_msg = f"\nSTARTING experiment {exp_name}..."
+        print(start_msg)
+        if status_callback:
+            status_callback(f"Starting experiment: {exp_name}.")
 
         current_exp.run_experiment()
         experiment_running = False
 
-        # threading.Thread(target=listen_for_stop, args=(teensy_board, exp), daemon=True).start()
-
-        print("\nALL DONE with experiment {}! ".format(experiment_id))
+        done_msg = f"\nALL DONE with experiment {experiment_id}!"
+        print(done_msg)
+        if status_callback:
+            status_callback(f"Experiment {exp_name} completed.")
 
     except Exception as e:
-        print(f"\nError in experiment: {e}")
+        error_msg = f"\nError in experiment: {e}."
+        print(error_msg)
+        if status_callback:
+            status_callback(f"Error: {str(e)}.")
+            
         experiment_running = False
-
-    # return teensy_board, exp
-
 
 def execute_exp(exp_name, experiment_id, mouse_id):
     data_aq = PCODAQ(experiment_id, bool_DEBUG)
@@ -219,7 +236,6 @@ if __name__ == "__main__":
                 else:
                     print(f"\nUnknown command: {cmd}.")
     
-
     except KeyboardInterrupt:
         print("\nReceived CTRL-C event")
         if current_exp.experiment_running:

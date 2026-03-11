@@ -108,6 +108,7 @@ class App(object):
         self.save_dir_ready = False
         self.save_file_handle = None
         self.gui_mode = gui_mode
+        self.exp_status_queue = queue.Queue()
 
         # self.check_and_fix_existing_experiment()
 
@@ -140,6 +141,28 @@ class App(object):
             except:
                 return None
         return None
+
+    def experiment_status_callback(self, message):
+        if hasattr(self, 'exp_status_queue'):
+            self.exp_status_queue.put(("status", message))
+        if not self.gui_mode:
+            print(f"[Experiment] {message}")
+
+    def experiment_trial_callback(self, current, total, message):
+        if hasattr(self, 'exp_status_queue'):
+            self.exp_status_queue.put(("trial", current, total, message))
+        if not self.gui_mode:
+            print(message)
+
+    def get_exp_status(self):
+        messages = []
+        try:
+            while True:
+                msg = self.exp_status_queue.get_nowait()
+                messages.append(msg)
+        except queue.Empty:
+            pass
+        return messages
 
     def get_exp_params(self):
         if hasattr(self, 'exp_thread') and self.exp_thread and self.exp_thread.is_alive():
@@ -201,7 +224,9 @@ class App(object):
             self.mouse_id = mouse_id
 
             self.start_logic_analyzer(experiment_id, mouse_id)
-            self.start_stim(exp_name, experiment_id, mouse_id, method)
+            self.start_stim(exp_name, experiment_id, mouse_id, method,
+                                self.experiment_status_callback,
+                                self.experiment_trial_callback)
 
             threading.Thread(target=self.wait_for_directories, args=(experiment_id,), daemon=True).start()
 
@@ -280,7 +305,7 @@ class App(object):
             for line in self.logic_progress.stdout:
                 print(f"{line.strip()}")
 
-    def start_stim(self, exp_name, experiment_id, mouse_id, method):
+    def start_stim(self, exp_name, experiment_id, mouse_id, method, status_callback=None, trial_callback=None):
         if getattr(self, 'stim_progress', None):
             print("Experiment currently running. Stopping...")
             if hasattr(self.stim_progress, 'terminate'):
@@ -288,6 +313,9 @@ class App(object):
             self.stop_stim()
 
         print(f"\nStarting {exp_name} with exp. ID {experiment_id} and mouse {mouse_id}...")
+
+        self.status_callback = status_callback
+        self.trial_callback = trial_callback
 
         if method.lower() == 's':
             self.stim_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/camstim/wf_main.py", exp_name, experiment_id, mouse_id],
@@ -353,7 +381,24 @@ class App(object):
             exp_completed = False
 
             for line in self.stim_progress.stdout:
-                print(f"{line.strip()}")
+                line = line.strip()
+                print(line)
+
+                if "Trial" in line and "out of" in line:
+                    try:
+                        parts = line.split()
+                        if len(parts) >= 4 and parts[0] == "Trial" and parts[2] == "out" and parts[3] == "of":
+                            current = int(parts[1])
+                            total = int(parts[4]) if len(parts) > 4 else 0
+                            if hasattr(self, 'trial_callback') and self.trial_callback:
+                                self.trial_callback(current, total, line)
+
+                    except (ValueError, IndexError):
+                        if hasattr(self, 'status_callback') and self.status_callback:
+                            self.status_callback(line)
+                else:
+                    if hasattr(self, 'status_callback') and self.status_callback:
+                        self.status_callback(line)
 
                 if "Experiment routine completed." in line:
                     print("\nStimulus completed message detected, stopping logic analyzer...")
@@ -367,7 +412,10 @@ class App(object):
                     isinstance(self.logic_progress, subprocess.Popen) and
                     self.logic_progress.poll() is None):
                     print("\nEnsuring logic analyzer is stopped...")
-                    self.stop_logic_analyzer()       
+                    self.stop_logic_analyzer()  
+
+            self.status_callback = None
+            self.trial_callback = None     
 
     def setup_live_speckle_variables(self):
         self.buffer_size = self.config['BUFFER_SIZE']
