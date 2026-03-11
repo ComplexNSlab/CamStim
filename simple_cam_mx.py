@@ -199,7 +199,7 @@ class App(object):
             self.exp_name = exp_name
             self.experiment_id = experiment_id
             self.mouse_id = mouse_id
-            
+
             self.start_logic_analyzer(experiment_id, mouse_id)
             self.start_stim(exp_name, experiment_id, mouse_id, method)
 
@@ -234,7 +234,7 @@ class App(object):
 
         print("\nStarting logic analyzer...")
 
-        self.logic_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/camstim/manage_sigrok.py", experiment_id, mouse_id],
+        self.logic_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/camstim/continuous_sigrok.py", experiment_id, mouse_id],
             stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True, cwd="C:/Data/logicAnalyzer_Recordings")
 
         self.logic_thread = threading.Thread(target=self.track_logic, daemon=True)

@@ -1,0 +1,231 @@
+import subprocess
+import sys
+from datetime import datetime
+import threading
+from pathlib import Path
+import time
+import os
+import signal
+import msvcrt
+
+stop_flag = False
+sigrok_exe = 'C:\\Program Files\\sigrok\\sigrok-cli\\sigrok-cli.exe'
+
+def stream_reader(pipe, label):
+    """Continuously read a text stream line by line and forward to stdout."""
+    try:
+        for line in pipe:
+            sys.stdout.write(f"[{label}] {line}")
+            sys.stdout.flush()
+    except Exception as e:
+        sys.stdout.write(f"[{label}] Reader error: {e}\n")
+        sys.stdout.flush()
+    finally:
+        if hasattr(pipe, 'close'):
+            pipe.close()
+
+def listen_for_stop_thread():
+    """Thread that continuously checks for STOP command."""
+    global stop_flag
+    print("\nListening for STOP command (type 'STOP' and press Enter)...")
+    print("(Typing is not echoed - just type STOP and press Enter)")
+    
+    buffer = ''
+    while not stop_flag:
+        try:
+            if msvcrt.kbhit():
+                char = msvcrt.getch().decode('utf-8', errors='ignore')
+                
+                if char == '\r':  # Enter key
+                    if buffer.upper() == 'STOP':
+                        print("\n\n✓ STOP command received!", flush=True)
+                        stop_flag = True
+                        break
+                    else:
+                        # Show that we received something else
+                        print(f"\n[Received: {buffer}] - not STOP", flush=True)
+                        buffer = ''
+                elif char == '\b':  # Backspace
+                    buffer = buffer[:-1]
+                else:
+                    buffer += char
+        except:
+            pass
+        time.sleep(0.1)
+
+def capture_sigrok_continuous(sigrok_exe, output_file, samplerate="20kHz"):
+    """Start sigrok-cli with proper process handling and streaming output."""
+    output_path = str(output_file.resolve())
+
+    cmd = [
+        sigrok_exe,
+        '--driver', 'fx2lafw',
+        '--config', f'samplerate={samplerate}',
+        '--continuous',
+        '-o', output_path,
+        '-O', 'srzip'
+    ]
+    
+    print(f"\nStarting sigrok-cli with command: {' '.join(cmd)}")
+    print("="*60)
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+        universal_newlines=True,
+        encoding='utf-8'
+    )
+
+    threading.Thread(target=stream_reader, args=(process.stdout, "OUT"), daemon=True).start()
+    threading.Thread(target=stream_reader, args=(process.stderr, "ERR"), daemon=True).start()
+
+    return process
+
+def stop_sigrok(process):
+    """Stop exactly like the test - just terminate and wait."""
+    if process.poll() is not None:
+        return
+
+    print(f"\nStopping sigrok-cli...")
+
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+        print("Process terminated.")
+    except subprocess.TimeoutExpired:
+        print("Terminate timeout, killing...")
+        process.kill()
+        process.wait()
+    except Exception as e:
+        print(f"Error stopping process: {e}")
+
+def signal_handler(sig, frame):
+    """Handle interrupt signals."""
+    global stop_flag
+    print(f"\nReceived signal {sig} - stopping capture.")
+    stop_flag = True
+
+def main():
+    global stop_flag
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    if len(sys.argv) < 3:
+        print("Usage: python script.py <experiment_id> <mouse_id>")
+        sys.exit(1)
+    
+    experiment_id, mouse_id = sys.argv[1], sys.argv[2]
+    
+    date = datetime.now().strftime("%Y%m%d")
+    save_dir = Path(f"C:/Data/{experiment_id}/logicAnalyzer_Recordings")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    base_filename = f"{date}_{experiment_id}_{mouse_id}"
+    output_file = save_dir / f"{base_filename}.sr"
+    
+    counter = 1
+    while output_file.exists():
+        output_file = save_dir / f"{base_filename}_{counter}.sr"
+        counter += 1
+    
+    samplerate = "20kHz"
+    
+    print(f"\n{'-'*60}")
+    print(f"LOGIC ANALYZER RECORDING")
+    print(f"{'-'*60}")
+    print(f"Experiment: {experiment_id}")
+    print(f"Mouse: {mouse_id}")
+    print(f"Samplerate: {samplerate}")
+    print(f"Output file: {output_file}")
+    print(f"\n{'-'*60}")
+    print("To stop recording:")
+    print("  - Type STOP and press Enter")
+    print("  - OR press Ctrl+C")
+    print(f"{'-'*60}\n")
+
+    stop_flag = False
+
+    # Start listener thread
+    stop_thread = threading.Thread(target=listen_for_stop_thread, daemon=True)
+    stop_thread.start()
+
+    # Start recording
+    start_time = time.time()
+    process = capture_sigrok_continuous(sigrok_exe, output_file, samplerate)
+
+    # Wait a moment to ensure capture starts
+    time.sleep(2)
+    
+    # Check initial file status
+    if output_file.exists():
+        initial_size = output_file.stat().st_size
+        print(f"Initial file size: {initial_size} bytes")
+    else:
+        print("Waiting for file to be created...")
+
+    # Monitor the process
+    try:
+        while not stop_flag:
+            # Check if process is still running
+            if process.poll() is not None:
+                print(f"\n  Process ended unexpectedly (exit code: {process.returncode})")
+                break
+            
+            time.sleep(0.5)
+            
+            # Show file size periodically
+            if output_file.exists():
+                current_size = output_file.stat().st_size
+                if current_size > 0 and not hasattr(main, 'shown_size'):
+                    print(f"File is growing: {current_size} bytes")
+                    main.shown_size = True
+
+        # If we exited due to stop_flag, stop gracefully
+        if stop_flag and process.poll() is None:
+            print("\nSTOP command detected, stopping capture...")
+            stop_sigrok(process)
+            
+    except Exception as e:
+        print(f"\nError: {e}")
+        if process.poll() is None:
+            stop_sigrok(process)
+
+    elapsed = time.time() - start_time
+    
+    # Give a moment for final write
+    time.sleep(1)
+
+    # Final report
+    if output_file.exists():
+        size_bytes = output_file.stat().st_size
+        size_mb = size_bytes / (1024 * 1024)
+        
+        print(f"\n\n{'-'*60}")
+        print(f"RECORDING COMPLETE")
+        print(f"{'-'*60}")
+        print(f"Duration: {elapsed:.1f} seconds")
+        print(f"File saved: {output_file}")
+        print(f"File size: {size_mb:.3f} MB ({size_bytes} bytes)")
+        
+        if size_bytes > 0:
+            print("SUCCESS! Data was captured.")
+        else:
+            print("\n ERROR: File size is 0 bytes!")
+            print("No data was captured.")
+    else:
+        print(f"\n No output file created!")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nReceived Ctrl+C - stopping capture.")
+        stop_flag = True
+        time.sleep(2)
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        import traceback
+        traceback.print_exc()
