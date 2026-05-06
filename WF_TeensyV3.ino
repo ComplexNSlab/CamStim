@@ -235,6 +235,7 @@ void triggerPulse(bool use_led1) { //Sends one LED pulse and TTL if configured
     digitalWrite(FRAME_TTL_PIN, HIGH);
     delayMicroseconds(ttl_pulse_width);
     digitalWrite(FRAME_TTL_PIN, LOW);
+    delayMicroseconds(E_LED-ttl_pulse_width-OFFSET);
     //Serial.println("TTL to Task Teensy fired."); // debugging 
   } else {
     delayMicroseconds(E_LED);
