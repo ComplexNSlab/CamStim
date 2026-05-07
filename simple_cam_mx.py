@@ -1075,8 +1075,9 @@ class App(object):
     			raise RuntimeError("Frame queue overflow: write too slow")
                 frame_timestamp = time.time()
                 self.frame_queue.put((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))  # Add frame and timestamp to the buffer
-            
-            self.display_queue.put(frame_data)  # Add frame to display buffer    
+            # Stop addding to the display queue if the frame queue is getting too full
+            if self.frame_queue.qsize() < 0.9 * self.frame_queue.maxsize: 
+            	self.display_queue.put(frame_data)  # Add frame to display buffer    
             self.frame_count += 1
         else:
             if self.last_timestamp is None or current_time-self.last_timestamp >= self.special_frame_period:
@@ -1090,8 +1091,9 @@ class App(object):
     				raise RuntimeError("Frame queue overflow: write too slow")
                     frame_timestamp = time.time()
                     self.frame_queue.put((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))  # Add frame and timestamp to the buffer
-                
-                self.display_queue.put(frame_data)  # Add frame to display buffer    
+                # Stop addding to the display queue if the frame queue is getting too full
+            	if self.frame_queue.qsize() < 0.9 * self.frame_queue.maxsize: 
+                	self.display_queue.put(frame_data)  # Add frame to display buffer    
                 self.frame_count += 1
             else:
                 return
