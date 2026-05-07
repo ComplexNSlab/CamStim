@@ -1,4 +1,4 @@
-# coding=utf-8
+	# coding=utf-8
 import cv2
 import numpy as np
 import mvsdk
@@ -51,7 +51,7 @@ class App(object):
         self.saving = False
         self.normalizeImage = False
         self.removeBackground = False
-        self.frame_queue = queue.Queue()  # Buffer for frames
+        self.frame_queue = queue.Queue(maxsize=1000)  # Buffer for frames
         self.display_queue = queue.Queue()  # Queue for displaying frames
         self.save_thread = threading.Thread(target=self.save_frames)  # Thread for saving frames
         self.display_thread = threading.Thread(target=self.display_frames)  # Create display thread
@@ -1052,9 +1052,14 @@ class App(object):
         # At this time, the image is already stored in pFrameBuffer. 
         # For color cameras, pFrameBuffer=RGB data, for monochrome cameras, pFrameBuffer=8-bit grayscale data
         # Convert pFrameBuffer into OpenCV image format for subsequent algorithm processing
-        frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData)
-        mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
         
+	# 0506 JO update
+	#frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData)
+        #mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+	frame_data = bytes((mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData))
+	mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+
+
         if not self.acquiring:
             self.acquiring = True
             self.t_start = time.time()
@@ -1062,6 +1067,12 @@ class App(object):
 
         if not self.force_framerate:
             if self.saving:
+		# 0505 JO update
+		if self.frame_queue.qsize() > 0.9 * self.frame_queue.maxsize:
+    			print("Warning: save queue almost full")
+
+		if self.frame_queue.full():
+    			raise RuntimeError("Frame queue overflow: write too slow")
                 frame_timestamp = time.time()
                 self.frame_queue.put((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))  # Add frame and timestamp to the buffer
             
@@ -1072,6 +1083,11 @@ class App(object):
                 self.last_timestamp = current_time
 
                 if self.saving:
+			# 0505 JO update
+			if self.frame_queue.qsize() > 0.9 * self.frame_queue.maxsize:
+    				print("Warning: save queue almost full")
+			if self.frame_queue.full():
+    				raise RuntimeError("Frame queue overflow: write too slow")
                     frame_timestamp = time.time()
                     self.frame_queue.put((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))  # Add frame and timestamp to the buffer
                 
