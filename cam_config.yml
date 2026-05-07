@@ -22,6 +22,18 @@ FORCE_FRAMERATE: false
 # What framerate to be forced, make sure exposure time is < forced framerate
 SPECIAL_FRAMERATE: 50
 
+# Save pipeline settings for high-throughput acquisition
+# Number of frames buffered in RAM before disk writes catch up.
+# 2048x2048x8-bit ~= 4 MiB/frame, so 1000 frames ~= 4 GiB.
+SAVE_QUEUE_MAX_FRAMES: 1200
+# Frames grouped into one write batch. Larger batches reduce syscall overhead.
+SAVE_BATCH_FRAMES: 64
+# Keep True to fail fast if writer cannot keep up (prevents silent frame drops).
+STRICT_NO_DROP_SAVE: true
+# Keep False for max throughput (writes raw bytes exactly as acquired).
+# True applies flip/bin processing in save thread and is significantly slower.
+SAVE_PROCESSED_FRAMES: false
+
 
 ## Frame trigger mode settings
 # The serial port of the RPi pico that will generate the camera's PWM signal

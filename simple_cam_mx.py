@@ -51,12 +51,19 @@ class App(object):
         self.saving = False
         self.normalizeImage = False
         self.removeBackground = False
-        self.frame_queue = queue.Queue(maxsize=1000)  # Buffer for frames
-        self.display_queue = queue.Queue()  # Queue for displaying frames
+        self.save_queue_max_frames = int(config.get('SAVE_QUEUE_MAX_FRAMES', 2000))
+        self.frame_queue = queue.Queue(maxsize=self.save_queue_max_frames)  # Buffer for save path
+        self.display_queue = queue.Queue(maxsize=3)  # Keep only recent frames for display
         self.save_thread = threading.Thread(target=self.save_frames)  # Thread for saving frames
         self.display_thread = threading.Thread(target=self.display_frames)  # Create display thread
         self.frame_count = 0  # To keep track of saved 
         self.frames_written = 0
+        self.dropped_display_frames = 0
+        self.dropped_save_frames = 0
+        self.save_overflow = False
+        self.strict_no_drop_save = bool(config.get('STRICT_NO_DROP_SAVE', True))
+        self.save_batch_frames = int(config.get('SAVE_BATCH_FRAMES', 64))
+        self.save_processed_frames = bool(config.get('SAVE_PROCESSED_FRAMES', False))
         self.live_speck = config['USE_LIVE_SPECKLE']
         self.exposure = config['EXPOSURE_TIME'] # in ms
         self.analog_gain = config['ANALOG_GAIN'] 
@@ -109,6 +116,8 @@ class App(object):
         self.save_file_handle = None
         self.gui_mode = gui_mode
         self.exp_status_queue = queue.Queue()
+        self.latest_frame_data = None
+        self.latest_frame_lock = threading.Lock()
 
         # self.check_and_fix_existing_experiment()
 
@@ -135,12 +144,40 @@ class App(object):
             self.udp_thread.join(timeout=2.0)
 
     def get_frame_for_display(self):
-        if not self.display_queue.empty():
+        return self.get_latest_frame()
+
+    def _clear_queue(self, q):
+        while True:
             try:
-                return self.display_queue.get_nowait()
-            except:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
+    def _put_display_frame(self, frame_data):
+        with self.latest_frame_lock:
+            self.latest_frame_data = frame_data
+
+        try:
+            self.display_queue.put_nowait(frame_data)
+        except queue.Full:
+            try:
+                self.display_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            try:
+                self.display_queue.put_nowait(frame_data)
+            except queue.Full:
+                # If a concurrent producer refilled it, keep the latest snapshot only.
+                pass
+
+            self.dropped_display_frames += 1
+
+    def get_latest_frame(self):
+        with self.latest_frame_lock:
+            if self.latest_frame_data is None:
                 return None
-        return None
+            return bytes(self.latest_frame_data)
 
     def experiment_status_callback(self, message):
         if hasattr(self, 'exp_status_queue'):
@@ -443,6 +480,43 @@ class App(object):
         return binned_frame
 
     def save_frames(self):
+        last_flush_time = time.time()
+        flush_interval_s = 0.5
+        flush_every_n_frames = max(1, self.save_batch_frames)
+        write_batch = []
+        ts_batch = []
+        sys_ts_batch = []
+
+        def flush_batch(force_flush=False):
+            nonlocal last_flush_time
+            if not write_batch or self.save_file_handle is None:
+                return
+
+            if self.save_processed_frames:
+                # Process and write each frame when explicitly requested.
+                for frame_data in write_batch:
+                    frame = np.frombuffer(frame_data, dtype=self.dtype).reshape((self.height, self.width))
+                    frame = cv2.flip(frame, 1)
+                    if self.bin_exp:
+                        frame = self.bin_frame(frame)
+                    frame.tofile(self.save_file_handle)
+            else:
+                # Fast path: write raw camera bytes exactly as acquired.
+                self.save_file_handle.write(b''.join(write_batch))
+
+            self.frame_timestamps.extend(ts_batch)
+            self.sys_clock_timestamps.extend(sys_ts_batch)
+            self.frames_written += len(write_batch)
+
+            should_flush = force_flush or ((time.time() - last_flush_time) >= flush_interval_s)
+            if should_flush:
+                self.save_file_handle.flush()
+                last_flush_time = time.time()
+
+            write_batch.clear()
+            ts_batch.clear()
+            sys_ts_batch.clear()
+
         while True:
             if self.saving:
                 if not self.save_dir_ready or self.save_dir is None:
@@ -451,36 +525,37 @@ class App(object):
 
                 if self.save_file_handle is None:
                     file_path = os.path.join(self.save_dir, self.filename + '.bin')
-                    self.save_file_handle = open(file_path, 'ab')
+                    # Buffered appends improve sustained throughput when frame rate is high.
+                    self.save_file_handle = open(file_path, 'ab', buffering=4 * 1024 * 1024)
 
                 # Process frames if available
-                if not self.frame_queue.empty():
-                    frame_data, count, timestamp, sys_stamp = self.frame_queue.get()
-                    self.frame_timestamps.append(timestamp)
-                    self.sys_clock_timestamps.append(sys_stamp)
+                try:
+                    frame_data, count, timestamp, sys_stamp = self.frame_queue.get(timeout=0.02)
+                except queue.Empty:
+                    flush_batch(force_flush=True)
+                    if self.quit and self.frame_queue.empty():
+                        break
+                    continue
 
-                    frame = np.frombuffer(frame_data, dtype=self.dtype).reshape((self.height, self.width))
-                    frame = cv2.flip(frame, 1)
-
-                    if self.bin_exp:
-                        frame = self.bin_frame(frame)
-
-                    frame.tofile(self.save_file_handle)
-                    self.save_file_handle.flush()
-                    self.frames_written += 1
+                write_batch.append(frame_data)
+                ts_batch.append(timestamp)
+                sys_ts_batch.append(sys_stamp)
+                if len(write_batch) >= flush_every_n_frames:
+                    flush_batch(force_flush=False)
 
                 # Check if it's time to exit: quit is True and no frames left in the queue
-                elif self.quit and self.frame_queue.empty():
+                if self.quit and self.frame_queue.empty():
+                    flush_batch(force_flush=True)
                     break
-                else:
-                    # Optionally, sleep for a very short time to prevent high CPU usage
-                    time.sleep(0.005)
             else:
+                flush_batch(force_flush=True)
                 if self.quit:
                     break
                 time.sleep(0.005)
 
         if self.save_file_handle is not None:
+            flush_batch(force_flush=True)
+            self.save_file_handle.flush()
             self.save_file_handle.close()
             self.save_file_handle = None
 
@@ -488,9 +563,9 @@ class App(object):
             # After processing all frames, save metadata
             metadata = {
                 'num_frames': self.frames_written,
-                'frame_width': self.width if not self.bin_exp else self.width//self.bin_size,
-                'frame_height': self.height if not self.bin_exp else self.height//self.bin_size,
-                'data_type': self.dtype  if not self.bin_exp else 'uint16',
+                'frame_width': self.width if (not self.save_processed_frames or not self.bin_exp) else self.width//self.bin_size,
+                'frame_height': self.height if (not self.save_processed_frames or not self.bin_exp) else self.height//self.bin_size,
+                'data_type': self.dtype if (not self.save_processed_frames or not self.bin_exp) else 'uint16',
                 'frame_timestamps': self.frame_timestamps,
                 'sys_clock_timestamps': self.sys_clock_timestamps,
                 'frame_exposure': self.exposure,
@@ -498,6 +573,7 @@ class App(object):
                 'pwm_frequency': self.pwm_freq,
                 'pwm_duty': self.pwm_duty,
                 'binned_live': self.bin_exp,
+                'save_processed_frames': self.save_processed_frames,
                 'bin_size': self.bin_size,
                 'force_framerate': self.force_framerate,
                 'special_framerate': self.special_framerate
@@ -579,7 +655,7 @@ class App(object):
                     self.roi_plotter.update_plot(average_intensity)
                     
                 if self.plot_roi or self.live_speck:
-                    self.display_queue.queue.clear()
+                    self._clear_queue(self.display_queue)
 
                 cv2.imshow("Live View", frame)
 
@@ -660,7 +736,7 @@ class App(object):
                 self.toggle_speckle()
 
         print("Quit order received for display thread.")
-        self.display_queue.queue.clear()
+        self._clear_queue(self.display_queue)
 
     def toggle_speckle(self):
         self.enable_live_speckle = True if not self.enable_live_speckle else False
@@ -695,9 +771,9 @@ class App(object):
         intensity_history = []
 
         while self.histogram_open and self.histogram_thread_running and not self.quit:
-            if not self.display_queue.empty():
+            frame_data = self.get_latest_frame()
+            if frame_data is not None:
                 try:
-                    frame_data = self.display_queue.get_nowait()
                     frame = np.frombuffer(frame_data, dtype=self.dtype)
                     frame = frame.reshape((self.height, self.width))
 
@@ -776,10 +852,14 @@ class App(object):
 
             try:
                 for i in range(F0_n_frames):
-                    frame_data = self.display_queue.get(timeout=1)
+                    frame_data = self.get_latest_frame()
+                    if frame_data is None:
+                        time.sleep(0.02)
+                        continue
                     frame = np.frombuffer(frame_data, dtype=self.dtype)
                     frame = frame.reshape((self.height, self.width))
                     baseline_frames.append(frame.astype(np.float32))
+                    time.sleep(0.01)
             except queue.Empty:
                 print("Warning: Not enough frames in queue to compute baseline F0.")
                 self.dFoF_open = False
@@ -848,7 +928,11 @@ class App(object):
             print("\n Stopping background substraction.")
         else:
             self.removeBackground = True
-            frame_data = self.display_queue.get()
+            frame_data = self.get_latest_frame()
+            if frame_data is None:
+                print("\n No frame available, could not capture background image.")
+                self.removeBackground = False
+                return
             frame = np.frombuffer(frame_data, dtype=self.dtype)
             frame = frame.reshape((self.height, self.width))                     
             kernel = np.ones((10,10),np.float32)/100
@@ -867,8 +951,8 @@ class App(object):
         if self.autoI > 49:
             self.autoI = 0.05
 
-        if not self.display_queue.empty():
-            frame_data = self.display_queue.get()
+        frame_data = self.get_latest_frame()
+        if frame_data is not None:
             frame = np.frombuffer(frame_data, dtype=self.dtype)
             frame = frame.reshape((self.height, self.width))
 
@@ -1019,8 +1103,8 @@ class App(object):
             average_fps = self.frame_count / elapsed_time if elapsed_time > 0 else 0
 
             # Print stats on the same line
-            print("\rSave Queue: {}, Frames Saved: {}, Display Queue: {}, Frames Displayed: {}, Average FPS: {:.2f} Saturated Pixels: {:06d}".format(
-                  self.frame_queue.qsize(), self.frames_written, self.display_queue.qsize(), self.frame_count, average_fps, self.n_saturated_pixels), end='')
+            print("\rSave Queue: {}, Frames Saved: {}, Save Drops: {}, Display Queue: {}, Display Drops: {}, Frames Displayed: {}, Average FPS: {:.2f} Saturated Pixels: {:06d}".format(
+                self.frame_queue.qsize(), self.frames_written, self.dropped_save_frames, self.display_queue.qsize(), self.dropped_display_frames, self.frame_count, average_fps, self.n_saturated_pixels), end='')
             time.sleep(0.1)
 
         print("\n")  # Ensure to move to a new line after quitting
@@ -1053,11 +1137,11 @@ class App(object):
         # For color cameras, pFrameBuffer=RGB data, for monochrome cameras, pFrameBuffer=8-bit grayscale data
         # Convert pFrameBuffer into OpenCV image format for subsequent algorithm processing
         
-	# 0506 JO update
-	#frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData)
-        #mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
-	frame_data = bytes((mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData))
-	mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+        # 0506 JO update
+        # frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData)
+        # mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+        frame_data = bytes((mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData))
+        mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
 
 
         if not self.acquiring:
@@ -1067,33 +1151,42 @@ class App(object):
 
         if not self.force_framerate:
             if self.saving:
-		# 0505 JO update
-		if self.frame_queue.qsize() > 0.9 * self.frame_queue.maxsize:
-    			print("Warning: save queue almost full")
-
-		if self.frame_queue.full():
-    			raise RuntimeError("Frame queue overflow: write too slow")
                 frame_timestamp = time.time()
-                self.frame_queue.put((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))  # Add frame and timestamp to the buffer
+                try:
+                    self.frame_queue.put_nowait((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))
+                except queue.Full:
+                    self.save_overflow = True
+                    if self.strict_no_drop_save:
+                        print("CRITICAL: save queue overflow, stopping acquisition to prevent silent frame loss.")
+                        self.quit = True
+                        return
+                    self.dropped_save_frames += 1
+                    if self.dropped_save_frames % 100 == 1:
+                        print("Warning: save queue full, dropping frames to keep acquisition real-time.")
             # Stop addding to the display queue if the frame queue is getting too full
-            if self.frame_queue.qsize() < 0.9 * self.frame_queue.maxsize: 
-            	self.display_queue.put(frame_data)  # Add frame to display buffer    
+            if self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize:
+                self._put_display_frame(frame_data)
             self.frame_count += 1
         else:
             if self.last_timestamp is None or current_time-self.last_timestamp >= self.special_frame_period:
                 self.last_timestamp = current_time
 
                 if self.saving:
-			# 0505 JO update
-			if self.frame_queue.qsize() > 0.9 * self.frame_queue.maxsize:
-    				print("Warning: save queue almost full")
-			if self.frame_queue.full():
-    				raise RuntimeError("Frame queue overflow: write too slow")
                     frame_timestamp = time.time()
-                    self.frame_queue.put((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))  # Add frame and timestamp to the buffer
+                    try:
+                        self.frame_queue.put_nowait((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))
+                    except queue.Full:
+                        self.save_overflow = True
+                        if self.strict_no_drop_save:
+                            print("CRITICAL: save queue overflow, stopping acquisition to prevent silent frame loss.")
+                            self.quit = True
+                            return
+                        self.dropped_save_frames += 1
+                        if self.dropped_save_frames % 100 == 1:
+                            print("Warning: save queue full, dropping frames to keep acquisition real-time.")
                 # Stop addding to the display queue if the frame queue is getting too full
-            	if self.frame_queue.qsize() < 0.9 * self.frame_queue.maxsize: 
-                	self.display_queue.put(frame_data)  # Add frame to display buffer    
+                if self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize:
+                    self._put_display_frame(frame_data)
                 self.frame_count += 1
             else:
                 return
