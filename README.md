@@ -110,7 +110,7 @@ All YAML configuration files are in `config_files/`:
 
 See `CHANGES.md` for recent refactoring and architectural decisions.
 
-## Authors
+## Contributors
 
 - Federico Bolaños: original code
 - Marina Xu: major reimplementation using a teensy microcontroller and sigrok analyzer as DAQ. New Pyqt6 GUI from scratch
