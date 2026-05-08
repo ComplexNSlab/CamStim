@@ -493,13 +493,14 @@ class App(object):
                 return
 
             if self.save_processed_frames:
-                # Process and write each frame when explicitly requested.
-                for frame_data in write_batch:
-                    frame = np.frombuffer(frame_data, dtype=self.dtype).reshape((self.height, self.width))
-                    frame = cv2.flip(frame, 1)
-                    if self.bin_exp:
-                        frame = self.bin_frame(frame)
-                    frame.tofile(self.save_file_handle)
+                # Process entire batch at once using vectorized 3D operations.
+                n = len(write_batch)
+                batch = np.frombuffer(b''.join(write_batch), dtype=self.dtype).reshape((n, self.height, self.width))
+                batch = np.ascontiguousarray(batch[:, :, ::-1])  # horizontal flip
+                if self.bin_exp:
+                    bs = self.bin_size
+                    batch = batch.reshape(n, self.height // bs, bs, self.width // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
+                batch.tofile(self.save_file_handle)
             else:
                 # Fast path: write raw camera bytes exactly as acquired.
                 self.save_file_handle.write(b''.join(write_batch))
