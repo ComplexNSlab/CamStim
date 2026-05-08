@@ -10,9 +10,9 @@ sys.stdin.reconfigure(line_buffering=True)
 
 from time import sleep, time
 
-from PCODAQ import ExperimentDAQ
-from PCODAQ import Teensy
-from experiment_discovery import discover_experiment_types
+from core.ExperimentDAQ import ExperimentDAQ
+from core.TeensyController import TeensyController
+from core.experiment_discovery import discover_experiment_types
 
 current_exp = None
 teensy_board = None
@@ -40,7 +40,7 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
             return
 
         data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
-        teensy_board = Teensy(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
+        teensy_board = TeensyController(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
 
         start_msg = "\nTeensy started."
         print(start_msg)
@@ -83,7 +83,7 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
 
 def execute_exp(exp_name, experiment_id, mouse_id):
     data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
-    teensy_board = Teensy(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
+    teensy_board = TeensyController(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
     print("\nTeensy started.")
 
     config_file = str(CONFIG_DIR / f"{exp_name.replace(' ', '_').lower()}_config.yaml")

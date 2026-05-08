@@ -2,7 +2,7 @@
 import sys
 import cv2
 import numpy as np
-import mvsdk
+from core import mvsdk
 import time
 import platform
 import queue
@@ -11,14 +11,13 @@ import serial
 import yaml
 from pathlib import Path
 import os
-from roi_module import ROIDrawer, ROIPlotter
+from core.roi_module import ROIDrawer, ROIPlotter
 import matplotlib.pyplot as plt
 import subprocess
 import tkinter as tk
 from tkinter import simpledialog
 import shutil
-from experiment_discovery import get_experiment_list
-
+from core.experiment_discovery import get_experiment_list
 
 CONFIG_DIR = Path('config_files')
 CONFIG_FILE = str(CONFIG_DIR / 'cam_config.yaml')

@@ -138,7 +138,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     if len(sys.argv) < 3:
-        print("Usage: python script.py <experiment_id> <mouse_id> [base_filename]")
+        print("Usage: python continuous_sigrok.py <experiment_id> <mouse_id> [base_filename]")
         sys.exit(1)
     
     experiment_id, mouse_id = sys.argv[1], sys.argv[2]

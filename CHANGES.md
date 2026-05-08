@@ -18,16 +18,26 @@
 - Replaced old save-settings file usage with `config.yaml`.
 - Centralized `SAVE_DIR` and `SIGROK_EXE` in `config.yaml`.
 - Moved all project YAML files into `config_files/` and updated runtime loaders to use that location.
-- Added robust relative-path resolution for YAML config loading in `simple_cam_mx.py`, `BaseExperiment.py`, and `PCODAQ.py`.
+- Added robust relative-path resolution for YAML config loading in `simple_cam_mx.py`, `BaseExperiment.py`, and `ExperimentDAQ.py`.
 - Updated `wf_main.py`, `gui_progress.py`, and `continuous_sigrok.py` to reference YAML files under `config_files/`.
 - Removed unused camera config options: `EXPERIMENT`, `SAVE_PROCESSED_FRAMES`, `STRICT_NO_DROP_SAVE`, `PICO_SERIAL_PORT`, `PICO_PWM_FREQUENCY`, `PICO_PWM_DUTY`, `FORCE_FRAMERATE`, `SPECIAL_FRAMERATE`, and `UDP_TRIGGER_PORT`.
 - Removed the UDP listener thread from `simple_cam_mx.py`.
+
+## Code Organization & Restructuring
+- Created `core/` directory for core library modules: `BaseExperiment.py`, `ExperimentDAQ.py`, `ExperimentLogger.py`, `TeensyController.py`, `experiment_discovery.py`, `mvsdk.py`, `roi_module.py`, `LocallySparseNoise.py`
+- Created `utils/` directory for utility scripts and hardware files: `simple_cam_mx.py` (camera helper), `continuous_sigrok.py` (logic analyzer), `wf_main.py` (experiment launcher), `teensyConnectTest.py` (Teensy testing), `WF_TeensyV3.ino` (Teensy firmware)
+- Root now contains the main GUI entry point: `camstim.py` (renamed from `gui_progress.py`)
+- Moved all non-entry-point Python files out of root for cleaner organization
+- Updated all imports across files to reflect new module structure
+- Removed `labjack_data.npy` (unused artifact from deprecated LabJack DAQ era)
 
 ## Experiment Launch and DAQ Cleanup
 - `start_stim` now always uses subprocess launch; removed UDP stim mode (`u`) and method selection prompt from experiment dialogs.
 - Removed unused DAQ modules and references for `NISDAQ`, `HTDAQ`, and `BlueDAQ`.
 - Removed `run_BLUE_experiment.py`.
-- Refactored `PCODAQ.py` to a minimal `ExperimentDAQ` class with only currently used DAQ interface (`sampling_rate`, `ni_log_filename`, `start_everything`, `stop_everything`), while keeping `Teensy` support in place.
+- Removed `FlashingLedExperiment.py` (unused, incompatible with current DAQ interface).
+- Refactored `ExperimentDAQ.py` (formerly `PCODAQ.py`) to a minimal `ExperimentDAQ` class with only currently used DAQ interface (`sampling_rate`, `ni_log_filename`, `start_everything`, `stop_everything`).
+- Extracted `TeensyController` class into its own dedicated module `TeensyController.py` for better separation of concerns.
 
 ## Experiment Type Organization and Dynamic Discovery
 - Moved all experiment type modules into new `experiment_types/` package directory.

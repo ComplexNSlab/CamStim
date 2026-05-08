@@ -7,9 +7,9 @@ from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QImage, QPixmap
 import time
 from collections import deque
-from simple_cam_mx import App, load_camera_config
+from utils.simple_cam_mx import App, load_camera_config
 import threading
-import mvsdk
+from core import mvsdk
 import cv2
 import yaml
 from pathlib import Path

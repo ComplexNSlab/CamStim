@@ -1,4 +1,5 @@
-from BaseExperiment import BaseExperiment
+from core.BaseExperiment import BaseExperiment
+from core.LocallySparseNoise import LocallySparseNoise
 
 import psychopy.visual
 import psychopy.event
@@ -6,8 +7,6 @@ import psychopy.monitors
 import numpy as np
 import yaml
 import matplotlib.pyplot as plt
-
-from LocallySparseNoise import *
 from time import sleep
 
 class LocallySparseNoiseExperiment(BaseExperiment):

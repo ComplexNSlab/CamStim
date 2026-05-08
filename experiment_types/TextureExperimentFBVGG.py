@@ -1,4 +1,4 @@
-from BaseExperiment import BaseExperiment
+from core.BaseExperiment import BaseExperiment
 
 import psychopy.visual
 import psychopy.event

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from ExperimentLogger import ExperimentLogger
+from core.ExperimentLogger import ExperimentLogger
 
 import psychopy.visual
 import psychopy.event

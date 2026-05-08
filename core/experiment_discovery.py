@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 
-EXPERIMENT_TYPES_DIR = Path(__file__).resolve().parent / "experiment_types"
+EXPERIMENT_TYPES_DIR = Path(__file__).resolve().parent.parent / "experiment_types"
 EXPERIMENT_NAME_OVERRIDES = {
     "TextureExperimentFB": "Texture FB",
     "TextureExperimentFBVGG": "Texture FB-VGG",
