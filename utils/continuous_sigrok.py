@@ -6,14 +6,18 @@ from pathlib import Path
 import time
 import os
 import signal
-import msvcrt
 import yaml
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 stop_flag = False
 
 
 def load_runtime_config():
-    config_path = Path(__file__).resolve().parent / 'config_files' / 'config.yaml'
+    config_path = Path(__file__).resolve().parent.parent / 'config_files' / 'config.yaml'
     if not config_path.is_file():
         raise Exception(f"Config file not found: {config_path}")
 
@@ -52,30 +56,37 @@ def listen_for_stop_thread():
     """Thread that continuously checks for STOP command."""
     global stop_flag
     print("\nListening for STOP command (type 'STOP' and press Enter)...")
-    print("(Typing is not echoed - just type STOP and press Enter)")
-    
-    buffer = ''
-    while not stop_flag:
-        try:
-            if msvcrt.kbhit():
-                char = msvcrt.getch().decode('utf-8', errors='ignore')
-                
-                if char == '\r':  # Enter key
-                    if buffer.upper() == 'STOP':
-                        print("\n\n✓ STOP command received!", flush=True)
-                        stop_flag = True
-                        break
-                    else:
-                        # Show that we received something else
+
+    if msvcrt is not None:
+        print("(Typing is not echoed - just type STOP and press Enter)")
+        buffer = ''
+        while not stop_flag:
+            try:
+                if msvcrt.kbhit():
+                    char = msvcrt.getch().decode('utf-8', errors='ignore')
+
+                    if char == '\r':  # Enter key
+                        if buffer.upper() == 'STOP':
+                            print("\n\n✓ STOP command received!", flush=True)
+                            stop_flag = True
+                            break
                         print(f"\n[Received: {buffer}] - not STOP", flush=True)
                         buffer = ''
-                elif char == '\b':  # Backspace
-                    buffer = buffer[:-1]
-                else:
-                    buffer += char
-        except:
-            pass
-        time.sleep(0.1)
+                    elif char == '\b':  # Backspace
+                        buffer = buffer[:-1]
+                    else:
+                        buffer += char
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return
+
+    # Linux/macOS path: read stdin line-by-line so parent process can send STOP.
+    for line in sys.stdin:
+        if line.strip().upper() == 'STOP':
+            print("\n\n✓ STOP command received!", flush=True)
+            stop_flag = True
+            break
 
 def capture_sigrok_continuous(sigrok_exe, output_file, samplerate="20kHz"):
     """Start sigrok-cli with proper process handling and streaming output."""

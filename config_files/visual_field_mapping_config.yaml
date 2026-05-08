@@ -3,7 +3,7 @@
 # All delays in seconds
 name: "VisualFieldMapping"
 
-n_repeats: 10
+n_repeats: 1
 
 # the delay before starting and after ending the experiment (black square comes on at half of this time)
 experiment_delay: 10

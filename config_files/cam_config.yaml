@@ -2,6 +2,9 @@
 USE_LIVE_SPECKLE: true
 BUFFER_SIZE: 10
 
+# Debug option: run experiments without initializing the Teensy board.
+DEBUG_SKIP_TEENSY: true
+
 # What exposure time to use (in ms, can be < 0)
 EXPOSURE_TIME: 15
 # Analog gain of the camera, try to keep as low as possible

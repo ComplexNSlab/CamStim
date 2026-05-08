@@ -19,14 +19,26 @@ from tkinter import simpledialog
 import shutil
 from core.experiment_discovery import get_experiment_list
 
-CONFIG_DIR = Path('config_files')
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+CONFIG_DIR = REPO_ROOT / 'config_files'
 CONFIG_FILE = str(CONFIG_DIR / 'cam_config.yaml')
 SAVE_SETTINGS_CONFIG_FILE = str(CONFIG_DIR / 'config.yaml')
 
+
+def _resolve_config_path(path_value):
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+
+    repo_candidate = REPO_ROOT / path
+    if repo_candidate.is_file():
+        return repo_candidate
+
+    return Path(__file__).resolve().parent / path
+
 def load_camera_config(yaml_file_path):
-    config_path = Path(yaml_file_path)
-    if not config_path.is_absolute():
-        config_path = Path(__file__).resolve().parent / config_path
+    config_path = _resolve_config_path(yaml_file_path)
 
     if config_path.is_file():
         with open(config_path, 'r') as file:
@@ -40,9 +52,7 @@ def load_camera_config(yaml_file_path):
 
 
 def load_save_root(yaml_file_path=SAVE_SETTINGS_CONFIG_FILE):
-    config_path = Path(yaml_file_path)
-    if not config_path.is_absolute():
-        config_path = Path(__file__).resolve().parent / config_path
+    config_path = _resolve_config_path(yaml_file_path)
 
     if not config_path.is_file():
         raise Exception("Save settings file does not exist, please create it. {}".format(config_path))
@@ -66,6 +76,12 @@ class App(object):
         super(App, self).__init__()
 
         self.config = config
+        self.gui_mode = gui_mode
+        debug_skip_teensy_cfg = config.get('DEBUG_SKIP_TEENSY', False)
+        if isinstance(debug_skip_teensy_cfg, str):
+            self.debug_skip_teensy = debug_skip_teensy_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            self.debug_skip_teensy = bool(debug_skip_teensy_cfg)
         self.vmin = 0
         self.vmax = 30    
         self.pFrameBuffer = 0
@@ -305,21 +321,32 @@ class App(object):
             pass
         return messages
 
-    def get_exp_params(self):
+    def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None):
         if hasattr(self, 'exp_thread') and self.exp_thread and self.exp_thread.is_alive():
             print('\nExperiment selection already in progress.')
-            return
+            return False
 
-        print("\n The available experiments are listed:")
-        for i, name in enumerate(self.exp_list, 1):
-            print(f"{i}: {name}")
+        if exp_name is None or experiment_id is None or mouse_id is None:
+            print("\n The available experiments are listed:")
+            for i, name in enumerate(self.exp_list, 1):
+                print(f"{i}: {name}")
 
-        exp_name, experiment_id, mouse_id = self.show_exp_dialogs()
-        if not exp_name: 
-            return
+            exp_name, experiment_id, mouse_id = self.show_exp_dialogs()
+
+        exp_name = (exp_name or '').strip()
+        experiment_id = (experiment_id or '').strip()
+        mouse_id = (mouse_id or '').strip()
+        if not exp_name or not experiment_id or not mouse_id:
+            return False
+
+        self.exp_name = exp_name
+        self.experiment_id = experiment_id
+        self.mouse_id = mouse_id
+        self.filename = f"{mouse_id}_{experiment_id}"
 
         self.exp_thread = threading.Thread(target=self.run_exp, args=(exp_name, experiment_id, mouse_id), daemon=True)
         self.exp_thread.start()
+        return True
 
     def show_exp_dialogs(self):
         try:
@@ -388,13 +415,17 @@ class App(object):
             self.filename = f"{mouse_id}_{experiment_id}"
             self._prepare_save_directory(mouse_id, experiment_id)
 
-            self.start_logic_analyzer(experiment_id, mouse_id, self.filename)
+            if self.debug_skip_teensy:
+                self.experiment_status_callback("DEBUG_SKIP_TEENSY enabled: skipping logic analyzer.")
+            else:
+                self.start_logic_analyzer(experiment_id, mouse_id, self.filename)
             self.start_stim(exp_name, experiment_id, mouse_id,
                                 self.experiment_status_callback,
                                 self.experiment_trial_callback)
 
         except Exception as e:
             print(f'\nError in experiment selection: {e}.')
+            self.experiment_status_callback(f"Error in experiment selection: {e}.")
         finally:
             self.exp_thread = None
 
@@ -403,7 +434,7 @@ class App(object):
         save_dir = os.path.join(save_root, mouse_id, experiment_id)
         os.makedirs(save_dir, exist_ok=True)
 
-        cam_config_source = Path(__file__).resolve().parent / CONFIG_FILE
+        cam_config_source = Path(CONFIG_FILE)
         cam_config_target = Path(save_dir) / 'cam_config.yaml'
         if cam_config_source.is_file():
             shutil.copyfile(cam_config_source, cam_config_target)
@@ -421,12 +452,13 @@ class App(object):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         sigrok_script = os.path.join(script_dir, "continuous_sigrok.py")
 
-        cmd = ["python", "-u", sigrok_script, experiment_id, mouse_id]
+        cmd = [sys.executable, "-u", sigrok_script, experiment_id, mouse_id]
         if base_filename:
             cmd.append(base_filename)
 
         self.logic_progress = subprocess.Popen(cmd,
-            stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True)
+            stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True,
+            cwd=str(REPO_ROOT))
 
         self.logic_thread = threading.Thread(target=self.track_logic, daemon=True)
         self.logic_thread.start()
@@ -487,8 +519,14 @@ class App(object):
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         wf_script = os.path.join(script_dir, "wf_main.py")
-        self.stim_progress = subprocess.Popen(["python", "-u", wf_script, exp_name, experiment_id, mouse_id],
-            stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True)
+        cmd = [sys.executable, "-u", wf_script, exp_name, experiment_id, mouse_id]
+        if self.debug_skip_teensy:
+            cmd.append("--skip-teensy")
+            print("DEBUG_SKIP_TEENSY enabled: running experiment without Teensy.")
+
+        self.stim_progress = subprocess.Popen(cmd,
+            stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True,
+            cwd=str(REPO_ROOT))
         threading.Thread(target=self.track_stim, daemon=True).start()
         print("\nStarted stim via subprocess.")
 
@@ -559,6 +597,13 @@ class App(object):
                     self.stop_logic_analyzer()
 
             print("\nStim process finished.")
+
+            if self.stim_progress.poll() not in (0, None):
+                exit_code = self.stim_progress.returncode
+                msg = f"Experiment subprocess exited with code {exit_code}."
+                print(msg)
+                if hasattr(self, 'status_callback') and self.status_callback:
+                    self.status_callback(msg)
             
             if not exp_completed:
                 if (getattr(self, 'logic_progress', None) and 
@@ -1158,7 +1203,8 @@ class App(object):
             print("{}: {} {}".format(i, DevInfo.GetFriendlyName(), DevInfo.GetPortType()))
         i = 0 if nDev == 1 else int(input("Select camera: "))
         DevInfo = DevList[i]
-        self.print_keyboard_commands()
+        if not self.gui_mode:
+            self.print_keyboard_commands()
 
         # Open camera
         self.hCamera = 0

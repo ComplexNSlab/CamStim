@@ -54,13 +54,26 @@ camstim/
 
 3. **Install dependencies:**
    ```bash
-   pip install numpy PyQt6 psychopy pyserial pyyaml opencv-python matplotlib
+   conda install -c conda-forge opencv gtk3 gstreamer pyqt qt-main pyqt6
+   pip install 'setuptools<70'
+   pip install --upgrade psychopy
+   pip install pyserial pyyaml matplotlib
    ```
+   
+   **Notes on compatibility:**
+   - The setuptools downgrade to <70 is required for the `pkg_resources` module that psychopy needs
+   - Upgrading psychopy ensures Python 3.10 compatibility and installs all required dependencies
    
    Optional (for data analysis):
    ```bash
    pip install jupyter h5py
    ```
+
+   Optional (for `RetinotopyExperiment`):
+   ```
+   pip install -r external/WarpedVisualStim/requirements.txt
+   ```
+   `RetinotopyExperiment` imports `WarpedVisualStim` from `external/WarpedVisualStim`.
 
 4. **Verify installation:**
    ```bash

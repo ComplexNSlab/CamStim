@@ -92,12 +92,13 @@ class BaseExperiment(ABC):
         if config_path.is_absolute():
             return str(config_path)
 
-        base_dir = Path(__file__).resolve().parent
-        config_dir_path = base_dir / 'config_files' / config_path
+        repo_root = Path(__file__).resolve().parent.parent
+        config_dir_path = repo_root / 'config_files' / config_path
         if config_dir_path.is_file():
             return str(config_dir_path)
 
-        return str(base_dir / config_path)
+        # Backward-compatible fallback for callers that pass core-relative paths.
+        return str(Path(__file__).resolve().parent / config_path)
    
     def load_monitor(self, monitor_config_filename):
         monitor_path = self.resolve_config_path(monitor_config_filename)

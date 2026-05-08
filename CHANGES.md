@@ -1,5 +1,35 @@
 # Changes Summary
 
+## GUI Experiment Flow, Debug Mode, and Linux Compatibility
+- Added Qt-native experiment controls in `camstim.py`: experiment dropdown, experiment ID, and mouse ID fields.
+- Experiment dropdown now populates at GUI startup and remains available independently of camera start/stop.
+- Routed GUI Preview/Start actions through selected Qt values instead of terminal/Tk prompts.
+- Made right-side control panel scrollable so experiment controls remain visible on smaller windows.
+- Fixed stop-camera thread joins to avoid `cannot join thread before it is started` runtime errors.
+
+- Added `DEBUG_SKIP_TEENSY` support in `cam_config.yaml` to run experiments without Teensy hardware.
+- `simple_cam_mx.py` now propagates debug no-Teensy mode to `wf_main.py` via `--skip-teensy`.
+- `wf_main.py` now supports `--skip-teensy` and bypasses Teensy initialization/start/stop when enabled.
+
+- Fixed subprocess launch robustness:
+	- `wf_main.py` now adds repo root to `sys.path` so `core` imports work when launched as a script.
+	- Subprocesses launched from `simple_cam_mx.py` now use `sys.executable` and repo-root `cwd`.
+	- Added clearer status reporting when experiment subprocess exits with errors.
+
+- Fixed config path handling regressions across runtime modules:
+	- `simple_cam_mx.py`, `BaseExperiment.py`, and `TeensyController.py` now resolve relative YAML paths from repository-root `config_files/` first (with fallback).
+	- `wf_main.py` and `continuous_sigrok.py` use repository-root `config_files/` paths.
+
+- Updated Linux runtime defaults in `config_files/config.yaml`:
+	- Preserved old Windows values as comments.
+	- Active defaults now use Linux-safe values (`SAVE_DIR: /home/orlandi/data/camstim`, `SIGROK_EXE: sigrok-cli`).
+
+- Made `continuous_sigrok.py` cross-platform by guarding Windows-only `msvcrt` import and adding stdin-based STOP handling for non-Windows systems.
+
+- Added optional local third-party dependency integration for retinotopy support:
+	- Clone `WarpedVisualStim` under `external/`.
+	- `RetinotopyExperiment.py` now imports it from `external/WarpedVisualStim`.
+
 ## Camera Pipeline and Binning
 - Added automatic stop flow after logic-analyzer termination (disable trigger, stop experiment, stop camera).
 - GUI preview now applies the configured binning path so display output matches experiment settings.

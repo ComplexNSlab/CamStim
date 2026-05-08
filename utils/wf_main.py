@@ -5,6 +5,10 @@ import json
 import threading
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 sys.stdout.reconfigure(line_buffering=True)
 sys.stdin.reconfigure(line_buffering=True)
 
@@ -22,10 +26,10 @@ experiment_running = False
 bool_DEBUG = True
 
 exp_types = discover_experiment_types()
-CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
+CONFIG_DIR = Path(__file__).resolve().parent.parent / 'config_files'
 
 
-def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
+def execute_exp_in_thread(exp_name, experiment_id, mouse_id, skip_teensy=False):
     global current_exp, teensy_board, experiment_running, current_exp_thread
 
     try:
@@ -40,12 +44,15 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
             return
 
         data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
-        teensy_board = TeensyController(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
-
-        start_msg = "\nTeensy started."
-        print(start_msg)
-        if status_callback:
-            status_callback("Teensy started.")
+        teensy_board = None
+        if not skip_teensy:
+            teensy_board = TeensyController(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
+            start_msg = "\nTeensy started."
+            print(start_msg)
+            if status_callback:
+                status_callback("Teensy started.")
+        else:
+            print("\nDEBUG: skipping Teensy startup.")
 
         current_exp = exp_type(experiment_id, mouse_id, data_aq, str(CONFIG_DIR / "monitor_config.yaml"), str(CONFIG_DIR / "config.yaml"), config_file, debug=bool_DEBUG)
 
@@ -56,7 +63,8 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
 
         current_exp.load_experiment_config()
         current_exp.start_data_acquisition()
-        teensy_board.start_teensy()
+        if teensy_board:
+            teensy_board.start_teensy()
 
         experiment_running = True
 
@@ -81,10 +89,14 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
             
         experiment_running = False
 
-def execute_exp(exp_name, experiment_id, mouse_id):
+def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False):
     data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
-    teensy_board = TeensyController(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
-    print("\nTeensy started.")
+    teensy_board = None
+    if not skip_teensy:
+        teensy_board = TeensyController(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
+        print("\nTeensy started.")
+    else:
+        print("\nDEBUG: skipping Teensy startup.")
 
     config_file = str(CONFIG_DIR / f"{exp_name.replace(' ', '_').lower()}_config.yaml")
 
@@ -97,7 +109,8 @@ def execute_exp(exp_name, experiment_id, mouse_id):
 
     exp.load_experiment_config()
     exp.start_data_acquisition()
-    teensy_board.start_teensy()
+    if teensy_board:
+        teensy_board.start_teensy()
 
     experiment_running = True
     print("\nSTARTING experiment...")
@@ -145,10 +158,18 @@ def listen_for_stop(teensy_board, exp):
 if __name__ == "__main__":
     try:
         if len(sys.argv) > 1:
-            exp_name = sys.argv[1]
-            experiment_id = sys.argv[2]
-            mouse_id = sys.argv[3]
-            teensy_board, current_exp = execute_exp(exp_name, experiment_id, mouse_id)
+            args = [arg for arg in sys.argv[1:] if arg != "--skip-teensy"]
+            skip_teensy = (len(args) != len(sys.argv[1:]))
+
+            if len(args) < 3:
+                print("\nError in receiving experiment inputs.")
+                print("Usage: python utils/wf_main.py <exp_name> <experiment_id> <mouse_id> [--skip-teensy]")
+                sys.exit(1)
+
+            exp_name = args[0]
+            experiment_id = args[1]
+            mouse_id = args[2]
+            teensy_board, current_exp = execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=skip_teensy)
 
             while not stop_flag:
                 sleep(0.1)

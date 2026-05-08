@@ -1,10 +1,15 @@
 from core.BaseExperiment import BaseExperiment
 
+import sys
+from pathlib import Path
 import psychopy.visual
 import psychopy.event
 import psychopy.monitors
 import numpy as np
 import yaml
+
+# Add WarpedVisualStim directory to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'external' / 'WarpedVisualStim'))
 
 import WarpedVisualStim.StimulusRoutines as stim
 from WarpedVisualStim.MonitorSetup import Monitor, Indicator

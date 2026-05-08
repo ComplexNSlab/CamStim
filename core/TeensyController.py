@@ -9,7 +9,11 @@ class TeensyController:
     def __init__(self, experiment_id, DEBUG, teensy_params):
         config_path = Path(teensy_params)
         if not config_path.is_absolute():
-            config_path = Path(__file__).resolve().parent / config_path
+            repo_candidate = Path(__file__).resolve().parent.parent / config_path
+            if repo_candidate.is_file():
+                config_path = repo_candidate
+            else:
+                config_path = Path(__file__).resolve().parent / config_path
         self.teensy_parameters_filename = str(config_path)
         with open(self.teensy_parameters_filename, 'r') as file:
             self.teensy_parameters = yaml.load(file, Loader=yaml.FullLoader)

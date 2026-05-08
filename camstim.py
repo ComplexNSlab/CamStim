@@ -2,7 +2,7 @@ import sys
 import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
 							QWidget, QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
-							QGroupBox, QTextEdit, QCheckBox, QComboBox)
+							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit)
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QImage, QPixmap
 import time
@@ -10,6 +10,7 @@ from collections import deque
 from utils.simple_cam_mx import App, load_camera_config
 import threading
 from core import mvsdk
+from core.experiment_discovery import get_experiment_list
 import cv2
 import yaml
 from pathlib import Path
@@ -19,7 +20,7 @@ CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
 class CameraGUI(QMainWindow):
 	def __init__(self):
 		super().__init__()
-		self.config = load_camera_config(str(Path('config_files') / 'cam_config.yaml'))
+		self.config = load_camera_config(str(CONFIG_DIR / 'cam_config.yaml'))
 		self.camera_app = None
 		self.preview_mode = False
 		self.preview_exp_thread = None
@@ -35,6 +36,7 @@ class CameraGUI(QMainWindow):
 		self.exp_status_timer.timeout.connect(self.check_experiment_status)
 		self.exp_status_timer.start(100)
 		self.init_ui()
+		self.populate_experiment_controls()
 		self.setup_timer()
 
 	def check_experiment_status(self):
@@ -166,6 +168,27 @@ class CameraGUI(QMainWindow):
 		exp_group = QGroupBox("Experiment Controls")
 		exp_layout = QVBoxLayout()
 
+		exp_select_layout = QHBoxLayout()
+		exp_select_layout.addWidget(QLabel("Experiment:"))
+		self.exp_combo = QComboBox()
+		self.exp_combo.setEnabled(False)
+		exp_select_layout.addWidget(self.exp_combo)
+		exp_layout.addLayout(exp_select_layout)
+
+		exp_id_layout = QHBoxLayout()
+		exp_id_layout.addWidget(QLabel("Experiment ID:"))
+		self.experiment_id_input = QLineEdit()
+		self.experiment_id_input.setPlaceholderText("Enter experiment ID")
+		exp_id_layout.addWidget(self.experiment_id_input)
+		exp_layout.addLayout(exp_id_layout)
+
+		mouse_id_layout = QHBoxLayout()
+		mouse_id_layout.addWidget(QLabel("Mouse ID:"))
+		self.mouse_id_input = QLineEdit()
+		self.mouse_id_input.setPlaceholderText("Enter mouse ID")
+		mouse_id_layout.addWidget(self.mouse_id_input)
+		exp_layout.addLayout(mouse_id_layout)
+
 		self.preview_btn = QPushButton("Preview Experiment")
 		self.preview_btn.clicked.connect(self.preview_experiment)
 		self.preview_btn.setEnabled(False)
@@ -235,6 +258,43 @@ class CameraGUI(QMainWindow):
 
 		return panel
 
+	def populate_experiment_controls(self):
+		self.exp_combo.clear()
+		experiment_list = []
+		if self.camera_app and getattr(self.camera_app, 'exp_list', None):
+			experiment_list = self.camera_app.exp_list
+		else:
+			try:
+				experiment_list = get_experiment_list()
+			except Exception as e:
+				self.update_status(f"Error loading experiment list: {e}.")
+
+		if not experiment_list:
+			self.exp_combo.setEnabled(False)
+			return
+
+		self.exp_combo.addItems(experiment_list)
+		self.exp_combo.setEnabled(True)
+
+	def get_selected_experiment_params(self):
+		exp_name = self.exp_combo.currentText().strip()
+		experiment_id = self.experiment_id_input.text().strip()
+		mouse_id = self.mouse_id_input.text().strip()
+
+		if not exp_name:
+			self.update_status("Error: Select an experiment from the dropdown.")
+			return None
+
+		if not experiment_id:
+			self.update_status("Error: Enter an experiment ID.")
+			return None
+
+		if not mouse_id:
+			self.update_status("Error: Enter a mouse ID.")
+			return None
+
+		return exp_name, experiment_id, mouse_id
+
 	def setup_timer(self):
 		self.timer = QTimer()
 		self.timer.timeout.connect(self.update_display)
@@ -269,6 +329,7 @@ class CameraGUI(QMainWindow):
 			self.trigger_btn.setEnabled(True)
 			self.exp_btn.setEnabled(False)
 			self.preview_btn.setEnabled(True)
+			self.populate_experiment_controls()
 
 			self.load_and_display_camera_config()
 			self.load_and_display_teensy_config()
@@ -300,11 +361,11 @@ class CameraGUI(QMainWindow):
 			self.timer.stop()
 			self.stats_timer.stop()
 
-			if hasattr(self.camera_app, 'save_thread'):
+			if hasattr(self.camera_app, 'save_thread') and self.camera_app.save_thread.ident is not None:
 				self.camera_app.save_thread.join(timeout=2.0)
-			if hasattr(self.camera_app, 'display_thread'):
+			if hasattr(self.camera_app, 'display_thread') and self.camera_app.display_thread.ident is not None:
 				self.camera_app.display_thread.join(timeout=2.0)
-			if hasattr(self, 'camera_thread'):
+			if hasattr(self, 'camera_thread') and self.camera_thread.ident is not None:
 				self.camera_thread.join(timeout=2.0)
 
 		self.start_btn.setEnabled(True)
@@ -315,6 +376,7 @@ class CameraGUI(QMainWindow):
 		self.video_label.setText("Camera Stopped.")
 		self.cam_config_display.setText("Camera stopped. \n\n Start camera to begin.")
 		self.current_cam_config = None
+		self.populate_experiment_controls()
 		self.update_status("Camera Stopped.")
 
 	def update_display(self):
@@ -467,21 +529,24 @@ class CameraGUI(QMainWindow):
 			self.update_status('Error: Camera must be started first.')
 			return
 
+		params = self.get_selected_experiment_params()
+		if params is None:
+			return
+
+		exp_name, experiment_id, mouse_id = params
+
 		self.preview_mode = True
-		if hasattr(self.camera_app, 'exp_list') and self.camera_app.exp_list:
-				self.update_status("Available Experiments:")
-				for i, name in enumerate(self.camera_app.exp_list, 1):
-					self.update_status(f"{i}: {name}")
-		else:
-			self.update_status("No experiment list available.")
-		self.camera_app.get_exp_params()
+		started = self.camera_app.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
+		if not started:
+			self.update_status('Error: Failed to start experiment preview subprocess.')
+			return
 		self.load_and_display_exp_config()
 		self.preview_btn.setEnabled(False)
 		self.stop_preview_btn.setEnabled(True)
 		self.exp_btn.setEnabled(False)
 		self.trigger_btn.setEnabled(False)
 
-		self.update_status('Starting experiment preview...')
+		self.update_status(f'Starting experiment preview: {exp_name}.')
 
 	def stop_preview(self):
 		if self.camera_app:
@@ -496,20 +561,22 @@ class CameraGUI(QMainWindow):
 
 	def start_experiment(self):
 		if self.camera_app and self.camera_app.saving:
-			if hasattr(self.camera_app, 'exp_list') and self.camera_app.exp_list:
-				self.update_status("Available Experiments:")
-				for i, name in enumerate(self.camera_app.exp_list, 1):
-					self.update_status(f"{i}: {name}")
-			else:
-				self.update_status("No experiment list available.")
-			self.camera_app.get_exp_params()
+			params = self.get_selected_experiment_params()
+			if params is None:
+				return
+
+			exp_name, experiment_id, mouse_id = params
+			started = self.camera_app.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
+			if not started:
+				self.update_status('Error: Failed to start experiment subprocess.')
+				return
 			self.load_and_display_exp_config()
 			self.reset_display_average_on_next_frame = True
 			self.reset_fps_on_next_frame = True
 			self.exp_btn.setEnabled(False)
 			self.stop_exp_btn.setEnabled(True)
 			self.trigger_btn.setEnabled(False)
-			self.update_status("Experiment started.")
+			self.update_status(f"Experiment started: {exp_name}.")
 		else:
 			self.update_status("Error: Must enable hardware trigger mode first.")
 
