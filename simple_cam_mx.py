@@ -1,4 +1,5 @@
 	# coding=utf-8
+import sys
 import cv2
 import numpy as np
 import mvsdk
@@ -79,11 +80,15 @@ class App(object):
         self.zeros = np.zeros((255, 255), dtype=np.uint8) # debug image in case I have problems with camera
         self.frame_timestamps = []  # List to store timestamps
         self.sys_clock_timestamps = []
+        self.session_frame_timestamps = []
+        self.session_sys_clock_timestamps = []
         self.USE_MONO16 = False # If false defaults to 8 bit although current camera doesn't have true 16 bit
         self.t_start = None
         self.t_end = None
         self.hCamera = None
         self.n_saturated_pixels = 0
+        self.session_frames_written = 0
+        self.on_logic_analyzer_terminated = None
 
         self.roi_drawer = ROIDrawer()
         self.roi_plotter = ROIPlotter()
@@ -302,7 +307,7 @@ class App(object):
         self.logic_thread = threading.Thread(target=self.track_logic, daemon=True)
         self.logic_thread.start()
 
-    def stop_logic_analyzer(self):
+    def stop_logic_analyzer(self, from_stop_stim=False):
         if getattr(self, 'logic_progress', None) is None:
             print("\nNo current logic analyzer session running.")
             return
@@ -324,6 +329,8 @@ class App(object):
                         self.logic_progress.terminate()
                         self.logic_progress.wait(timeout=2.0)
                     print("\nLogic analyzer terminated.")
+                    if not from_stop_stim and callable(self.on_logic_analyzer_terminated):
+                        self.on_logic_analyzer_terminated()
                 else:
                     print("Logic analyzer process has already finished.")
             except (OSError, subprocess.TimeoutExpired) as e:
@@ -407,7 +414,16 @@ class App(object):
                 
             self.stim_progress = None
 
-        self.stop_logic_analyzer()
+        if self.saving:
+            print("Stopping frame saving and finalizing metadata...")
+            self.saving = False
+            if self.hCamera:
+                try:
+                    mvsdk.CameraSetTriggerMode(self.hCamera, 0)
+                except mvsdk.CameraException as e:
+                    print("Failed to switch camera back to continuous mode after stopping experiment: {}".format(e))
+
+        self.stop_logic_analyzer(from_stop_stim=True)
 
         if hasattr(self, 'stim_thread') and self.stim_thread and self.stim_thread.is_alive():
             self.stim_thread.join(timeout=1.0)
@@ -469,6 +485,34 @@ class App(object):
             print("WARNING!!! Experiment file already exists, modifying name to avoid overwriting.")
             self.filename += "1"
 
+    def _write_metadata(self):
+        if self.session_frames_written <= 0 or not self.save_dir_ready or self.save_dir is None:
+            return
+
+        metadata = {
+            'num_frames': self.session_frames_written,
+            'frame_width': self.width if (not self.save_processed_frames or not self.bin_exp) else self.width//self.bin_size,
+            'frame_height': self.height if (not self.save_processed_frames or not self.bin_exp) else self.height//self.bin_size,
+            'data_type': self.dtype if (not self.save_processed_frames or not self.bin_exp) else 'uint16',
+            'frame_timestamps': self.session_frame_timestamps,
+            'sys_clock_timestamps': self.session_sys_clock_timestamps,
+            'frame_exposure': self.exposure,
+            'frame_gain': self.analog_gain,
+            'pwm_frequency': self.pwm_freq,
+            'pwm_duty': self.pwm_duty,
+            'binned_live': self.bin_exp,
+            'save_processed_frames': self.save_processed_frames,
+            'bin_size': self.bin_size,
+            'force_framerate': self.force_framerate,
+            'special_framerate': self.special_framerate
+        }
+        np.save(os.path.join(self.save_dir, '{}_metadata.npy'.format(self.filename)), metadata)
+
+    def _reset_save_session_metadata(self):
+        self.session_frames_written = 0
+        self.session_frame_timestamps = []
+        self.session_sys_clock_timestamps = []
+
     def bin_frame(self, frame):
         # Binning
         binned_frame = frame.reshape((self.height//self.bin_size, self.bin_size, self.width//self.bin_size, self.bin_size)).sum(axis=(1, 3), dtype=np.uint16)
@@ -499,7 +543,18 @@ class App(object):
                 batch = np.ascontiguousarray(batch[:, :, ::-1])  # horizontal flip
                 if self.bin_exp:
                     bs = self.bin_size
-                    batch = batch.reshape(n, self.height // bs, bs, self.width // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
+                    if bs in (2, 4, 8, 16, 32, 64):
+                        # Faster path for power-of-two bin sizes via iterative 2x2 reductions.
+                        batch = batch.astype(np.uint16, copy=False)
+                        for _ in range(bs.bit_length() - 1):
+                            batch = (
+                                batch[:, 0::2, 0::2]
+                                + batch[:, 1::2, 0::2]
+                                + batch[:, 0::2, 1::2]
+                                + batch[:, 1::2, 1::2]
+                            )
+                    else:
+                        batch = batch.reshape(n, self.height // bs, bs, self.width // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
                 batch.tofile(self.save_file_handle)
             else:
                 # Fast path: write raw camera bytes exactly as acquired.
@@ -507,7 +562,10 @@ class App(object):
 
             self.frame_timestamps.extend(ts_batch)
             self.sys_clock_timestamps.extend(sys_ts_batch)
+            self.session_frame_timestamps.extend(ts_batch)
+            self.session_sys_clock_timestamps.extend(sys_ts_batch)
             self.frames_written += len(write_batch)
+            self.session_frames_written += len(write_batch)
 
             should_flush = force_flush or ((time.time() - last_flush_time) >= flush_interval_s)
             if should_flush:
@@ -549,7 +607,25 @@ class App(object):
                     flush_batch(force_flush=True)
                     break
             else:
+                while not self.frame_queue.empty():
+                    try:
+                        frame_data, count, timestamp, sys_stamp = self.frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    write_batch.append(frame_data)
+                    ts_batch.append(timestamp)
+                    sys_ts_batch.append(sys_stamp)
+                    if len(write_batch) >= flush_every_n_frames:
+                        flush_batch(force_flush=False)
+
                 flush_batch(force_flush=True)
+                if self.save_file_handle is not None and self.frame_queue.empty():
+                    self.save_file_handle.flush()
+                    self.save_file_handle.close()
+                    self.save_file_handle = None
+                    self._write_metadata()
+                    self._reset_save_session_metadata()
                 if self.quit:
                     break
                 time.sleep(0.005)
@@ -559,27 +635,8 @@ class App(object):
             self.save_file_handle.flush()
             self.save_file_handle.close()
             self.save_file_handle = None
-
-        if self.frames_written > 0 and self.save_dir_ready:
-            # After processing all frames, save metadata
-            metadata = {
-                'num_frames': self.frames_written,
-                'frame_width': self.width if (not self.save_processed_frames or not self.bin_exp) else self.width//self.bin_size,
-                'frame_height': self.height if (not self.save_processed_frames or not self.bin_exp) else self.height//self.bin_size,
-                'data_type': self.dtype if (not self.save_processed_frames or not self.bin_exp) else 'uint16',
-                'frame_timestamps': self.frame_timestamps,
-                'sys_clock_timestamps': self.sys_clock_timestamps,
-                'frame_exposure': self.exposure,
-                'frame_gain': self.analog_gain,
-                'pwm_frequency': self.pwm_freq,
-                'pwm_duty': self.pwm_duty,
-                'binned_live': self.bin_exp,
-                'save_processed_frames': self.save_processed_frames,
-                'bin_size': self.bin_size,
-                'force_framerate': self.force_framerate,
-                'special_framerate': self.special_framerate
-            }
-            np.save(os.path.join(self.save_dir, '{}_metadata.npy'.format(self.filename)), metadata)
+            self._write_metadata()
+            self._reset_save_session_metadata()
 
     def display_frames(self):
         print(f"DEBUG: display_frames started, gui_mode = {self.gui_mode}")
@@ -1097,15 +1154,22 @@ class App(object):
         self.print_camera_stats()
         time.sleep(1)
 
+        _stats_written = False
         # main loop to print info from the camera
         while not self.quit:
             current_time = time.time()
             elapsed_time = current_time - self.t_start
             average_fps = self.frame_count / elapsed_time if elapsed_time > 0 else 0
 
-            # Print stats on the same line
-            print("\rSave Queue: {}, Frames Saved: {}, Save Drops: {}, Display Queue: {}, Display Drops: {}, Frames Displayed: {}, Average FPS: {:.2f} Saturated Pixels: {:06d}".format(
-                self.frame_queue.qsize(), self.frames_written, self.dropped_save_frames, self.display_queue.qsize(), self.dropped_display_frames, self.frame_count, average_fps, self.n_saturated_pixels), end='')
+            # Print stats, reusing the same terminal line
+            msg = "Save Q: {}, Frames Saved: {}, Save Drop: {}, Disp Q: {}, Disp Drop: {}, Frames Disp: {}, Average FPS: {:.2f} Sat Pixels: {:06d}".format(
+                self.frame_queue.qsize(), self.frames_written, self.dropped_save_frames, self.display_queue.qsize(), self.dropped_display_frames, self.frame_count, average_fps, self.n_saturated_pixels)
+            if _stats_written:
+                sys.stdout.write('\033[F\033[2K' + msg + '\n')
+            else:
+                sys.stdout.write(msg + '\n')
+                _stats_written = True
+            sys.stdout.flush()
             time.sleep(0.1)
 
         print("\n")  # Ensure to move to a new line after quitting
