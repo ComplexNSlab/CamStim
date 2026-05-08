@@ -21,7 +21,7 @@ if __name__ == "__main__":
             mouse_id=mouse_id,
             daq=daq,
             monitor_config_filename='monitor_config.yaml',
-            save_settings_config_filename='save_settings_config.yaml',
+            save_settings_config_filename='config.yaml',
             exp_config_filename='retinotopy_config.yaml',  # Using any config since we don't need specific settings
             debug=False
         )

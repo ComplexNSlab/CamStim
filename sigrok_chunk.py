@@ -6,9 +6,39 @@ from pathlib import Path
 import time
 import os
 import zipfile
+import yaml
 
 stop_flag = False
-sigrok_exe = 'C:/Program Files/sigrok/sigrok-cli/sigrok-cli.exe'
+
+
+def load_sigrok_exe():
+    config_path = Path(__file__).resolve().parent / 'config.yaml'
+    if not config_path.is_file():
+        raise Exception(f"Config file not found: {config_path}")
+
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file) or {}
+
+    sigrok_exe = config.get('SIGROK_EXE')
+    if not sigrok_exe:
+        raise Exception(f"SIGROK_EXE missing in {config_path}")
+
+    return sigrok_exe
+
+
+def load_save_root():
+    config_path = Path(__file__).resolve().parent / 'config.yaml'
+    if not config_path.is_file():
+        raise Exception(f"Config file not found: {config_path}")
+
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file) or {}
+
+    save_root = config.get('SAVE_DIR')
+    if not save_root:
+        raise Exception(f"SAVE_DIR missing in {config_path}")
+
+    return save_root
 
 def capture_sigrok_data_chunked(sigrok_exe, output_file, samplerate="1MHz", chunk_samples=1000000):
     """
@@ -164,13 +194,13 @@ def main():
     # Get experiment parameters
     experiment_id, mouse_id = sys.argv[1], sys.argv[2]
     
-    # Set up save directory
-    date = datetime.now().strftime("%Y%m%d")
-    save_dir = Path(f"C:/Data/{experiment_id}/logicAnalyzer_Recordings")
+    # Set up save directory from config.yaml
+    save_root = load_save_root()
+    save_dir = Path(save_root) / mouse_id / experiment_id
     save_dir.mkdir(parents=True, exist_ok=True)
     
     # Output file
-    base_filename = f"{date}_{experiment_id}_{mouse_id}"
+    base_filename = f"{mouse_id}_{experiment_id}"
     output_file = save_dir / f"{base_filename}.sr"
     
     # Handle existing files
@@ -197,6 +227,7 @@ def main():
     stop_thread.start()
     
     # Capture in chunks
+    sigrok_exe = load_sigrok_exe()
     chunks = capture_sigrok_data_chunked(sigrok_exe, output_file, samplerate, chunk_samples)
     
     print(f"\n\n{'='*60}")

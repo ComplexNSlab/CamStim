@@ -7,9 +7,33 @@ import time
 import os
 import signal
 import msvcrt
+import yaml
 
 stop_flag = False
-sigrok_exe = 'C:\\Program Files\\sigrok\\sigrok-cli\\sigrok-cli.exe'
+
+
+def load_runtime_config():
+    config_path = Path(__file__).resolve().parent / 'config.yaml'
+    if not config_path.is_file():
+        raise Exception(f"Config file not found: {config_path}")
+
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file) or {}
+
+    save_root = config.get('SAVE_DIR')
+    if not save_root:
+        raise Exception(f"SAVE_DIR missing in {config_path}")
+
+    sigrok_exe = config.get('SIGROK_EXE')
+    if not sigrok_exe:
+        raise Exception(f"SIGROK_EXE missing in {config_path}")
+
+    return save_root, sigrok_exe
+
+
+def load_save_root():
+    save_root, _ = load_runtime_config()
+    return save_root
 
 def stream_reader(pipe, label):
     """Continuously read a text stream line by line and forward to stdout."""
@@ -114,22 +138,22 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     if len(sys.argv) < 3:
-        print("Usage: python script.py <experiment_id> <mouse_id>")
+        print("Usage: python script.py <experiment_id> <mouse_id> [base_filename]")
         sys.exit(1)
     
     experiment_id, mouse_id = sys.argv[1], sys.argv[2]
+    forced_base_filename = sys.argv[3] if len(sys.argv) >= 4 else None
     
-    date = datetime.now().strftime("%Y%m%d")
-    save_dir = Path(f"C:/Data/{experiment_id}/logicAnalyzer_Recordings")
+    save_root, sigrok_exe = load_runtime_config()
+    save_dir = Path(save_root) / mouse_id / experiment_id
     save_dir.mkdir(parents=True, exist_ok=True)
-    
-    base_filename = f"{date}_{experiment_id}_{mouse_id}"
+
+    if forced_base_filename:
+        base_filename = forced_base_filename
+    else:
+        base_filename = f"{mouse_id}_{experiment_id}"
+
     output_file = save_dir / f"{base_filename}.sr"
-    
-    counter = 1
-    while output_file.exists():
-        output_file = save_dir / f"{base_filename}_{counter}.sr"
-        counter += 1
     
     samplerate = "20kHz"
     

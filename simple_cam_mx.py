@@ -19,9 +19,11 @@ import subprocess
 import tkinter as tk
 from tkinter import simpledialog
 import json
+import shutil
 
 
 CONFIG_FILE = 'cam_config.yml'
+SAVE_SETTINGS_CONFIG_FILE = 'config.yaml'
 
 def load_camera_config(yaml_file_path):
     if Path(yaml_file_path).is_file():
@@ -33,6 +35,27 @@ def load_camera_config(yaml_file_path):
                 raise Exception("There is an error in the config yaml file, please check it. {}".format(yaml_file_path))
     else:
         raise Exception("Configuration file does not exist, please create it.")
+
+
+def load_save_root(yaml_file_path=SAVE_SETTINGS_CONFIG_FILE):
+    config_path = Path(yaml_file_path)
+    if not config_path.is_absolute():
+        config_path = Path(__file__).resolve().parent / config_path
+
+    if not config_path.is_file():
+        raise Exception("Save settings file does not exist, please create it. {}".format(config_path))
+
+    with open(config_path, 'r') as file:
+        try:
+            config = yaml.safe_load(file) or {}
+        except yaml.YAMLError:
+            raise Exception("There is an error in the save settings yaml file, please check it. {}".format(config_path))
+
+    save_root = config.get('SAVE_DIR')
+    if not save_root:
+        raise Exception("SAVE_DIR missing in {}".format(config_path))
+
+    return save_root
 
 
 
@@ -162,6 +185,9 @@ class App(object):
         with self.latest_frame_lock:
             self.latest_frame_data = frame_data
 
+        if self.gui_mode:
+            return
+
         try:
             self.display_queue.put_nowait(frame_data)
         except queue.Full:
@@ -183,6 +209,18 @@ class App(object):
             if self.latest_frame_data is None:
                 return None
             return bytes(self.latest_frame_data)
+
+    def _enqueue_save_frame(self, frame_data, frame_index, camera_timestamp, system_timestamp):
+        queued_frame = (frame_data, frame_index, camera_timestamp, system_timestamp)
+
+        while not self.quit:
+            try:
+                self.frame_queue.put(queued_frame, timeout=0.1)
+                return True
+            except queue.Full:
+                self.save_overflow = True
+
+        return False
 
     def experiment_status_callback(self, message):
         if hasattr(self, 'exp_status_queue'):
@@ -264,45 +302,48 @@ class App(object):
             self.exp_name = exp_name
             self.experiment_id = experiment_id
             self.mouse_id = mouse_id
+            self.filename = f"{mouse_id}_{experiment_id}"
+            self._prepare_save_directory(mouse_id, experiment_id)
 
-            self.start_logic_analyzer(experiment_id, mouse_id)
+            self.start_logic_analyzer(experiment_id, mouse_id, self.filename)
             self.start_stim(exp_name, experiment_id, mouse_id, method,
                                 self.experiment_status_callback,
                                 self.experiment_trial_callback)
-
-            threading.Thread(target=self.wait_for_directories, args=(experiment_id,), daemon=True).start()
 
         except Exception as e:
             print(f'\nError in experiment selection: {e}.')
         finally:
             self.exp_thread = None
 
-    def wait_for_directories(self, experiment_id):
-        base_dir = f'C:\\\\Data\\{experiment_id}'
-        wf_recordings_dir = os.path.join(base_dir, "WF_Recordings")
+    def _prepare_save_directory(self, mouse_id, experiment_id):
+        save_root = load_save_root()
+        save_dir = os.path.join(save_root, mouse_id, experiment_id)
+        os.makedirs(save_dir, exist_ok=True)
 
-        while not os.path.exists(base_dir) and not self.quit:
-            time.sleep(0.1)
-
-        if os.path.exists(base_dir):
-            while not os.path.exists(wf_recordings_dir) and not self.quit:
-                time.sleep(0.1)
-
-            if os.path.exists(wf_recordings_dir):
-                self.save_dir = wf_recordings_dir
-                self.save_dir_ready = True
-            else:
-                print(f'\nWarning: video save directory nout found.')
+        cam_config_source = Path(__file__).resolve().parent / CONFIG_FILE
+        cam_config_target = Path(save_dir) / 'cam_config.yaml'
+        if cam_config_source.is_file():
+            shutil.copyfile(cam_config_source, cam_config_target)
         else:
-            print(f'Warning: base directory never created.')
+            print("Warning: {} not found; skipping config copy.".format(cam_config_source))
 
-    def start_logic_analyzer(self, experiment_id, mouse_id):
+        self.save_dir = save_dir
+        self.save_dir_ready = True
+
+    def start_logic_analyzer(self, experiment_id, mouse_id, base_filename=None):
         self.stop_logic_analyzer()
 
         print("\nStarting logic analyzer...")
 
-        self.logic_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/camstim/continuous_sigrok.py", experiment_id, mouse_id],
-            stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True, cwd="C:/Data/logicAnalyzer_Recordings")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        sigrok_script = os.path.join(script_dir, "continuous_sigrok.py")
+
+        cmd = ["python", "-u", sigrok_script, experiment_id, mouse_id]
+        if base_filename:
+            cmd.append(base_filename)
+
+        self.logic_progress = subprocess.Popen(cmd,
+            stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True)
 
         self.logic_thread = threading.Thread(target=self.track_logic, daemon=True)
         self.logic_thread.start()
@@ -362,7 +403,9 @@ class App(object):
         self.trial_callback = trial_callback
 
         if method.lower() == 's':
-            self.stim_progress = subprocess.Popen(["python", "-u", "C:/Users/admin/source/camstim/wf_main.py", exp_name, experiment_id, mouse_id],
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            wf_script = os.path.join(script_dir, "wf_main.py")
+            self.stim_progress = subprocess.Popen(["python", "-u", wf_script, exp_name, experiment_id, mouse_id],
                 stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True)
             threading.Thread(target=self.track_stim, daemon=True).start()
             print("\nStarted stim via subprocess.")
@@ -506,17 +549,12 @@ class App(object):
             'force_framerate': self.force_framerate,
             'special_framerate': self.special_framerate
         }
-        np.save(os.path.join(self.save_dir, '{}_metadata.npy'.format(self.filename)), metadata)
+        np.save(os.path.join(self.save_dir, '{}.npy'.format(self.filename)), metadata)
 
     def _reset_save_session_metadata(self):
         self.session_frames_written = 0
         self.session_frame_timestamps = []
         self.session_sys_clock_timestamps = []
-
-    def bin_frame(self, frame):
-        # Binning
-        binned_frame = frame.reshape((self.height//self.bin_size, self.bin_size, self.width//self.bin_size, self.bin_size)).sum(axis=(1, 3), dtype=np.uint16)
-        return binned_frame
 
     def std_filter_frame(self, frame):
         # Binning
@@ -1217,17 +1255,8 @@ class App(object):
         if not self.force_framerate:
             if self.saving:
                 frame_timestamp = time.time()
-                try:
-                    self.frame_queue.put_nowait((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))
-                except queue.Full:
-                    self.save_overflow = True
-                    if self.strict_no_drop_save:
-                        print("CRITICAL: save queue overflow, stopping acquisition to prevent silent frame loss.")
-                        self.quit = True
-                        return
-                    self.dropped_save_frames += 1
-                    if self.dropped_save_frames % 100 == 1:
-                        print("Warning: save queue full, dropping frames to keep acquisition real-time.")
+                if not self._enqueue_save_frame(frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp):
+                    return
             # Stop addding to the display queue if the frame queue is getting too full
             if self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize:
                 self._put_display_frame(frame_data)
@@ -1238,17 +1267,8 @@ class App(object):
 
                 if self.saving:
                     frame_timestamp = time.time()
-                    try:
-                        self.frame_queue.put_nowait((frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp))
-                    except queue.Full:
-                        self.save_overflow = True
-                        if self.strict_no_drop_save:
-                            print("CRITICAL: save queue overflow, stopping acquisition to prevent silent frame loss.")
-                            self.quit = True
-                            return
-                        self.dropped_save_frames += 1
-                        if self.dropped_save_frames % 100 == 1:
-                            print("Warning: save queue full, dropping frames to keep acquisition real-time.")
+                    if not self._enqueue_save_frame(frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp):
+                        return
                 # Stop addding to the display queue if the frame queue is getting too full
                 if self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize:
                     self._put_display_frame(frame_data)

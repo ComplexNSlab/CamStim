@@ -41,9 +41,9 @@ if __name__ == "__main__":
         # change the line below to use PCO or NIS (2p)
         data_aq = NISDAQ(experiment_id)
         #data_aq = PCODAQ(experiment_id)
-        #exp = DynamicBatteryExperiment(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "save_settings_config.yaml", "dynamic_battery_config.yaml", debug=bool_DEBUG)
+        #exp = DynamicBatteryExperiment(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "config.yaml", "dynamic_battery_config.yaml", debug=bool_DEBUG)
         
-        exp = TextureExperimentFBVGG(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "save_settings_config.yaml", "texture_FB-VGG_config.yaml", debug=bool_DEBUG)
+        exp = TextureExperimentFBVGG(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "config.yaml", "texture_FB-VGG_config.yaml", debug=bool_DEBUG)
 
         exp.load_experiment_config()
         exp.start_data_acquisition()

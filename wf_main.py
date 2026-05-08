@@ -68,7 +68,7 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
         if status_callback:
             status_callback("Teensy started.")
 
-        current_exp = exp_type(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "save_settings_config.yaml", config_file, debug=bool_DEBUG)
+        current_exp = exp_type(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "config.yaml", config_file, debug=bool_DEBUG)
 
         if status_callback:
             current_exp_set_status_callback(status_callback)
@@ -114,7 +114,7 @@ def execute_exp(exp_name, experiment_id, mouse_id):
         print("\nExperiment name error.")
         return
 
-    exp = exp_type(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "save_settings_config.yaml", config_file, debug=bool_DEBUG)
+    exp = exp_type(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "config.yaml", config_file, debug=bool_DEBUG)
 
     exp.load_experiment_config()
     exp.start_data_acquisition()

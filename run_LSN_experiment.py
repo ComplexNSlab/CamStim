@@ -41,7 +41,7 @@ if __name__ == "__main__":
         # change the line below to use PCO or NIS (2p)
         data_aq = NISDAQ(experiment_id)
         #data_aq = PCODAQ(experiment_id)
-        exp = LocallySparseNoiseExperiment(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "save_settings_config.yaml", "locally_sparse_noise_config.yaml", debug=bool_DEBUG)
+        exp = LocallySparseNoiseExperiment(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "config.yaml", "locally_sparse_noise_config.yaml", debug=bool_DEBUG)
      
 
         exp.load_experiment_config()

@@ -174,16 +174,16 @@ class BaseExperiment(ABC):
         with open(save_settings_config_filename, 'r') as file:
             save_settings = yaml.load(file, Loader=yaml.FullLoader)
 
-        if platform == "win32":
-            self.save_dir = os.path.join(save_settings['LABSERVER_DIR_WIN'], self.experiment_id)
-        else:
-            self.save_dir = os.path.join(save_settings['LABSERVER_DIR_LIN'], self.experiment_id)
+        save_root = save_settings.get('SAVE_DIR')
+        if not save_root:
+            raise Exception("SAVE_DIR missing in {}".format(save_settings_config_filename))
 
-        self.data_log_dir = os.path.join(self.save_dir, save_settings['log_folder']) 
-        dirs_to_make = save_settings["dirs_to_make"]
+        self.save_dir = os.path.join(save_root, self.mouse_id, self.experiment_id)
+
+        self.data_log_dir = self.save_dir
 
         # set the log filenames for the NI log and the exp log
-        self.experiment_log_filename = os.path.join(self.data_log_dir, "{}_exp_log".format(self.experiment_id))
+        self.experiment_log_filename = os.path.join(self.data_log_dir, "{}_{}".format(self.mouse_id, self.experiment_id))
         self.ni_log_filename = os.path.join(self.data_log_dir, "{}_ni_log.npy".format(self.experiment_id))
 
 
@@ -192,9 +192,6 @@ class BaseExperiment(ABC):
         else:
             if not self.debug:
                 raise Exception("Experiment ID: {} already exists make new ID...".format(self.experiment_id))
-
-        for dir_to_make in dirs_to_make:
-            os.makedirs(os.path.join(self.save_dir, dir_to_make), exist_ok=self.debug)
 
 
 

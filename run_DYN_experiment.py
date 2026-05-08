@@ -42,7 +42,7 @@ if __name__ == "__main__":
         data_aq = NISDAQ(experiment_id)
         #data_aq = PCODAQ(experiment_id)
         
-        exp = DynamicBatteryExperiment(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "save_settings_config.yaml", "dynamic_battery_config.yaml", debug=bool_DEBUG)
+        exp = DynamicBatteryExperiment(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "config.yaml", "dynamic_battery_config.yaml", debug=bool_DEBUG)
         
         
         exp.load_experiment_config()

@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QImage, QPixmap
 import time
+from collections import deque
 from simple_cam_mx import App, load_camera_config
 import threading
 import mvsdk
@@ -22,6 +23,11 @@ class CameraGUI(QMainWindow):
 		self.current_exp_config = None
 		self.current_cam_config = None
 		self.current_teensy_config = None
+		self.reset_display_average_on_next_frame = False
+		self.reset_fps_on_next_frame = False
+		self.last_stats_time = None
+		self.last_stats_frame_count = 0
+		self.fps_samples = deque(maxlen=100)
 		self.exp_status_timer = QTimer()
 		self.exp_status_timer.timeout.connect(self.check_experiment_status)
 		self.exp_status_timer.start(100)
@@ -235,9 +241,18 @@ class CameraGUI(QMainWindow):
 	def start_camera(self):
 		try:
 			self.camera_app = App(self.config, gui_mode=True)
+			self.last_stats_time = time.time()
+			self.last_stats_frame_count = 0
+			self.fps_samples.clear()
+
+			def _on_logic_analyzer_terminated():
+				from PyQt6.QtCore import QTimer
+				QTimer.singleShot(0, self._auto_stop_after_logic_analyzer)
+			self.camera_app.on_logic_analyzer_terminated = _on_logic_analyzer_terminated
 
 			self.camera_app.save_thread.start()
-			self.camera_app.display_thread.start()
+			if not self.camera_app.gui_mode:
+				self.camera_app.display_thread.start()
 
 			self.camera_thread = threading.Thread(target=self.camera_app.main)
 			self.camera_thread.daemon = True
@@ -259,8 +274,25 @@ class CameraGUI(QMainWindow):
 		except Exception as e:
 			self.update_status(f"Error starting camera: {str(e)}.")
 
+	def _auto_stop_after_logic_analyzer(self):
+		self.disable_hardware_trigger()
+		self.stop_experiment()
+		self.stop_camera()
+
+	def disable_hardware_trigger(self):
+		if self.camera_app and self.camera_app.hCamera:
+			try:
+				mvsdk.CameraSetTriggerMode(self.camera_app.hCamera, 0)
+			except Exception as e:
+				self.update_status(f"Error disabling hardware trigger: {e}.")
+			self.camera_app.saving = False
+
+		self.trigger_btn.setText("Enable Hardware Trigger")
+		self.exp_btn.setEnabled(False)
+
 	def stop_camera(self):
 		if self.camera_app:
+			self.disable_hardware_trigger()
 			self.camera_app.quit = True
 			self.timer.stop()
 			self.stats_timer.stop()
@@ -275,6 +307,7 @@ class CameraGUI(QMainWindow):
 
 		self.start_btn.setEnabled(True)
 		self.stop_btn.setEnabled(False)
+		self.trigger_btn.setEnabled(False)
 		self.exp_btn.setEnabled(False)
 		self.preview_btn.setEnabled(False)
 		self.video_label.setText("Camera Stopped.")
@@ -283,14 +316,43 @@ class CameraGUI(QMainWindow):
 		self.update_status("Camera Stopped.")
 
 	def update_display(self):
-		if self.camera_app and not self.camera_app.display_queue.empty():
+		if self.camera_app:
 			try:
-				frame_data = self.camera_app.display_queue.get_nowait()
+				frame_data = self.camera_app.get_frame_for_display()
+				if frame_data is None:
+					return
 				frame = np.frombuffer(frame_data, dtype=self.camera_app.dtype)
+
+				if self.reset_display_average_on_next_frame:
+					if hasattr(self.camera_app, 'circular_buffer'):
+						self.camera_app.circular_buffer.fill(0)
+					if hasattr(self.camera_app, 'current_buffer_item'):
+						self.camera_app.current_buffer_item = 0
+					if hasattr(self.camera_app, 'buffer_loop_reached'):
+						self.camera_app.buffer_loop_reached = False
+					self.reset_display_average_on_next_frame = False
+
+				if self.reset_fps_on_next_frame:
+					self.last_stats_time = time.time()
+					self.last_stats_frame_count = self.camera_app.frame_count
+					self.fps_samples.clear()
+					self.reset_fps_on_next_frame = False
+
 				if hasattr(self.camera_app, 'height') and hasattr(self.camera_app, 'width'):
 					frame = frame.reshape((self.camera_app.height, self.camera_app.width))
 					frame = cv2.flip(frame, 1)
 				
+				if self.camera_app.bin_exp:
+					bs = self.camera_app.bin_size
+					frame = frame.astype(np.float32)
+					if bs in (2, 4, 8, 16):
+						for _ in range(bs.bit_length() - 1):
+							frame = (frame[0::2, 0::2] + frame[1::2, 0::2] + frame[0::2, 1::2] + frame[1::2, 1::2])
+					else:
+						h, w = frame.shape
+						frame = frame.reshape(h // bs, bs, w // bs, bs).sum(axis=(1, 3))
+					frame /= (bs * bs)
+
 				display_frame = self.process_frame_for_display(frame)
 				self.display_processed_frame(display_frame)
 			except Exception as e:
@@ -306,8 +368,14 @@ class CameraGUI(QMainWindow):
 				self.camera_app.circular_buffer[self.camera_app.current_buffer_item, :, :] = frame
 				self.camera_app.current_buffer_item += 1
 				self.camera_app.current_buffer_item %= self.camera_app.buffer_size
+				if (not self.camera_app.buffer_loop_reached) and self.camera_app.current_buffer_item == 0:
+					self.camera_app.buffer_loop_reached = True
 
-				frame = self.camera_app.circular_buffer.mean(axis=0)
+				if self.camera_app.buffer_loop_reached:
+					frame = self.camera_app.circular_buffer.mean(axis=0)
+				else:
+					filled = max(1, self.camera_app.current_buffer_item)
+					frame = self.camera_app.circular_buffer[:filled, :, :].mean(axis=0)
 				clipped = np.clip(frame, self.camera_app.vmin, self.camera_app.vmax)
 				frame = ((clipped - self.camera_app.vmin) / (self.camera_app.vmax - self.camera_app.vmin)) * 255
 
@@ -352,8 +420,18 @@ class CameraGUI(QMainWindow):
 		if self.camera_app:
 			try:
 				current_time = time.time()
-				elapsed_time = current_time - self.camera_app.t_start if self.camera_app.t_start else 0
-				average_fps = self.camera_app.frame_count / elapsed_time if elapsed_time > 0 else 0
+				if self.last_stats_time is None:
+					self.last_stats_time = current_time
+					self.last_stats_frame_count = self.camera_app.frame_count
+
+				delta_time = current_time - self.last_stats_time
+				delta_frames = self.camera_app.frame_count - self.last_stats_frame_count
+				if delta_time > 0 and delta_frames >= 0:
+					self.fps_samples.append(delta_frames / delta_time)
+
+				self.last_stats_time = current_time
+				self.last_stats_frame_count = self.camera_app.frame_count
+				average_fps = sum(self.fps_samples) / len(self.fps_samples) if self.fps_samples else 0
 
 				stats_text = f"FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Queue: {self.camera_app.display_queue.qsize()}"
 				self.stats_label.setText(stats_text)
@@ -424,6 +502,8 @@ class CameraGUI(QMainWindow):
 				self.update_status("No experiment list available.")
 			self.camera_app.get_exp_params()
 			self.load_and_display_exp_config()
+			self.reset_display_average_on_next_frame = True
+			self.reset_fps_on_next_frame = True
 			self.exp_btn.setEnabled(False)
 			self.stop_exp_btn.setEnabled(True)
 			self.trigger_btn.setEnabled(False)
