@@ -30,6 +30,13 @@
 	- Clone `WarpedVisualStim` under `external/`.
 	- `RetinotopyExperiment.py` now imports it from `external/WarpedVisualStim`.
 
+## Visual Field Mapping Updates
+- `VisualFieldMapping` now reads temporal frequency from config and includes it in the stimulus combinations.
+- Added `grating_phase_temporal_frequencies` list in `visual_field_mapping_config.yaml` for per-trial temporal-frequency sweeps.
+- Updated trial stimulus logging to include temporal frequency alongside position/orientation/sf/size.
+- Refined blank-trial behavior: blanks are now appended once per repeat (total blanks = `n_repeats`) after each repeat's full parameter sweep.
+- Added explanatory comments in `visual_field_mapping_config.yaml` for orientation units, size/position units, and supported `grating_mask` options.
+
 ## Camera Pipeline and Binning
 - Added automatic stop flow after logic-analyzer termination (disable trigger, stop experiment, stop camera).
 - GUI preview now applies the configured binning path so display output matches experiment settings.

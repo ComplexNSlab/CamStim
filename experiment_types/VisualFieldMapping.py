@@ -27,7 +27,7 @@ class VisualFieldMapping(BaseExperiment):
         self.grating_position = self.exp_parameters['grating_position']
         self.grating_orientations = self.exp_parameters['grating_orientations']
         self.give_blanks = self.exp_parameters['give_blanks']
-        #self.grating_phase_temporal_frequency = self.exp_parameters['grating_phase_temporal_frequency']
+        self.grating_phase_temporal_frequencies = self.exp_parameters['grating_phase_temporal_frequencies']
         self.grating_sizes = self.exp_parameters['grating_sizes']
         self.grating_mask = self.exp_parameters['grating_mask']
 
@@ -52,14 +52,13 @@ class VisualFieldMapping(BaseExperiment):
         self.exp_log.log['daq_sampling_rate'] = self.daq.sampling_rate
 
     def generate_stimuli(self):
-        all_possible_stims = []
-
-        self.pos_combos = list(itertools.product(self.grating_orientations, self.grating_sfs, self.grating_sizes))
+        self.pos_combos = list(itertools.product(self.grating_orientations, self.grating_sfs, self.grating_sizes, self.grating_phase_temporal_frequencies))
         self.stims_per_pos = len(self.pos_combos)
         self.n_trials = self.stims_per_pos * len(self.grating_position) * self.n_repeats
 
         if self.give_blanks:
-            self.n_trials += 1
+            # One blank per repeat (not per position).
+            self.n_trials += self.n_repeats
 
         print("Total number of stims:", self.n_trials, "Number of stims per position:", self.stims_per_pos, "Number of repeats:", self.n_repeats)
 
@@ -69,11 +68,11 @@ class VisualFieldMapping(BaseExperiment):
             for pos in self.grating_position:
                 self.combos = self.pos_combos.copy()
                 np.random.shuffle(self.combos)
-                for ori, sfs, size in self.combos:
-                    self.experiment_stims.append([pos, ori, sfs, size])
-
+                for ori, sfs, size, temporal_freq in self.combos:
+                    self.experiment_stims.append([pos, ori, sfs, size, temporal_freq])
             if self.give_blanks:
-                self.experiment_stims.append('blank')
+                # Blank behaves like one extra position trial per repeat.
+                self.experiment_stims.append(['blank', None, None, None, None])
 
     def run_experiment(self, ):
         self.experiment_running = True
@@ -101,15 +100,18 @@ class VisualFieldMapping(BaseExperiment):
             self.update_trial_progress(trial + 1, self.n_trials)
             # print("Trial {} out of {}.".format(trial+1, self.n_trials))
 
-            current_position = self.experiment_stims[trial][0]
-            current_orientation = self.experiment_stims[trial][1]
-            current_sf = self.experiment_stims[trial][2]
-            current_size = self.experiment_stims[trial][3]
-            current_phase = np.round(np.random.random(), 2)
+            stim_info = self.experiment_stims[trial]
+            current_position = stim_info[0]
+            current_orientation = stim_info[1]
+            current_sf = stim_info[2]
+            current_size = stim_info[3]
+            current_temporal_freq = stim_info[4]
+            is_blank = (current_orientation is None)
+            current_phase = np.round(np.random.random(), 2) if not is_blank else None
 
             #current_phase = np.random.randint(self.grating_phases_range[0], self.grating_phases_range[1])
 
-            if self.experiment_stims[trial] != 'blank':
+            if not is_blank:
                 self.ps_grating.pos = current_position
                 self.ps_grating.ori = current_orientation
                 self.ps_grating.sf = current_sf
@@ -122,7 +124,7 @@ class VisualFieldMapping(BaseExperiment):
             self.photodiode_square.fillColor = self.photodiode_square.lineColor = self.square_color_on
             # Log stimulus
             # TODO figure out how to dump all the PS grating information easily....
-            self.exp_log.log_stimulus(self.master_clock.getTime(), trial, [current_position, current_orientation, current_sf, current_size, current_phase], 0)
+            self.exp_log.log_stimulus(self.master_clock.getTime(), trial, [current_position, current_orientation, current_sf, current_size, current_temporal_freq, current_phase], 0)
 
             while self.clock.getTime() < self.stim_length:
 
@@ -134,11 +136,12 @@ class VisualFieldMapping(BaseExperiment):
                 #     self.ps_grating.contrast = 1
                 # else:
                 #     self.ps_grating.contrast = -1
-                self.ps_grating.phase = np.mod(self.clock.getTime() * 2, 1)
+                if not is_blank:
+                    self.ps_grating.phase = np.mod(self.clock.getTime() * current_temporal_freq, 1)
 
                 #self.ps_grating.contrast = 1 - (1/(self.stim_length/2))*np.mod(self.clock.getTime(), self.stim_length)
 
-                if self.experiment_stims[trial] != 'blank':
+                if not is_blank:
                     self.ps_grating.draw()
                 self.photodiode_square.draw()
 
