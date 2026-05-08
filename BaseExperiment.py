@@ -7,6 +7,7 @@ import psychopy.monitors
 import yaml
 from sys import platform
 import os
+from pathlib import Path
 from time import sleep
 import numpy as np
 from psychopy.visual.windowwarp import Warper
@@ -31,7 +32,7 @@ class BaseExperiment(ABC):
         self.window = None
 
         self.exp_parameters = None
-        self.exp_parameters_filename = exp_config_filename
+        self.exp_parameters_filename = self.resolve_config_path(exp_config_filename)
         
         self.clock = psychopy.core.Clock()
         self.master_clock = psychopy.core.Clock()
@@ -46,7 +47,11 @@ class BaseExperiment(ABC):
         self.data_log_dir = None
         self.create_save_directories(save_settings_config_filename)
 
-        self.experiment_settings_filenames = [monitor_config_filename, save_settings_config_filename, self.exp_parameters_filename]
+        self.experiment_settings_filenames = [
+            self.resolve_config_path(monitor_config_filename),
+            self.resolve_config_path(save_settings_config_filename),
+            self.exp_parameters_filename,
+        ]
 
         # experiment trial params logger
         self.exp_log = ExperimentLogger(self.experiment_log_filename, self.experiment_id, self.mouse_id, self.data_log_dir, self.experiment_settings_filenames) 
@@ -80,9 +85,23 @@ class BaseExperiment(ABC):
 
     def __del__(self):
         self.window.close()
+
+    @staticmethod
+    def resolve_config_path(config_filename):
+        config_path = Path(config_filename)
+        if config_path.is_absolute():
+            return str(config_path)
+
+        base_dir = Path(__file__).resolve().parent
+        config_dir_path = base_dir / 'config_files' / config_path
+        if config_dir_path.is_file():
+            return str(config_dir_path)
+
+        return str(base_dir / config_path)
    
     def load_monitor(self, monitor_config_filename):
-        with open(monitor_config_filename, 'r') as file:
+        monitor_path = self.resolve_config_path(monitor_config_filename)
+        with open(monitor_path, 'r') as file:
             self.monitor_settings = yaml.load(file, Loader=yaml.FullLoader)
         
         monitor_name = self.monitor_settings['monitor_name']
@@ -171,12 +190,13 @@ class BaseExperiment(ABC):
 
 
     def create_save_directories(self, save_settings_config_filename):
-        with open(save_settings_config_filename, 'r') as file:
+        save_settings_path = self.resolve_config_path(save_settings_config_filename)
+        with open(save_settings_path, 'r') as file:
             save_settings = yaml.load(file, Loader=yaml.FullLoader)
 
         save_root = save_settings.get('SAVE_DIR')
         if not save_root:
-            raise Exception("SAVE_DIR missing in {}".format(save_settings_config_filename))
+            raise Exception("SAVE_DIR missing in {}".format(save_settings_path))
 
         self.save_dir = os.path.join(save_root, self.mouse_id, self.experiment_id)
 

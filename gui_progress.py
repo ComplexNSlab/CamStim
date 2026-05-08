@@ -12,11 +12,14 @@ import threading
 import mvsdk
 import cv2
 import yaml
+from pathlib import Path
+
+CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
 
 class CameraGUI(QMainWindow):
 	def __init__(self):
 		super().__init__()
-		self.config = load_camera_config('cam_config.yml')
+		self.config = load_camera_config(str(Path('config_files') / 'cam_config.yaml'))
 		self.camera_app = None
 		self.preview_mode = False
 		self.preview_exp_thread = None
@@ -296,7 +299,6 @@ class CameraGUI(QMainWindow):
 			self.camera_app.quit = True
 			self.timer.stop()
 			self.stats_timer.stop()
-			self.camera_app.cleanup_udp()
 
 			if hasattr(self.camera_app, 'save_thread'):
 				self.camera_app.save_thread.join(timeout=2.0)
@@ -468,8 +470,8 @@ class CameraGUI(QMainWindow):
 		self.preview_mode = True
 		if hasattr(self.camera_app, 'exp_list') and self.camera_app.exp_list:
 				self.update_status("Available Experiments:")
-				for num, name in self.camera_app.exp_list.items():
-					self.update_status(f"{num}: {name}")
+				for i, name in enumerate(self.camera_app.exp_list, 1):
+					self.update_status(f"{i}: {name}")
 		else:
 			self.update_status("No experiment list available.")
 		self.camera_app.get_exp_params()
@@ -496,8 +498,8 @@ class CameraGUI(QMainWindow):
 		if self.camera_app and self.camera_app.saving:
 			if hasattr(self.camera_app, 'exp_list') and self.camera_app.exp_list:
 				self.update_status("Available Experiments:")
-				for num, name in self.camera_app.exp_list.items():
-					self.update_status(f"{num}: {name}")
+				for i, name in enumerate(self.camera_app.exp_list, 1):
+					self.update_status(f"{i}: {name}")
 			else:
 				self.update_status("No experiment list available.")
 			self.camera_app.get_exp_params()
@@ -529,7 +531,7 @@ class CameraGUI(QMainWindow):
 				self.config_display.setText("No experiment selected.\nPlease start an experiment first.")
 				return
 
-			config_file = f"{exp_name.replace(' ', '_').lower()}_config.yaml"
+			config_file = CONFIG_DIR / f"{exp_name.replace(' ', '_').lower()}_config.yaml"
 	        
 			try:
 				with open(config_file, 'r') as f:
@@ -579,7 +581,7 @@ class CameraGUI(QMainWindow):
 
 	def load_and_display_camera_config(self):
 		try:
-			config_file = 'cam_config.yml'
+			config_file = CONFIG_DIR / 'cam_config.yaml'
 
 			try:
 				with open(config_file, 'r') as f:
@@ -629,7 +631,7 @@ class CameraGUI(QMainWindow):
 
 	def load_and_display_teensy_config(self):
 		try:
-			config_file = 'teensyParams.yaml'
+			config_file = CONFIG_DIR / 'teensyParams.yaml'
 
 			try:
 				with open(config_file, 'r') as f:

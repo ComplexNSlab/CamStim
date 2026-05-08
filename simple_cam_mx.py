@@ -17,19 +17,25 @@ import subprocess
 import tkinter as tk
 from tkinter import simpledialog
 import shutil
+from experiment_discovery import get_experiment_list
 
 
-CONFIG_FILE = 'cam_config.yaml'
-SAVE_SETTINGS_CONFIG_FILE = 'config.yaml'
+CONFIG_DIR = Path('config_files')
+CONFIG_FILE = str(CONFIG_DIR / 'cam_config.yaml')
+SAVE_SETTINGS_CONFIG_FILE = str(CONFIG_DIR / 'config.yaml')
 
 def load_camera_config(yaml_file_path):
-    if Path(yaml_file_path).is_file():
-        with open(yaml_file_path, 'r') as file:
+    config_path = Path(yaml_file_path)
+    if not config_path.is_absolute():
+        config_path = Path(__file__).resolve().parent / config_path
+
+    if config_path.is_file():
+        with open(config_path, 'r') as file:
             try:
                 config = yaml.safe_load(file)
                 return config
             except yaml.YAMLError:
-                raise Exception("There is an error in the config yaml file, please check it. {}".format(yaml_file_path))
+                raise Exception("There is an error in the config yaml file, please check it. {}".format(config_path))
     else:
         raise Exception("Configuration file does not exist, please create it.")
 
@@ -124,16 +130,7 @@ class App(object):
         self.logic_thread = None
         self.stim_progress = None
         self.logic_progress = None
-        self.exp_list = {1: "Locally Sparse Noise", 
-            2:"Dynamic Battery", 
-            3: "Simple Orientation", 
-            4: "Elevation Mapper", 
-            5: "Retinotopy", 
-            6: "Texture FB", 
-            7: "Texture FB-VGG", 
-            8: "Texture FB-VGGMultiTime", 
-            9: "Square", 
-            10: "Visual Field Mapping"}
+        self.exp_list = get_experiment_list()  # Dynamically discover experiments
 
         self.save_dir = None
         self.save_dir_ready = False
@@ -146,9 +143,6 @@ class App(object):
         # self.check_and_fix_existing_experiment()
 
         self.dtype = 'uint16' if self.USE_MONO16 else 'uint8'
-
-    def cleanup_udp(self):
-        return
 
     def get_frame_for_display(self):
         return self.get_latest_frame()
@@ -318,8 +312,8 @@ class App(object):
             return
 
         print("\n The available experiments are listed:")
-        for num, name in self.exp_list.items():
-            print(f"{num}: {name}")
+        for i, name in enumerate(self.exp_list, 1):
+            print(f"{i}: {name}")
 
         exp_name, experiment_id, mouse_id = self.show_exp_dialogs()
         if not exp_name: 
@@ -335,21 +329,47 @@ class App(object):
                 self._tk_root.withdraw()
 
             root = self._tk_root
+            selected_exp = [None]
 
-            while True:
-                exp_num = simpledialog.askinteger("Experiment", "Enter experiment number:", parent=root)
-                if exp_num is None:
-                    return (None, None, None)
-                exp_name = self.exp_list.get(exp_num)
-                if exp_name:
-                    break
+            def select_experiment():
+                from tkinter import Toplevel, Listbox, Button, Label
+                sel_window = Toplevel(root)
+                sel_window.title("Select Experiment")
+                sel_window.geometry("300x400")
 
-            experiment_id = simpledialog.askstring("Experiment ID", "Enter experiment ID:", parent=root)
-            if experiment_id is None:
+                label = Label(sel_window, text="Select an experiment:")
+                label.pack(padx=5, pady=5)
+
+                listbox = Listbox(sel_window, height=15)
+                listbox.pack(padx=5, pady=5, fill="both", expand=True)
+
+                for exp_name in self.exp_list:
+                    listbox.insert("end", exp_name)
+
+                def confirm_selection():
+                    selection = listbox.curselection()
+                    if selection:
+                        selected_exp[0] = listbox.get(selection[0])
+                    sel_window.destroy()
+
+                confirm_btn = Button(sel_window, text="Select", command=confirm_selection)
+                confirm_btn.pack(pady=5)
+
+                sel_window.transient(root)
+                sel_window.wait_window()
+
+            select_experiment()
+            exp_name = selected_exp[0]
+
+            if exp_name is None:
                 return (None, None, None)
 
             self.save_dir = None
             self.save_dir_ready = False
+
+            experiment_id = simpledialog.askstring("Experiment ID", "Enter experiment ID:", parent=root)
+            if experiment_id is None:
+                return (None, None, None)
 
             mouse_id = simpledialog.askstring("Mouse ID", "Enter mouse ID:", parent=root)
             if mouse_id is None:

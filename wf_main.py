@@ -3,6 +3,7 @@ import numpy as np
 import socket
 import json
 import threading
+from pathlib import Path
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stdin.reconfigure(line_buffering=True)
@@ -11,17 +12,7 @@ from time import sleep, time
 
 from PCODAQ import ExperimentDAQ
 from PCODAQ import Teensy
-
-from SimpleOrientationExperiment import SimpleOrientationExperiment
-from TextureExperimentFB import TextureExperimentFB
-from TextureExperimentFBVGG import TextureExperimentFBVGG
-from TextureExperimentFBVGGMultiTime import TextureExperimentFBVGGMultiTime
-from DynamicBatteryExperiment import  DynamicBatteryExperiment
-from SquareExperiment import SquareExperiment
-from LocallySparseNoiseExperiment import LocallySparseNoiseExperiment
-from ElevationMapperExperiment import ElevationMapperExperiment
-from RetinotopyExperiment import RetinotopyExperiment
-from VisualFieldMapping import VisualFieldMapping
+from experiment_discovery import discover_experiment_types
 
 current_exp = None
 teensy_board = None
@@ -30,24 +21,15 @@ stop_flag = False
 experiment_running = False
 bool_DEBUG = True
 
-
-exp_types = {"Locally Sparse Noise": LocallySparseNoiseExperiment,
-            "Dynamic Battery": DynamicBatteryExperiment,
-            "Simple Orientation": SimpleOrientationExperiment,
-            "Elevation Mapper": ElevationMapperExperiment,
-            "Retinotopy": RetinotopyExperiment,
-            "Texture FB": TextureExperimentFB,
-            "Texture FB-VGG": TextureExperimentFBVGG,
-            "Texture FB-VGGMultiTime": TextureExperimentFBVGGMultiTime,
-            "Square": SquareExperiment,
-            "Visual Field Mapping": VisualFieldMapping}
+exp_types = discover_experiment_types()
+CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
 
 
 def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
     global current_exp, teensy_board, experiment_running, current_exp_thread
 
     try:
-        config_file = f"{exp_name.replace(' ', '_').lower()}_config.yaml"
+        config_file = str(CONFIG_DIR / f"{exp_name.replace(' ', '_').lower()}_config.yaml")
 
         exp_type = exp_types.get(exp_name)
         if exp_type is None:
@@ -58,14 +40,14 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
             return
 
         data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
-        teensy_board = Teensy(experiment_id, bool_DEBUG, "teensyParams.yaml")
+        teensy_board = Teensy(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
 
         start_msg = "\nTeensy started."
         print(start_msg)
         if status_callback:
             status_callback("Teensy started.")
 
-        current_exp = exp_type(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "config.yaml", config_file, debug=bool_DEBUG)
+        current_exp = exp_type(experiment_id, mouse_id, data_aq, str(CONFIG_DIR / "monitor_config.yaml"), str(CONFIG_DIR / "config.yaml"), config_file, debug=bool_DEBUG)
 
         if status_callback:
             current_exp_set_status_callback(status_callback)
@@ -101,17 +83,17 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
 
 def execute_exp(exp_name, experiment_id, mouse_id):
     data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
-    teensy_board = Teensy(experiment_id, bool_DEBUG, "teensyParams.yaml")
+    teensy_board = Teensy(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
     print("\nTeensy started.")
 
-    config_file = f"{exp_name.replace(' ', '_').lower()}_config.yaml"
+    config_file = str(CONFIG_DIR / f"{exp_name.replace(' ', '_').lower()}_config.yaml")
 
     exp_type = exp_types.get(exp_name)
     if exp_type is None:
         print("\nExperiment name error.")
         return
 
-    exp = exp_type(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "config.yaml", config_file, debug=bool_DEBUG)
+    exp = exp_type(experiment_id, mouse_id, data_aq, str(CONFIG_DIR / "monitor_config.yaml"), str(CONFIG_DIR / "config.yaml"), config_file, debug=bool_DEBUG)
 
     exp.load_experiment_config()
     exp.start_data_acquisition()

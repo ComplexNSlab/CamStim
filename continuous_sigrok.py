@@ -13,7 +13,7 @@ stop_flag = False
 
 
 def load_runtime_config():
-    config_path = Path(__file__).resolve().parent / 'config.yaml'
+    config_path = Path(__file__).resolve().parent / 'config_files' / 'config.yaml'
     if not config_path.is_file():
         raise Exception(f"Config file not found: {config_path}")
 

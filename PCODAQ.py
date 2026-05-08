@@ -2,6 +2,7 @@ from time import sleep
 import serial
 import threading
 import yaml
+from pathlib import Path
 
 
 # Minimal DAQ surface still used by BaseExperiment.
@@ -21,7 +22,10 @@ class ExperimentDAQ:
 
 class Teensy:
     def __init__(self, experiment_id, DEBUG, teensy_params):
-        self.teensy_parameters_filename = teensy_params
+        config_path = Path(teensy_params)
+        if not config_path.is_absolute():
+            config_path = Path(__file__).resolve().parent / config_path
+        self.teensy_parameters_filename = str(config_path)
         with open(self.teensy_parameters_filename, 'r') as file:
             self.teensy_parameters = yaml.load(file, Loader=yaml.FullLoader)
 
