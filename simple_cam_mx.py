@@ -8,8 +8,6 @@ import platform
 import queue
 import threading
 import serial
-import socket
-import select
 import yaml
 from pathlib import Path
 import os
@@ -18,11 +16,10 @@ import matplotlib.pyplot as plt
 import subprocess
 import tkinter as tk
 from tkinter import simpledialog
-import json
 import shutil
 
 
-CONFIG_FILE = 'cam_config.yml'
+CONFIG_FILE = 'cam_config.yaml'
 SAVE_SETTINGS_CONFIG_FILE = 'config.yaml'
 
 def load_camera_config(yaml_file_path):
@@ -85,21 +82,20 @@ class App(object):
         self.dropped_display_frames = 0
         self.dropped_save_frames = 0
         self.save_overflow = False
-        self.strict_no_drop_save = bool(config.get('STRICT_NO_DROP_SAVE', True))
         self.save_batch_frames = int(config.get('SAVE_BATCH_FRAMES', 64))
-        self.save_processed_frames = bool(config.get('SAVE_PROCESSED_FRAMES', False))
         self.live_speck = config['USE_LIVE_SPECKLE']
         self.exposure = config['EXPOSURE_TIME'] # in ms
         self.analog_gain = config['ANALOG_GAIN'] 
-        self.filename = config['EXPERIMENT']
-        self.pwm_freq = config['PICO_PWM_FREQUENCY']
-        self.pwm_duty = config['PICO_PWM_DUTY']
-        self.bin_exp = config['BIN_EXP_LIVE']
+        self.filename = str(config.get('EXPERIMENT', 'recording'))
+        self.bin_exp = bool(config['BIN_EXP_LIVE'])
         self.bin_size = config['BIN_SIZE']
-        self.force_framerate = config['FORCE_FRAMERATE']
-        self.special_framerate = config['SPECIAL_FRAMERATE']
-        self.special_frame_period = 1.0/self.special_framerate
-        self.last_timestamp = None
+        self.bin_mode = str(config.get('BIN_MODE', 'software')).strip().lower()
+        if self.bin_mode not in ('software', 'camera'):
+            print(f"Warning: invalid BIN_MODE '{self.bin_mode}', defaulting to software.")
+            self.bin_mode = 'software'
+        self.hardware_bin_enabled = False
+        self.request_camera_bin = self.bin_exp and self.bin_mode == 'camera'
+        self.bin_exp = self.bin_exp and self.bin_mode == 'software'
         self.zeros = np.zeros((255, 255), dtype=np.uint8) # debug image in case I have problems with camera
         self.frame_timestamps = []  # List to store timestamps
         self.sys_clock_timestamps = []
@@ -149,27 +145,10 @@ class App(object):
 
         # self.check_and_fix_existing_experiment()
 
-
-        # UDP socket to listen for the commands
-        self.udp_port = config['UDP_TRIGGER_PORT']
-        self.ip = '0.0.0.0'
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.ip, self.udp_port))
-
-        self.udp_thread = threading.Thread(target=self.wait_udp_trigger)
-        self.udp_thread.start()
-
         self.dtype = 'uint16' if self.USE_MONO16 else 'uint8'
 
     def cleanup_udp(self):
-        self.quit = True
-        if hasattr(self, 'sock') and self.sock:
-            try:
-                self.sock.close()
-            except:
-                pass
-        if hasattr(self, 'udp_thread') and self.udp_thread.is_alive():
-            self.udp_thread.join(timeout=2.0)
+        return
 
     def get_frame_for_display(self):
         return self.get_latest_frame()
@@ -222,6 +201,95 @@ class App(object):
 
         return False
 
+    def _decode_mode_mask(self, mask):
+        return [bit + 2 for bit in range(32) if mask & (1 << bit)]
+
+    def _probe_camera_binning_support(self, cap, mono_camera):
+        res_range = cap.sResolutionRange
+        print(f"Hardware skip modes: {self._decode_mode_mask(res_range.uSkipModeMask)}")
+        print(f"Hardware bin-sum modes: {self._decode_mode_mask(res_range.uBinSumModeMask)}")
+        print(f"Hardware bin-average modes: {self._decode_mode_mask(res_range.uBinAverageModeMask)}")
+
+        if not mono_camera:
+            print("MONO16 probe skipped: camera is not monochrome.")
+            return
+
+        original_format = None
+        try:
+            original_format = mvsdk.CameraGetIspOutFormat(self.hCamera)
+            probe_error = mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO16)
+            if probe_error == mvsdk.CAMERA_STATUS_SUCCESS:
+                applied_format = mvsdk.CameraGetIspOutFormat(self.hCamera)
+                mono16_enabled = (applied_format == mvsdk.CAMERA_MEDIA_TYPE_MONO16)
+                print(f"MONO16 probe: supported={mono16_enabled}, applied_format={applied_format}")
+            else:
+                print(f"MONO16 probe: rejected with SDK status {probe_error}")
+        except Exception as e:
+            print(f"MONO16 probe failed: {e}")
+        finally:
+            if original_format is not None:
+                try:
+                    mvsdk.CameraSetIspOutFormat(self.hCamera, original_format)
+                except Exception as e:
+                    print(f"Warning: failed to restore original ISP format after probe: {e}")
+
+    def _fallback_to_software_binning(self, reason):
+        print(f"Camera binning unavailable: {reason}. Falling back to software binning.")
+        self.request_camera_bin = False
+        self.hardware_bin_enabled = False
+        self.bin_mode = 'software'
+        self.bin_exp = True
+
+    def _apply_camera_binning(self, cap, mono_camera):
+        if not self.request_camera_bin:
+            return
+
+        if not mono_camera:
+            self._fallback_to_software_binning('camera is not monochrome')
+            return
+
+        if self.bin_size < 2:
+            self._fallback_to_software_binning(f'invalid BIN_SIZE {self.bin_size}')
+            return
+
+        bin_bit = 1 << (self.bin_size - 2)
+        if not (cap.sResolutionRange.uBinSumModeMask & bin_bit):
+            self._fallback_to_software_binning(f'hardware sum binning {self.bin_size}x{self.bin_size} is not supported')
+            return
+
+        try:
+            mono16_error = mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO16)
+            if mono16_error != mvsdk.CAMERA_STATUS_SUCCESS:
+                self._fallback_to_software_binning(f'MONO16 rejected with SDK status {mono16_error}')
+                return
+
+            applied_format = mvsdk.CameraGetIspOutFormat(self.hCamera)
+            if applied_format != mvsdk.CAMERA_MEDIA_TYPE_MONO16:
+                self._fallback_to_software_binning(f'MONO16 did not stick (applied format {applied_format})')
+                return
+
+            image_res = mvsdk.CameraGetImageResolution(self.hCamera)
+            image_res.uSkipMode = 0
+            image_res.uBinAverageMode = 0
+            image_res.uBinSumMode = bin_bit
+
+            set_error = mvsdk.CameraSetImageResolution(self.hCamera, image_res)
+            if set_error != mvsdk.CAMERA_STATUS_SUCCESS:
+                self._fallback_to_software_binning(f'CameraSetImageResolution failed with SDK status {set_error}')
+                return
+
+            applied_res = mvsdk.CameraGetImageResolution(self.hCamera)
+            self.width = applied_res.iWidth
+            self.height = applied_res.iHeight
+            self.USE_MONO16 = True
+            self.dtype = 'uint16'
+            self.hardware_bin_enabled = True
+            self.bin_exp = False
+            self.bin_mode = 'camera'
+            print(f"Enabled camera binning: sum {self.bin_size}x{self.bin_size}, output {self.width}x{self.height}, format MONO16")
+        except Exception as e:
+            self._fallback_to_software_binning(str(e))
+
     def experiment_status_callback(self, message):
         if hasattr(self, 'exp_status_queue'):
             self.exp_status_queue.put(("status", message))
@@ -253,11 +321,11 @@ class App(object):
         for num, name in self.exp_list.items():
             print(f"{num}: {name}")
 
-        exp_name, experiment_id, mouse_id, method = self.show_exp_dialogs()
+        exp_name, experiment_id, mouse_id = self.show_exp_dialogs()
         if not exp_name: 
             return
 
-        self.exp_thread = threading.Thread(target=self.run_exp, args=(exp_name, experiment_id, mouse_id, method), daemon=True)
+        self.exp_thread = threading.Thread(target=self.run_exp, args=(exp_name, experiment_id, mouse_id), daemon=True)
         self.exp_thread.start()
 
     def show_exp_dialogs(self):
@@ -271,33 +339,29 @@ class App(object):
             while True:
                 exp_num = simpledialog.askinteger("Experiment", "Enter experiment number:", parent=root)
                 if exp_num is None:
-                    return (None, None, None, None)
+                    return (None, None, None)
                 exp_name = self.exp_list.get(exp_num)
                 if exp_name:
                     break
 
             experiment_id = simpledialog.askstring("Experiment ID", "Enter experiment ID:", parent=root)
             if experiment_id is None:
-                return (None, None, None, None)
+                return (None, None, None)
 
             self.save_dir = None
             self.save_dir_ready = False
 
             mouse_id = simpledialog.askstring("Mouse ID", "Enter mouse ID:", parent=root)
             if mouse_id is None:
-                return (None, None, None, None)
+                return (None, None, None)
 
-            method = simpledialog.askstring("Method", "Send inputs via 'subprocess (s)' or '(u)'?", parent=root)
-            if method is None:
-                return (None, None, None, None)
-
-            return (exp_name, experiment_id, mouse_id, method)
+            return (exp_name, experiment_id, mouse_id)
 
         except Exception as e:
             print(f"Dialog Error: {e}.")
-            return (None, None, None, None)
+            return (None, None, None)
 
-    def run_exp(self, exp_name, experiment_id, mouse_id, method):
+    def run_exp(self, exp_name, experiment_id, mouse_id):
         try:
             self.exp_name = exp_name
             self.experiment_id = experiment_id
@@ -306,7 +370,7 @@ class App(object):
             self._prepare_save_directory(mouse_id, experiment_id)
 
             self.start_logic_analyzer(experiment_id, mouse_id, self.filename)
-            self.start_stim(exp_name, experiment_id, mouse_id, method,
+            self.start_stim(exp_name, experiment_id, mouse_id,
                                 self.experiment_status_callback,
                                 self.experiment_trial_callback)
 
@@ -390,7 +454,7 @@ class App(object):
             for line in self.logic_progress.stdout:
                 print(f"{line.strip()}")
 
-    def start_stim(self, exp_name, experiment_id, mouse_id, method, status_callback=None, trial_callback=None):
+    def start_stim(self, exp_name, experiment_id, mouse_id, status_callback=None, trial_callback=None):
         if getattr(self, 'stim_progress', None):
             print("Experiment currently running. Stopping...")
             if hasattr(self.stim_progress, 'terminate'):
@@ -402,30 +466,12 @@ class App(object):
         self.status_callback = status_callback
         self.trial_callback = trial_callback
 
-        if method.lower() == 's':
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            wf_script = os.path.join(script_dir, "wf_main.py")
-            self.stim_progress = subprocess.Popen(["python", "-u", wf_script, exp_name, experiment_id, mouse_id],
-                stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True)
-            threading.Thread(target=self.track_stim, daemon=True).start()
-            print("\nStarted stim via subprocess.")
-
-        elif method.lower() == 'u':
-            msg = {"cmd": "START", 
-                'exp_name': exp_name, 
-                "experiment_id": experiment_id, 
-                "mouse_id": mouse_id}
-            
-            UDP_IP = "127.0.0.1"
-            UDP_PORT = 5005
-
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as send_sock:
-                send_sock.sendto(json.dumps(msg).encode(), (UDP_IP, UDP_PORT))
-                print(f"Sent UDP trigger to visual stim at {UDP_IP}:{UDP_PORT}")
-
-            self.stim_progress = True
-        else:
-            raise ValueError(f"Unknown method {method}. Choose 's' or 'u''.")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        wf_script = os.path.join(script_dir, "wf_main.py")
+        self.stim_progress = subprocess.Popen(["python", "-u", wf_script, exp_name, experiment_id, mouse_id],
+            stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True)
+        threading.Thread(target=self.track_stim, daemon=True).start()
+        print("\nStarted stim via subprocess.")
 
     def stop_stim(self):
         if getattr(self, 'stim_progress', None) is None:
@@ -446,14 +492,6 @@ class App(object):
                     print(f'\nError stopping stim: {e}.')
                     if self.stim_progress.poll() is None:
                         self.stim_progress.kill()
-
-            elif self.stim_progress is True:
-                msg = {"cmd": "STOP"}
-                UDP_IP = "127.0.0.1"
-                UDP_PORT = 5005
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as send_sock:
-                    send_sock.sendto(json.dumps(msg).encode(), (UDP_IP, UDP_PORT))
-                    print(f"\nSent stop to visual stim at {UDP_IP}:{UDP_PORT}")
                 
             self.stim_progress = None
 
@@ -534,20 +572,16 @@ class App(object):
 
         metadata = {
             'num_frames': self.session_frames_written,
-            'frame_width': self.width if (not self.save_processed_frames or not self.bin_exp) else self.width//self.bin_size,
-            'frame_height': self.height if (not self.save_processed_frames or not self.bin_exp) else self.height//self.bin_size,
-            'data_type': self.dtype if (not self.save_processed_frames or not self.bin_exp) else 'uint16',
+            'frame_width': self.width if not self.bin_exp else self.width//self.bin_size,
+            'frame_height': self.height if not self.bin_exp else self.height//self.bin_size,
+            'data_type': self.dtype if not self.bin_exp else 'uint16',
             'frame_timestamps': self.session_frame_timestamps,
             'sys_clock_timestamps': self.session_sys_clock_timestamps,
             'frame_exposure': self.exposure,
             'frame_gain': self.analog_gain,
-            'pwm_frequency': self.pwm_freq,
-            'pwm_duty': self.pwm_duty,
-            'binned_live': self.bin_exp,
-            'save_processed_frames': self.save_processed_frames,
+            'binned_live': self.bin_exp or self.hardware_bin_enabled,
+            'bin_mode': self.bin_mode if (self.bin_exp or self.hardware_bin_enabled) else 'none',
             'bin_size': self.bin_size,
-            'force_framerate': self.force_framerate,
-            'special_framerate': self.special_framerate
         }
         np.save(os.path.join(self.save_dir, '{}.npy'.format(self.filename)), metadata)
 
@@ -574,29 +608,25 @@ class App(object):
             if not write_batch or self.save_file_handle is None:
                 return
 
-            if self.save_processed_frames:
-                # Process entire batch at once using vectorized 3D operations.
-                n = len(write_batch)
-                batch = np.frombuffer(b''.join(write_batch), dtype=self.dtype).reshape((n, self.height, self.width))
-                batch = np.ascontiguousarray(batch[:, :, ::-1])  # horizontal flip
-                if self.bin_exp:
-                    bs = self.bin_size
-                    if bs in (2, 4, 8, 16, 32, 64):
-                        # Faster path for power-of-two bin sizes via iterative 2x2 reductions.
-                        batch = batch.astype(np.uint16, copy=False)
-                        for _ in range(bs.bit_length() - 1):
-                            batch = (
-                                batch[:, 0::2, 0::2]
-                                + batch[:, 1::2, 0::2]
-                                + batch[:, 0::2, 1::2]
-                                + batch[:, 1::2, 1::2]
-                            )
-                    else:
-                        batch = batch.reshape(n, self.height // bs, bs, self.width // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
-                batch.tofile(self.save_file_handle)
-            else:
-                # Fast path: write raw camera bytes exactly as acquired.
-                self.save_file_handle.write(b''.join(write_batch))
+            # Process entire batch at once using vectorized 3D operations.
+            n = len(write_batch)
+            batch = np.frombuffer(b''.join(write_batch), dtype=self.dtype).reshape((n, self.height, self.width))
+            batch = np.ascontiguousarray(batch[:, :, ::-1])  # horizontal flip
+            if self.bin_exp:
+                bs = self.bin_size
+                if bs in (2, 4, 8, 16, 32, 64):
+                    # Faster path for power-of-two bin sizes via iterative 2x2 reductions.
+                    batch = batch.astype(np.uint16, copy=False)
+                    for _ in range(bs.bit_length() - 1):
+                        batch = (
+                            batch[:, 0::2, 0::2]
+                            + batch[:, 1::2, 0::2]
+                            + batch[:, 0::2, 1::2]
+                            + batch[:, 1::2, 1::2]
+                        )
+                else:
+                    batch = batch.reshape(n, self.height // bs, bs, self.width // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
+            batch.tofile(self.save_file_handle)
 
             self.frame_timestamps.extend(ts_batch)
             self.sys_clock_timestamps.extend(sys_ts_batch)
@@ -1074,30 +1104,6 @@ class App(object):
         # self.maxI = np.percentile(frame[:], 100-self.autoI)
         # print("\n Changing dynamical range to: {}, {} pixel values. Percentiles: {}, {}".format(self.minI, self.maxI, self.autoI, 100-self.autoI))
 
-    def wait_udp_trigger(self):
-        self.sock.setblocking(0)
-        while not self.quit:
-            # Receive message
-            ready = select.select([self.sock], [], [], 1)
-            if ready[0]:
-                try:
-                    data, addr = self.sock.recvfrom(1024)  # buffer size is 1024 bytes
-                    msg = data.decode()
-
-                    if 'ExpStart' in msg:
-                        print("Experiment started - waiting for hardware triggers.")
-                        self.frame_count = 0
-                        self.t_start = time.time()
-                    elif 'ExpEnd' in msg:
-                        print("Experiment ended.")
-                    else:
-                        print("Received: ", msg)
-                except:
-                    if self.quit:
-                        break
-        print("UDP thread stopped.")
-
-
     def print_camera_stats(self):
         print("\nExposure(ms): {} Gain: {} ".format(self.exposure, self.analog_gain))
 
@@ -1149,6 +1155,13 @@ class App(object):
         # Determine if it is a monochrome camera or a color camera
         monoCamera = (cap.sIspCapacity.bMonoSensor != 0)
 
+        self._probe_camera_binning_support(cap, monoCamera)
+
+        self.height = cap.sResolutionRange.iHeightMax
+        self.width = cap.sResolutionRange.iWidthMax
+
+        self._apply_camera_binning(cap, monoCamera)
+
         # For monochrome cameras, let ISP output MONO data directly, instead of expanding it into 24-bit grayscale with R=G=B
         if monoCamera:
             if self.USE_MONO16:
@@ -1168,8 +1181,6 @@ class App(object):
         mvsdk.CameraSetExposureTime(self.hCamera, self.exposure * 1000)
         mvsdk.CameraSetAnalogGain(self.hCamera, self.analog_gain)
 
-        self.height = cap.sResolutionRange.iHeightMax
-        self.width = cap.sResolutionRange.iWidthMax
         print(f"Camera resolution: {self.width}x{self.height}")
 
         if self.live_speck:
@@ -1252,29 +1263,14 @@ class App(object):
             self.t_start = time.time()
 
 
-        if not self.force_framerate:
-            if self.saving:
-                frame_timestamp = time.time()
-                if not self._enqueue_save_frame(frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp):
-                    return
-            # Stop addding to the display queue if the frame queue is getting too full
-            if self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize:
-                self._put_display_frame(frame_data)
-            self.frame_count += 1
-        else:
-            if self.last_timestamp is None or current_time-self.last_timestamp >= self.special_frame_period:
-                self.last_timestamp = current_time
-
-                if self.saving:
-                    frame_timestamp = time.time()
-                    if not self._enqueue_save_frame(frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp):
-                        return
-                # Stop addding to the display queue if the frame queue is getting too full
-                if self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize:
-                    self._put_display_frame(frame_data)
-                self.frame_count += 1
-            else:
+        if self.saving:
+            frame_timestamp = time.time()
+            if not self._enqueue_save_frame(frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp):
                 return
+        # Stop addding to the display queue if the frame queue is getting too full
+        if self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize:
+            self._put_display_frame(frame_data)
+        self.frame_count += 1
 
 def main():
     try:
@@ -1288,7 +1284,6 @@ def main():
         app.quit = True
         app.save_thread.join()  # Ensure the save thread has finished
         app.display_thread.join()  # Ensure the display thread has finished
-        app.udp_thread.join()
         plt.close('all')
 
 if __name__ == '__main__':

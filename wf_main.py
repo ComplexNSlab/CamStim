@@ -9,10 +9,7 @@ sys.stdin.reconfigure(line_buffering=True)
 
 from time import sleep, time
 
-# the imports below are no longer needed, since for now there is no need to support NIDAQMX anymore
-#from NISDAQ import NISDAQ
-from PCODAQ import PCODAQ
-#from HTDAQ import HTDAQ
+from PCODAQ import ExperimentDAQ
 from PCODAQ import Teensy
 
 from SimpleOrientationExperiment import SimpleOrientationExperiment
@@ -60,7 +57,7 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
                 status_callback(error_msg)
             return
 
-        data_aq = PCODAQ(experiment_id, bool_DEBUG)
+        data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
         teensy_board = Teensy(experiment_id, bool_DEBUG, "teensyParams.yaml")
 
         start_msg = "\nTeensy started."
@@ -103,7 +100,7 @@ def execute_exp_in_thread(exp_name, experiment_id, mouse_id):
         experiment_running = False
 
 def execute_exp(exp_name, experiment_id, mouse_id):
-    data_aq = PCODAQ(experiment_id, bool_DEBUG)
+    data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
     teensy_board = Teensy(experiment_id, bool_DEBUG, "teensyParams.yaml")
     print("\nTeensy started.")
 

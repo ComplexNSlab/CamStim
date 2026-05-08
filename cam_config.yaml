@@ -1,0 +1,23 @@
+# Whether to use the live speckle feature
+USE_LIVE_SPECKLE: true
+BUFFER_SIZE: 10
+
+# What exposure time to use (in ms, can be < 0)
+EXPOSURE_TIME: 15
+# Analog gain of the camera, try to keep as low as possible
+ANALOG_GAIN: 1
+
+# Whether the data should be binned during the experiment
+# raw data is huge (2048, 2048) images
+BIN_EXP_LIVE: false
+# Where binning should happen: software or camera
+BIN_MODE: "software"
+# What bin size is done (e.g., 4 means final image size will be 512, 512)
+BIN_SIZE: 2
+
+# Save pipeline settings for high-throughput acquisition
+# Number of frames buffered in RAM before disk writes catch up.
+# 2048x2048x8-bit ~= 4 MiB/frame, so 1000 frames ~= 4 GiB.
+SAVE_QUEUE_MAX_FRAMES: 1200
+# Frames grouped into one write batch. Larger batches reduce syscall overhead.
+SAVE_BATCH_FRAMES: 64

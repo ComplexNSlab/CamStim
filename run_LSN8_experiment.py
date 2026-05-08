@@ -7,8 +7,7 @@ import numpy as np
 from time import sleep, time
 from datetime import datetime
 
-from NISDAQ import NISDAQ
-from PCODAQ import PCODAQ
+from PCODAQ import ExperimentDAQ
 
 from SimpleOrientationExperiment import SimpleOrientationExperiment
 from TextureExperimentFB import TextureExperimentFB
@@ -39,9 +38,7 @@ if __name__ == "__main__":
     try:
         print("Running an 8 degree receptive field mapping experiment.")
         experiment_id, mouse_id = create_experiment_name()
-        # change the line below to use PCO or NIS (2p)
-        data_aq = NISDAQ(experiment_id)
-        #data_aq = PCODAQ(experiment_id)
+        data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
         exp = LocallySparseNoiseExperiment(experiment_id, mouse_id, data_aq, "monitor_config.yaml", "config.yaml", "locally_sparse_noise_8deg_config.yaml", debug=bool_DEBUG)
      
 
