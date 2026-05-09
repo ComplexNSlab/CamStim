@@ -25,11 +25,6 @@ SAVE_BATCH_FRAMES: 64
 # Upper bound on raw frame bytes per batch (helps avoid long periodic write stalls).
 SAVE_TARGET_BATCH_BYTES: 33554432
 
-# Acquisition-priority mode: when saving, reduce display update rate so callback stays fast.
-PRIORITIZE_ACQUISITION: true
-# Update latest/display frame every N acquired frames while saving.
-DISPLAY_UPDATE_INTERVAL_WHEN_SAVING: 10
-
 # Apply horizontal mirror to each grabbed frame via CameraFlipFrameBuffer.
 # Set to true when the camera is mounted so the raw image is left-right flipped.
 CAMERA_MIRROR_HORIZONTAL: true

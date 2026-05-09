@@ -123,9 +123,6 @@ class App(object):
         self.save_batch_frames = int(config.get('SAVE_BATCH_FRAMES', 64))
         # Cap batch memory to avoid periodic large allocations that can stall writes.
         self.save_target_batch_bytes = int(config.get('SAVE_TARGET_BATCH_BYTES', 32 * 1024 * 1024))
-        # Keep acquisition callback lightweight during saving by reducing display work.
-        self.prioritize_acquisition = bool(config.get('PRIORITIZE_ACQUISITION', True))
-        self.display_update_interval_when_saving = max(1, int(config.get('DISPLAY_UPDATE_INTERVAL_WHEN_SAVING', 10)))
         self.live_speck = config['USE_LIVE_SPECKLE']
         self.exposure = config['EXPOSURE_TIME'] # in ms
         self.analog_gain = float(config['ANALOG_GAIN'])
@@ -322,9 +319,6 @@ class App(object):
 
         if self.frame_output_queue is not None:
             self._queue_put_latest(self.frame_output_queue, frame_data)
-
-        if self.prioritize_acquisition and self.saving and (frame_index % self.display_update_interval_when_saving != 0):
-            return
 
 
     def get_latest_frame(self):
