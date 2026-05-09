@@ -1,5 +1,14 @@
 # Changes Summary
 
+## Camera Subprocess Split and Runtime Fixes
+- Moved the camera acquisition path into a dedicated subprocess so the GUI no longer shares the same Python execution path as frame grabbing.
+- Added a GUI proxy layer in `camstim.py` to control camera, trigger, experiment, and status flow through IPC queues.
+- Kept live display working by forwarding the latest frame snapshot from the worker back to the GUI.
+- Restored experiment-complete auto-stop behavior so the GUI returns to the same stop-experiment / stop-camera state after a run finishes.
+- Fixed the histogram normalize crash by routing the checkbox to the GUI proxy instead of the old in-process camera object.
+- Hardened save-thread shutdown so the save file handle is closed idempotently and no longer raises `OSError: handle is closed` at experiment end.
+- Added Windows-only priority boosts for the camera worker and callback thread to reduce scheduling interference during acquisition.
+
 ## GUI Experiment Flow, Debug Mode, and Linux Compatibility
 - Added Qt-native experiment controls in `camstim.py`: experiment dropdown, experiment ID, and mouse ID fields.
 - Experiment dropdown now populates at GUI startup and remains available independently of camera start/stop.

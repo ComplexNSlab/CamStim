@@ -1,4 +1,5 @@
-	# coding=utf-8
+# coding=utf-8
+import ctypes
 import sys
 import cv2
 import numpy as np
@@ -23,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 CONFIG_DIR = REPO_ROOT / 'config_files'
 CONFIG_FILE = str(CONFIG_DIR / 'cam_config.yaml')
+TEENSY_PARAMS_FILE = str(CONFIG_DIR / 'teensyParams.yaml')
 SAVE_SETTINGS_CONFIG_FILE = str(CONFIG_DIR / 'config.yaml')
 
 
@@ -72,7 +74,7 @@ def load_save_root(yaml_file_path=SAVE_SETTINGS_CONFIG_FILE):
 
 
 class App(object):
-    def __init__(self, config, gui_mode=False):
+    def __init__(self, config, gui_mode=False, frame_output_queue=None, command_queue=None, status_queue=None):
         super(App, self).__init__()
 
         self.config = config
@@ -84,7 +86,6 @@ class App(object):
             self.debug_skip_teensy = bool(debug_skip_teensy_cfg)
         self.vmin = 0
         self.vmax = 30    
-        self.pFrameBuffer = 0
         self.minI = 0
         self.maxI = 255
         self.autoI = 0.05
@@ -104,9 +105,15 @@ class App(object):
         self.dropped_save_frames = 0
         self.save_overflow = False
         self.save_batch_frames = int(config.get('SAVE_BATCH_FRAMES', 64))
+        # Cap batch memory to avoid periodic large allocations that can stall writes.
+        self.save_target_batch_bytes = int(config.get('SAVE_TARGET_BATCH_BYTES', 32 * 1024 * 1024))
+        # Keep acquisition callback lightweight during saving by reducing display work.
+        self.prioritize_acquisition = bool(config.get('PRIORITIZE_ACQUISITION', True))
+        self.display_update_interval_when_saving = max(1, int(config.get('DISPLAY_UPDATE_INTERVAL_WHEN_SAVING', 10)))
         self.live_speck = config['USE_LIVE_SPECKLE']
         self.exposure = config['EXPOSURE_TIME'] # in ms
         self.analog_gain = config['ANALOG_GAIN'] 
+
         self.filename = str(config.get('EXPERIMENT', 'recording'))
         self.bin_exp = bool(config['BIN_EXP_LIVE'])
         self.bin_size = config['BIN_SIZE']
@@ -122,7 +129,8 @@ class App(object):
         self.sys_clock_timestamps = []
         self.session_frame_timestamps = []
         self.session_sys_clock_timestamps = []
-        self.USE_MONO16 = False # If false defaults to 8 bit although current camera doesn't have true 16 bit
+        self.USE_MONO16 = False
+        self.bytes_per_pixel = 1
         self.t_start = None
         self.t_end = None
         self.hCamera = None
@@ -152,12 +160,18 @@ class App(object):
         self.save_file_handle = None
         self.gui_mode = gui_mode
         self.exp_status_queue = queue.Queue()
+        self.frame_output_queue = frame_output_queue
+        self.command_queue = command_queue
+        self.status_queue = status_queue
+        self.ready_state_published = False
         self.latest_frame_data = None
         self.latest_frame_lock = threading.Lock()
+        self._windows_camera_thread_priority_boosted = False
+        self._windows_callback_thread_priority_boosted = False
 
         # self.check_and_fix_existing_experiment()
 
-        self.dtype = 'uint16' if self.USE_MONO16 else 'uint8'
+        self.dtype = 'uint8'
 
     def get_frame_for_display(self):
         return self.get_latest_frame()
@@ -169,9 +183,140 @@ class App(object):
             except queue.Empty:
                 break
 
-    def _put_display_frame(self, frame_data):
+    def _queue_put_latest(self, q, item):
+        if q is None:
+            return
+        try:
+            while True:
+                q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            pass
+
+    def _publish_status(self, payload):
+        self._queue_put_latest(self.status_queue, payload)
+
+    def _publish_ready_state(self):
+        if self.ready_state_published:
+            return
+        if not hasattr(self, 'width') or not hasattr(self, 'height'):
+            return
+
+        self.ready_state_published = True
+        self._publish_status({
+            'type': 'ready',
+            'width': int(self.width),
+            'height': int(self.height),
+            'dtype': self.dtype,
+            'bin_exp': bool(self.bin_exp),
+            'bin_size': int(self.bin_size),
+        })
+
+    def _handle_command(self, command):
+        if not command:
+            return
+
+        if isinstance(command, tuple):
+            name = command[0]
+            payload = command[1] if len(command) > 1 else None
+        elif isinstance(command, dict):
+            name = command.get('name')
+            payload = command.get('payload')
+        else:
+            return
+
+        try:
+            if name == 'stop_camera':
+                self.stop_stim()
+                self.quit = True
+            elif name == 'set_trigger_mode':
+                mode = int(payload)
+                if self.hCamera:
+                    mvsdk.CameraSetTriggerMode(self.hCamera, mode)
+                self.saving = (mode == 2)
+                self._publish_status({'type': 'trigger_mode', 'mode': mode})
+            elif name == 'set_exposure':
+                exposure_ms = float(payload)
+                self.exposure = exposure_ms
+                if self.hCamera:
+                    mvsdk.CameraSetExposureTime(self.hCamera, exposure_ms * 1000)
+                self._publish_status({'type': 'exposure', 'value': exposure_ms})
+            elif name == 'set_gain':
+                gain = int(payload)
+                self.analog_gain = gain
+                if self.hCamera:
+                    mvsdk.CameraSetAnalogGain(self.hCamera, gain)
+                self._publish_status({'type': 'gain', 'value': gain})
+            elif name == 'set_saving':
+                self.saving = bool(payload)
+                self._publish_status({'type': 'saving', 'value': self.saving})
+            elif name == 'preview_experiment':
+                exp_name, experiment_id, mouse_id = payload
+                self.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
+            elif name == 'start_experiment':
+                exp_name, experiment_id, mouse_id = payload
+                self.saving = True
+                self.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
+            elif name == 'stop_preview':
+                self.stop_stim()
+            elif name == 'stop_experiment':
+                self.saving = False
+                self.stop_stim()
+        except Exception as e:
+            self._publish_status({'type': 'error', 'message': str(e)})
+
+    def _process_command_queue(self):
+        if self.command_queue is None:
+            return
+
+        while True:
+            try:
+                command = self.command_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_command(command)
+
+    def _boost_windows_camera_thread_priority(self):
+        if platform.system() != 'Windows' or self._windows_camera_thread_priority_boosted:
+            return
+
+        try:
+            kernel32 = ctypes.windll.kernel32
+            thread_handle = kernel32.GetCurrentThread()
+            high_thread_priority = 2
+            if not kernel32.SetThreadPriority(thread_handle, high_thread_priority):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._windows_camera_thread_priority_boosted = True
+            print('Windows camera thread priority raised to HIGH.')
+        except Exception as e:
+            print(f'Warning: could not raise Windows camera thread priority: {e}')
+
+    def _boost_windows_callback_thread_priority(self):
+        if platform.system() != 'Windows' or self._windows_callback_thread_priority_boosted:
+            return
+
+        try:
+            kernel32 = ctypes.windll.kernel32
+            thread_handle = kernel32.GetCurrentThread()
+            highest_thread_priority = 2
+            if not kernel32.SetThreadPriority(thread_handle, highest_thread_priority):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._windows_callback_thread_priority_boosted = True
+        except Exception as e:
+            print(f'Warning: could not raise Windows callback thread priority: {e}')
+
+    def _put_display_frame(self, frame_data, frame_index):
         with self.latest_frame_lock:
             self.latest_frame_data = frame_data
+
+        if self.frame_output_queue is not None:
+            self._queue_put_latest(self.frame_output_queue, frame_data)
+
+        if self.prioritize_acquisition and self.saving and (frame_index % self.display_update_interval_when_saving != 0):
+            return
 
         if self.gui_mode:
             return
@@ -192,23 +337,41 @@ class App(object):
 
             self.dropped_display_frames += 1
 
+
     def get_latest_frame(self):
         with self.latest_frame_lock:
             if self.latest_frame_data is None:
                 return None
-            return bytes(self.latest_frame_data)
+            return self.latest_frame_data
 
     def _enqueue_save_frame(self, frame_data, frame_index, camera_timestamp, system_timestamp):
         queued_frame = (frame_data, frame_index, camera_timestamp, system_timestamp)
+        try:
+            # Never block the camera callback thread; callback stalls can cause SDK-level drops.
+            self.frame_queue.put_nowait(queued_frame)
+            return True
+        except queue.Full:
+            self.save_overflow = True
+            return False
 
-        while not self.quit:
-            try:
-                self.frame_queue.put(queued_frame, timeout=0.1)
-                return True
-            except queue.Full:
-                self.save_overflow = True
+    def _ensure_unique_filename(self):
+        if not self.save_dir_ready or self.save_dir is None:
+            return
 
-        return False
+        base_name = self.filename
+        candidate = base_name
+        suffix = 1
+        while True:
+            bin_path = Path(self.save_dir) / f"{candidate}.bin"
+            meta_path = Path(self.save_dir) / f"{candidate}.npy"
+            if not bin_path.exists() and not meta_path.exists():
+                break
+            candidate = f"{base_name}_{suffix}"
+            suffix += 1
+
+        if candidate != base_name:
+            print(f"Warning: save file exists for '{base_name}'. Using '{candidate}' instead.")
+            self.filename = candidate
 
     def _decode_mode_mask(self, mask):
         return [bit + 2 for bit in range(32) if mask & (1 << bit)]
@@ -219,29 +382,6 @@ class App(object):
         print(f"Hardware bin-sum modes: {self._decode_mode_mask(res_range.uBinSumModeMask)}")
         print(f"Hardware bin-average modes: {self._decode_mode_mask(res_range.uBinAverageModeMask)}")
 
-        if not mono_camera:
-            print("MONO16 probe skipped: camera is not monochrome.")
-            return
-
-        original_format = None
-        try:
-            original_format = mvsdk.CameraGetIspOutFormat(self.hCamera)
-            probe_error = mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO16)
-            if probe_error == mvsdk.CAMERA_STATUS_SUCCESS:
-                applied_format = mvsdk.CameraGetIspOutFormat(self.hCamera)
-                mono16_enabled = (applied_format == mvsdk.CAMERA_MEDIA_TYPE_MONO16)
-                print(f"MONO16 probe: supported={mono16_enabled}, applied_format={applied_format}")
-            else:
-                print(f"MONO16 probe: rejected with SDK status {probe_error}")
-        except Exception as e:
-            print(f"MONO16 probe failed: {e}")
-        finally:
-            if original_format is not None:
-                try:
-                    mvsdk.CameraSetIspOutFormat(self.hCamera, original_format)
-                except Exception as e:
-                    print(f"Warning: failed to restore original ISP format after probe: {e}")
-
     def _fallback_to_software_binning(self, reason):
         print(f"Camera binning unavailable: {reason}. Falling back to software binning.")
         self.request_camera_bin = False
@@ -249,65 +389,32 @@ class App(object):
         self.bin_mode = 'software'
         self.bin_exp = True
 
-    def _apply_camera_binning(self, cap, mono_camera):
-        if not self.request_camera_bin:
-            return
-
+    def _apply_output_bit_depth(self, mono_camera):
         if not mono_camera:
-            self._fallback_to_software_binning('camera is not monochrome')
-            return
+            raise RuntimeError("Only monochrome cameras are supported in this application.")
 
-        if self.bin_size < 2:
-            self._fallback_to_software_binning(f'invalid BIN_SIZE {self.bin_size}')
-            return
+        # Mono8 is enforced for stability and compatibility.
+        mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
+        self.USE_MONO16 = False
+        self.bytes_per_pixel = 1
+        self.dtype = 'uint8'
+        print("Using 8-bit output format (MONO8).")
 
-        bin_bit = 1 << (self.bin_size - 2)
-        if not (cap.sResolutionRange.uBinSumModeMask & bin_bit):
-            self._fallback_to_software_binning(f'hardware sum binning {self.bin_size}x{self.bin_size} is not supported')
-            return
-
-        try:
-            mono16_error = mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO16)
-            if mono16_error != mvsdk.CAMERA_STATUS_SUCCESS:
-                self._fallback_to_software_binning(f'MONO16 rejected with SDK status {mono16_error}')
-                return
-
-            applied_format = mvsdk.CameraGetIspOutFormat(self.hCamera)
-            if applied_format != mvsdk.CAMERA_MEDIA_TYPE_MONO16:
-                self._fallback_to_software_binning(f'MONO16 did not stick (applied format {applied_format})')
-                return
-
-            image_res = mvsdk.CameraGetImageResolution(self.hCamera)
-            image_res.uSkipMode = 0
-            image_res.uBinAverageMode = 0
-            image_res.uBinSumMode = bin_bit
-
-            set_error = mvsdk.CameraSetImageResolution(self.hCamera, image_res)
-            if set_error != mvsdk.CAMERA_STATUS_SUCCESS:
-                self._fallback_to_software_binning(f'CameraSetImageResolution failed with SDK status {set_error}')
-                return
-
-            applied_res = mvsdk.CameraGetImageResolution(self.hCamera)
-            self.width = applied_res.iWidth
-            self.height = applied_res.iHeight
-            self.USE_MONO16 = True
-            self.dtype = 'uint16'
-            self.hardware_bin_enabled = True
-            self.bin_exp = False
-            self.bin_mode = 'camera'
-            print(f"Enabled camera binning: sum {self.bin_size}x{self.bin_size}, output {self.width}x{self.height}, format MONO16")
-        except Exception as e:
-            self._fallback_to_software_binning(str(e))
+    def _apply_camera_binning(self, cap, mono_camera):
+        if self.request_camera_bin:
+            self._fallback_to_software_binning('camera binning mode is disabled in MONO8-only mode')
 
     def experiment_status_callback(self, message):
         if hasattr(self, 'exp_status_queue'):
             self.exp_status_queue.put(("status", message))
+        self._publish_status({'type': 'status', 'message': message})
         if not self.gui_mode:
             print(f"[Experiment] {message}")
 
     def experiment_trial_callback(self, current, total, message):
         if hasattr(self, 'exp_status_queue'):
             self.exp_status_queue.put(("trial", current, total, message))
+        self._publish_status({'type': 'trial', 'current': current, 'total': total, 'message': message})
         if not self.gui_mode:
             print(message)
 
@@ -443,6 +550,18 @@ class App(object):
 
         self.save_dir = save_dir
         self.save_dir_ready = True
+        self._ensure_unique_filename()
+
+    def _copy_teensy_params_to_save_dir(self):
+        if not self.save_dir_ready or self.save_dir is None:
+            return
+
+        teensy_params_source = Path(TEENSY_PARAMS_FILE)
+        teensy_params_target = Path(self.save_dir) / 'teensyParams.yaml'
+        if teensy_params_source.is_file():
+            shutil.copyfile(teensy_params_source, teensy_params_target)
+        else:
+            print("Warning: {} not found; skipping config copy.".format(teensy_params_source))
 
     def start_logic_analyzer(self, experiment_id, mouse_id, base_filename=None):
         self.stop_logic_analyzer()
@@ -487,8 +606,12 @@ class App(object):
                     print("\nLogic analyzer terminated.")
                     if not from_stop_stim and callable(self.on_logic_analyzer_terminated):
                         self.on_logic_analyzer_terminated()
+                    if not from_stop_stim:
+                        self._publish_status({'type': 'logic_analyzer_terminated'})
                 else:
                     print("Logic analyzer process has already finished.")
+                    if not from_stop_stim:
+                        self._publish_status({'type': 'logic_analyzer_terminated'})
             except (OSError, subprocess.TimeoutExpired) as e:
                 print(f"\nError stopping logic analyzer: {e}.")
                 if self.logic_progress.poll() is None:
@@ -595,6 +718,7 @@ class App(object):
                     print("\nStimulus completed message detected, stopping logic analyzer...")
                     exp_completed = True
                     self.stop_logic_analyzer()
+                    self._publish_status({'type': 'logic_analyzer_terminated'})
 
             print("\nStim process finished.")
 
@@ -611,6 +735,11 @@ class App(object):
                     self.logic_progress.poll() is None):
                     print("\nEnsuring logic analyzer is stopped...")
                     self.stop_logic_analyzer()  
+
+            if exp_completed and self.saving:
+                self._publish_status({'type': 'experiment_finished'})
+
+            self._copy_teensy_params_to_save_dir()
 
             self.status_callback = None
             self.trial_callback = None     
@@ -634,6 +763,11 @@ class App(object):
         if self.session_frames_written <= 0 or not self.save_dir_ready or self.save_dir is None:
             return
 
+        camera_gap_stats = self._analyze_timestamp_gaps(self.session_frame_timestamps)
+        system_gap_stats = self._analyze_timestamp_gaps(self.session_sys_clock_timestamps)
+
+        estimated_total_triggered_frames = self.session_frames_written + camera_gap_stats['estimated_missing_frames']
+
         metadata = {
             'num_frames': self.session_frames_written,
             'frame_width': self.width if not self.bin_exp else self.width//self.bin_size,
@@ -646,13 +780,91 @@ class App(object):
             'binned_live': self.bin_exp or self.hardware_bin_enabled,
             'bin_mode': self.bin_mode if (self.bin_exp or self.hardware_bin_enabled) else 'none',
             'bin_size': self.bin_size,
+            'timestamp_gap_analysis': {
+                'camera_timestamp': camera_gap_stats,
+                'system_timestamp': system_gap_stats,
+                'estimated_total_triggered_frames': estimated_total_triggered_frames,
+            },
         }
         np.save(os.path.join(self.save_dir, '{}.npy'.format(self.filename)), metadata)
+
+        cam_gap = metadata['timestamp_gap_analysis']['camera_timestamp']
+        summary = (
+            f"Timestamp gap summary: expected_dt={cam_gap['expected_delta']}, "
+            f"max_dt={cam_gap['max_delta']}, gap_events={cam_gap['gap_events']}, "
+            f"estimated_missing_frames={cam_gap['estimated_missing_frames']}, "
+            f"saved_frames={self.session_frames_written}, "
+            f"estimated_total_triggered={metadata['timestamp_gap_analysis']['estimated_total_triggered_frames']}"
+        )
+        print(summary)
+        self.experiment_status_callback(summary)
+
+    def _analyze_timestamp_gaps(self, timestamps):
+        """Estimate missing frames from timestamp gaps using a robust expected interval."""
+        if timestamps is None or len(timestamps) < 3:
+            return {
+                'num_timestamps': 0 if timestamps is None else int(len(timestamps)),
+                'expected_delta': None,
+                'max_delta': None,
+                'gap_events': 0,
+                'estimated_missing_frames': 0,
+            }
+
+        ts = np.asarray(timestamps, dtype=np.float64)
+        diffs = np.diff(ts)
+        diffs = diffs[diffs > 0]
+
+        if diffs.size == 0:
+            return {
+                'num_timestamps': int(len(timestamps)),
+                'expected_delta': None,
+                'max_delta': None,
+                'gap_events': 0,
+                'estimated_missing_frames': 0,
+            }
+
+        expected_delta = float(np.median(diffs))
+        if expected_delta <= 0:
+            return {
+                'num_timestamps': int(len(timestamps)),
+                'expected_delta': None,
+                'max_delta': float(np.max(diffs)),
+                'gap_events': 0,
+                'estimated_missing_frames': 0,
+            }
+
+        # Treat deltas larger than 1.5x expected as likely containing at least one missing frame.
+        gap_mask = diffs > (1.5 * expected_delta)
+        gap_diffs = diffs[gap_mask]
+
+        if gap_diffs.size == 0:
+            estimated_missing_frames = 0
+        else:
+            estimated_missing_frames = int(np.maximum(0, np.rint(gap_diffs / expected_delta).astype(np.int64) - 1).sum())
+
+        return {
+            'num_timestamps': int(len(timestamps)),
+            'expected_delta': expected_delta,
+            'max_delta': float(np.max(diffs)),
+            'gap_events': int(gap_diffs.size),
+            'estimated_missing_frames': estimated_missing_frames,
+        }
 
     def _reset_save_session_metadata(self):
         self.session_frames_written = 0
         self.session_frame_timestamps = []
         self.session_sys_clock_timestamps = []
+
+    def _close_save_file_handle(self):
+        if self.save_file_handle is None:
+            return
+
+        try:
+            if not self.save_file_handle.closed:
+                self.save_file_handle.flush()
+                self.save_file_handle.close()
+        finally:
+            self.save_file_handle = None
 
     def std_filter_frame(self, frame):
         # Binning
@@ -663,6 +875,7 @@ class App(object):
         last_flush_time = time.time()
         flush_interval_s = 0.5
         flush_every_n_frames = max(1, self.save_batch_frames)
+        last_reported_batch = None
         write_batch = []
         ts_batch = []
         sys_ts_batch = []
@@ -714,10 +927,23 @@ class App(object):
                     time.sleep(0.01)
                     continue
 
+                if hasattr(self, 'width') and hasattr(self, 'height'):
+                    frame_bytes = max(1, int(self.width) * int(self.height) * int(self.bytes_per_pixel))
+                    max_frames_by_bytes = max(1, self.save_target_batch_bytes // frame_bytes)
+                    effective_batch = max(1, min(self.save_batch_frames, max_frames_by_bytes))
+                    if effective_batch != flush_every_n_frames:
+                        flush_every_n_frames = effective_batch
+                    if last_reported_batch != flush_every_n_frames:
+                        print(f"Using effective save batch size: {flush_every_n_frames} frame(s) (~{flush_every_n_frames * frame_bytes / (1024*1024):.1f} MiB raw)")
+                        last_reported_batch = flush_every_n_frames
+
                 if self.save_file_handle is None:
                     file_path = os.path.join(self.save_dir, self.filename + '.bin')
-                    # Buffered appends improve sustained throughput when frame rate is high.
-                    self.save_file_handle = open(file_path, 'ab', buffering=4 * 1024 * 1024)
+                    if os.path.exists(file_path):
+                        self._ensure_unique_filename()
+                        file_path = os.path.join(self.save_dir, self.filename + '.bin')
+                    # Buffered writes improve sustained throughput when frame rate is high.
+                    self.save_file_handle = open(file_path, 'wb', buffering=4 * 1024 * 1024)
 
                 # Process frames if available
                 try:
@@ -753,9 +979,7 @@ class App(object):
 
                 flush_batch(force_flush=True)
                 if self.save_file_handle is not None and self.frame_queue.empty():
-                    self.save_file_handle.flush()
-                    self.save_file_handle.close()
-                    self.save_file_handle = None
+                    self._close_save_file_handle()
                     self._write_metadata()
                     self._reset_save_session_metadata()
                 if self.quit:
@@ -764,9 +988,7 @@ class App(object):
 
         if self.save_file_handle is not None:
             flush_batch(force_flush=True)
-            self.save_file_handle.flush()
-            self.save_file_handle.close()
-            self.save_file_handle = None
+            self._close_save_file_handle()
             self._write_metadata()
             self._reset_save_session_metadata()
 
@@ -1193,6 +1415,8 @@ class App(object):
 
     def main(self):
         # Enumerate cameras
+        self._boost_windows_camera_thread_priority()
+
         DevList = mvsdk.CameraEnumerateDevice()
         nDev = len(DevList)
         if nDev < 1:
@@ -1219,6 +1443,10 @@ class App(object):
 
         # Determine if it is a monochrome camera or a color camera
         monoCamera = (cap.sIspCapacity.bMonoSensor != 0)
+        if not monoCamera:
+            print("This application supports monochrome cameras only.")
+            mvsdk.CameraUnInit(self.hCamera)
+            return
 
         self._probe_camera_binning_support(cap, monoCamera)
 
@@ -1227,15 +1455,14 @@ class App(object):
 
         self._apply_camera_binning(cap, monoCamera)
 
-        # For monochrome cameras, let ISP output MONO data directly, instead of expanding it into 24-bit grayscale with R=G=B
-        if monoCamera:
-            if self.USE_MONO16:
-                print("Using 16-bit.")
-                mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO16)
-            else:
-                mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
-        else:
-            mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
+        # For monochrome cameras, output configured bit depth directly.
+        self._apply_output_bit_depth(monoCamera)
+
+        # Read back actual active resolution after ISP/output setup.
+        applied_res = mvsdk.CameraGetImageResolution(self.hCamera)
+        self.width = applied_res.iWidth
+        self.height = applied_res.iHeight
+        self._publish_ready_state()
 
         # Switch camera mode to continuous capture
         mvsdk.CameraSetTriggerMode(self.hCamera, 0)
@@ -1254,13 +1481,8 @@ class App(object):
         # Let the SDK's internal image capture thread start working
         mvsdk.CameraPlay(self.hCamera)
 
-        # Calculate the size of the RGB buffer required, here directly allocated according to the camera's maximum resolution
-        FrameBufferSize = 1*cap.sResolutionRange.iWidthMax * cap.sResolutionRange.iHeightMax * (1 if monoCamera else 3)
-
-        # Allocate RGB buffer for storing images output by ISP
-        # Note: The data transferred from the camera to the PC is RAW data, which is converted to RGB data by software ISP on the PC 
-        # #(If it is a monochrome camera, no format conversion is needed, but ISP has other processing, so this buffer also needs to be allocated)
-        self.pFrameBuffer = mvsdk.CameraAlignMalloc(FrameBufferSize, 16)
+        # Allocate ISP output buffer for worst-case mono frame size at current bit depth.
+        FrameBufferSize = cap.sResolutionRange.iWidthMax * cap.sResolutionRange.iHeightMax * self.bytes_per_pixel
 
         # Set the capture callback function
         self.quit = False
@@ -1271,9 +1493,18 @@ class App(object):
         _stats_written = False
         # main loop to print info from the camera
         while not self.quit:
+            self._process_command_queue()
             current_time = time.time()
             elapsed_time = current_time - self.t_start
             average_fps = self.frame_count / elapsed_time if elapsed_time > 0 else 0
+
+            self._publish_status({
+                'type': 'stats',
+                'frame_count': self.frame_count,
+                'frames_written': self.frames_written,
+                'save_queue_size': self.frame_queue.qsize(),
+                'display_queue_size': self.display_queue.qsize(),
+            })
 
             # Print stats, reusing the same terminal line
             msg = "Save Q: {}, Frames Saved: {}, Save Drop: {}, Disp Q: {}, Disp Drop: {}, Frames Disp: {}, Average FPS: {:.2f} Sat Pixels: {:06d}".format(
@@ -1295,33 +1526,19 @@ class App(object):
         print("\n")  # Ensure to move to a new line after quitting
         # Uninitialize camera
         mvsdk.CameraUnInit(self.hCamera)
-        # Free the memory buffer
-        mvsdk.CameraAlignFree(self.pFrameBuffer)
-
     @mvsdk.method(mvsdk.CAMERA_SNAP_PROC)
     def GrabCallback(self, hCamera, pRawData, pFrameHead, pContext):
         if self.quit:
             #print("Returning without adding frames to the list")
             return
 
+        self._boost_windows_callback_thread_priority()
+
         current_time = time.time()
         FrameHead = pFrameHead[0]
-        pFrameBuffer = self.pFrameBuffer
 
-        # TODO check ImageProcess
-        # mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
-        # mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
-
-        # At this time, the image is already stored in pFrameBuffer. 
-        # For color cameras, pFrameBuffer=RGB data, for monochrome cameras, pFrameBuffer=8-bit grayscale data
-        # Convert pFrameBuffer into OpenCV image format for subsequent algorithm processing
-        
-        # 0506 JO update
-        # frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData)
-        # mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
         frame_data = bytes((mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData))
         mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
-
 
         if not self.acquiring:
             self.acquiring = True
@@ -1331,10 +1548,11 @@ class App(object):
         if self.saving:
             frame_timestamp = time.time()
             if not self._enqueue_save_frame(frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp):
+                self.dropped_save_frames += 1
                 return
         # Stop addding to the display queue if the frame queue is getting too full
         if self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize:
-            self._put_display_frame(frame_data)
+            self._put_display_frame(frame_data, self.frame_count)
         self.frame_count += 1
 
 def main():
@@ -1350,6 +1568,12 @@ def main():
         app.save_thread.join()  # Ensure the save thread has finished
         app.display_thread.join()  # Ensure the display thread has finished
         plt.close('all')
+
+
+def run_camera_worker(config, frame_output_queue=None, command_queue=None, status_queue=None):
+    app = App(config, gui_mode=True, frame_output_queue=frame_output_queue, command_queue=command_queue, status_queue=status_queue)
+    app.save_thread.start()
+    app.main()
 
 if __name__ == '__main__':
     main()

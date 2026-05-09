@@ -1,5 +1,7 @@
 import sys
 import numpy as np
+import multiprocessing as mp
+import queue
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
 							QWidget, QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
 							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit)
@@ -10,18 +12,225 @@ from collections import deque
 from utils.simple_cam_mx import App, load_camera_config
 import threading
 from core import mvsdk
+from core.TeensyController import TeensyController
 from core.experiment_discovery import get_experiment_list
 import cv2
 import yaml
 from pathlib import Path
 
+from utils.simple_cam_mx import load_camera_config, run_camera_worker
+from core.experiment_discovery import get_experiment_list
+
 CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
+
+
+class CameraProcessClient:
+	def __init__(self, config):
+		self.config = config
+		self.frame_queue = None
+		self.command_queue = None
+		self.status_queue = None
+		self.process = None
+		self.latest_frame_data = None
+		self.latest_frame_lock = threading.Lock()
+		self.ready = False
+		self.dtype = 'uint8'
+		self.width = None
+		self.height = None
+		self.bin_exp = bool(config.get('BIN_EXP_LIVE'))
+		self.bin_size = int(config.get('BIN_SIZE', 1))
+		self.vmin = 0
+		self.vmax = 30
+		self.live_speck = bool(config.get('USE_LIVE_SPECKLE', False))
+		self.enable_live_speckle = False
+		self.removeBackground = False
+		self.saving = False
+		self.hardware_trigger_enabled = False
+		self.normalizeImage = False
+		self.dFoF_open = False
+		self.F0 = None
+		self.minI = 0
+		self.maxI = 255
+		self.backgroundImg = None
+		self.buffer_size = int(config.get('BUFFER_SIZE', 50))
+		self.circular_buffer = None
+		self.current_buffer_item = 0
+		self.buffer_loop_reached = False
+		self.histogram_open = False
+		self.frame_count = 0
+		self.frames_written = 0
+		self.save_queue_size = 0
+		self.display_queue_size = 0
+		self.exp_status_queue = queue.Queue()
+		self.exp_list = get_experiment_list()
+		self.exp_name = None
+		self.experiment_id = None
+		self.mouse_id = None
+		self.on_logic_analyzer_terminated = None
+		self.on_experiment_finished = None
+
+	def start(self):
+		ctx = mp.get_context('spawn')
+		self.frame_queue = ctx.Queue(maxsize=1)
+		self.command_queue = ctx.Queue()
+		self.status_queue = ctx.Queue()
+		self.process = ctx.Process(
+			target=run_camera_worker,
+			args=(self.config, self.frame_queue, self.command_queue, self.status_queue),
+			daemon=True,
+		)
+		self.process.start()
+		self._wait_for_ready()
+
+	def _wait_for_ready(self, timeout=10.0):
+		deadline = time.time() + timeout
+		while time.time() < deadline:
+			self.poll_messages()
+			if self.ready:
+				return True
+			time.sleep(0.05)
+		return self.ready
+
+	def _send_command(self, name, payload=None):
+		if self.command_queue is None:
+			return False
+		self.command_queue.put({'name': name, 'payload': payload})
+		return True
+
+	def poll_messages(self):
+		if self.status_queue is None:
+			return
+		while True:
+			try:
+				msg = self.status_queue.get_nowait()
+			except queue.Empty:
+				break
+			if not isinstance(msg, dict):
+				continue
+			msg_type = msg.get('type')
+			if msg_type == 'ready':
+				self.ready = True
+				self.width = msg.get('width', self.width)
+				self.height = msg.get('height', self.height)
+				self.dtype = msg.get('dtype', self.dtype)
+				self.bin_exp = bool(msg.get('bin_exp', self.bin_exp))
+				self.bin_size = int(msg.get('bin_size', self.bin_size))
+				if self.circular_buffer is None and self.width and self.height:
+					self.circular_buffer = np.zeros((self.buffer_size, self.height // self.bin_size, self.width // self.bin_size), dtype=np.float32)
+			elif msg_type == 'stats':
+				self.frame_count = int(msg.get('frame_count', self.frame_count))
+				self.frames_written = int(msg.get('frames_written', self.frames_written))
+				self.save_queue_size = int(msg.get('save_queue_size', self.save_queue_size))
+				self.display_queue_size = int(msg.get('display_queue_size', self.display_queue_size))
+			elif msg_type == 'trigger_mode':
+				self.hardware_trigger_enabled = msg.get('mode') == 2
+			elif msg_type == 'exposure':
+				self.exposure = msg.get('value', getattr(self, 'exposure', None))
+			elif msg_type == 'gain':
+				self.analog_gain = msg.get('value', getattr(self, 'analog_gain', None))
+			elif msg_type == 'status':
+				self.exp_status_queue.put(("status", msg.get('message', '')))
+			elif msg_type == 'trial':
+				self.exp_status_queue.put(("trial", msg.get('current', 0), msg.get('total', 0), msg.get('message', '')))
+			elif msg_type == 'logic_analyzer_terminated':
+				if callable(self.on_logic_analyzer_terminated):
+					self.on_logic_analyzer_terminated()
+			elif msg_type == 'experiment_finished':
+				if callable(self.on_experiment_finished):
+					self.on_experiment_finished()
+			elif msg_type == 'error':
+				self.exp_status_queue.put(("status", f"Camera worker error: {msg.get('message')}"))
+			else:
+				self.exp_status_queue.put(("status", str(msg)))
+
+	def get_frame_for_display(self):
+		self.poll_messages()
+		latest = None
+		if self.frame_queue is not None:
+			while True:
+				try:
+					latest = self.frame_queue.get_nowait()
+				except queue.Empty:
+					break
+		if latest is not None:
+			with self.latest_frame_lock:
+				self.latest_frame_data = latest
+		with self.latest_frame_lock:
+			return self.latest_frame_data
+
+	def get_exp_status(self):
+		self.poll_messages()
+		messages = []
+		try:
+			while True:
+				messages.append(self.exp_status_queue.get_nowait())
+		except queue.Empty:
+			pass
+		return messages
+
+	def set_trigger_mode(self, enabled):
+		self.hardware_trigger_enabled = bool(enabled)
+		return self._send_command('set_trigger_mode', 2 if enabled else 0)
+
+	def set_exposure(self, value):
+		return self._send_command('set_exposure', value)
+
+	def set_gain(self, value):
+		return self._send_command('set_gain', value)
+
+	def set_saving(self, enabled):
+		self.saving = bool(enabled)
+		return self._send_command('set_saving', bool(enabled))
+
+	def toggle_background_removal(self):
+		self.removeBackground = not self.removeBackground
+		return self.removeBackground
+
+	def toggle_speckle(self):
+		self.enable_live_speckle = not self.enable_live_speckle
+		return self.enable_live_speckle
+
+	def toggle_dFoF(self):
+		self.dFoF_open = not self.dFoF_open
+		return self.dFoF_open
+
+	def toggle_histogram(self):
+		self.histogram_open = not self.histogram_open
+		return self.histogram_open
+
+	def adjust_dynamic_range(self):
+		self.normalizeImage = not self.normalizeImage
+		return self.normalizeImage
+
+	def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None):
+		self.exp_name = exp_name
+		self.experiment_id = experiment_id
+		self.mouse_id = mouse_id
+		if self.hardware_trigger_enabled:
+			return self._send_command('start_experiment', (exp_name, experiment_id, mouse_id))
+		return self._send_command('preview_experiment', (exp_name, experiment_id, mouse_id))
+
+	def stop_stim(self):
+		if self.hardware_trigger_enabled:
+			self._send_command('stop_experiment')
+		else:
+			self._send_command('stop_preview')
+		return True
+
+	def stop(self):
+		self._send_command('stop_camera')
+		if self.process is not None:
+			self.process.join(timeout=3.0)
 
 class CameraGUI(QMainWindow):
 	def __init__(self):
 		super().__init__()
 		self.config = load_camera_config(str(CONFIG_DIR / 'cam_config.yaml'))
+		self.display_target_size = None
 		self.camera_app = None
+		self.teensy_controller = None
+		self.teensy_active = False
+		self.hardware_trigger_enabled = False
 		self.preview_mode = False
 		self.preview_exp_thread = None
 		self.current_exp_config = None
@@ -29,6 +238,10 @@ class CameraGUI(QMainWindow):
 		self.current_teensy_config = None
 		self.reset_display_average_on_next_frame = False
 		self.reset_fps_on_next_frame = False
+		self._auto_stop_pending = False
+		self.histogram_open = False
+		self.histogram_thread_running = False
+		self.histogram_thread = None
 		self.last_stats_time = None
 		self.last_stats_frame_count = 0
 		self.fps_samples = deque(maxlen=100)
@@ -39,6 +252,12 @@ class CameraGUI(QMainWindow):
 		self.populate_experiment_controls()
 		self.setup_timer()
 
+	def resizeEvent(self, event):
+		super().resizeEvent(event)
+		# Only update display target size when the window size actually changes.
+		if event.oldSize() != event.size() and hasattr(self, 'video_label'):
+			self.display_target_size = self.video_label.size()
+
 	def check_experiment_status(self):
 		if self.camera_app and hasattr(self.camera_app, 'get_exp_status'):
 			messages = self.camera_app.get_exp_status()
@@ -47,6 +266,11 @@ class CameraGUI(QMainWindow):
 					self.update_status(msg[1])
 				elif msg[0] == "trial":
 					self.update_status(msg[3])
+				elif msg[0] in ("logic_analyzer_terminated", "experiment_finished"):
+					if not self._auto_stop_pending:
+						self._auto_stop_pending = True
+						from PyQt6.QtCore import QTimer
+						QTimer.singleShot(0, self._auto_stop_after_logic_analyzer)
 
 	def init_ui(self):
 		self.setWindowTitle('Camera GUI')
@@ -62,6 +286,7 @@ class CameraGUI(QMainWindow):
 		main_layout.addWidget(left_panel, 2)
 
 		right_panel = self.create_control_panel()
+		right_panel.setFixedWidth(420)
 		main_layout.addWidget(right_panel, 1)
 
 	def create_display_panel(self):
@@ -80,9 +305,11 @@ class CameraGUI(QMainWindow):
 		configs_layout = QHBoxLayout()
 
 		exp_config_group = QGroupBox("Experiment Configuration")
+		exp_config_group.setFixedWidth(300)
+		exp_config_group.setFixedHeight(250)
 		exp_config_layout = QVBoxLayout()
 		self.config_display = QTextEdit()
-		self.config_display.setMaximumHeight(200)
+		self.config_display.setFixedHeight(200)
 		self.config_display.setReadOnly(True)
 		self.config_display.setText("No experiment running. \n\nPreview/start an experiment to load configuration.")
 		exp_config_layout.addWidget(self.config_display)
@@ -90,9 +317,11 @@ class CameraGUI(QMainWindow):
 		configs_layout.addWidget(exp_config_group)
 
 		cam_config_group = QGroupBox("Camera Configuration")
+		cam_config_group.setFixedWidth(300)
+		cam_config_group.setFixedHeight(250)
 		cam_config_layout = QVBoxLayout()
 		self.cam_config_display = QTextEdit()
-		self.cam_config_display.setMaximumHeight(200)
+		self.cam_config_display.setFixedHeight(200)
 		self.cam_config_display.setReadOnly(True)
 		self.cam_config_display.setText("Camera configuration will display here.")
 		cam_config_layout.addWidget(self.cam_config_display)
@@ -100,9 +329,11 @@ class CameraGUI(QMainWindow):
 		configs_layout.addWidget(cam_config_group)
 
 		teensy_config_group = QGroupBox("Teensy Configuration")
+		teensy_config_group.setFixedWidth(300)
+		teensy_config_group.setFixedHeight(250)
 		teensy_config_layout = QVBoxLayout()
 		self.teensy_config_display = QTextEdit()
-		self.teensy_config_display.setMaximumHeight(200)
+		self.teensy_config_display.setFixedHeight(200)
 		self.teensy_config_display.setReadOnly(True)
 		self.teensy_config_display.setText("Teensy configuration will display here.")
 		teensy_config_layout.addWidget(self.teensy_config_display)
@@ -135,6 +366,11 @@ class CameraGUI(QMainWindow):
 		self.trigger_btn.clicked.connect(self.toggle_trigger_mode)
 		self.trigger_btn.setEnabled(False)
 		cam_layout.addWidget(self.trigger_btn)
+
+		self.teensy_toggle_btn = QPushButton("Enable Teensy")
+		self.teensy_toggle_btn.clicked.connect(self.toggle_teensy_mode)
+		self.teensy_toggle_btn.setEnabled(False)
+		cam_layout.addWidget(self.teensy_toggle_btn)
 
 		cam_group.setLayout(cam_layout)
 		layout.addWidget(cam_group)
@@ -175,19 +411,19 @@ class CameraGUI(QMainWindow):
 		exp_select_layout.addWidget(self.exp_combo)
 		exp_layout.addLayout(exp_select_layout)
 
-		exp_id_layout = QHBoxLayout()
-		exp_id_layout.addWidget(QLabel("Experiment ID:"))
-		self.experiment_id_input = QLineEdit()
-		self.experiment_id_input.setPlaceholderText("Enter experiment ID")
-		exp_id_layout.addWidget(self.experiment_id_input)
-		exp_layout.addLayout(exp_id_layout)
-
 		mouse_id_layout = QHBoxLayout()
 		mouse_id_layout.addWidget(QLabel("Mouse ID:"))
 		self.mouse_id_input = QLineEdit()
 		self.mouse_id_input.setPlaceholderText("Enter mouse ID")
 		mouse_id_layout.addWidget(self.mouse_id_input)
 		exp_layout.addLayout(mouse_id_layout)
+
+		exp_id_layout = QHBoxLayout()
+		exp_id_layout.addWidget(QLabel("Experiment ID:"))
+		self.experiment_id_input = QLineEdit()
+		self.experiment_id_input.setPlaceholderText("Enter experiment ID")
+		exp_id_layout.addWidget(self.experiment_id_input)
+		exp_layout.addLayout(exp_id_layout)
 
 		self.preview_btn = QPushButton("Preview Experiment")
 		self.preview_btn.clicked.connect(self.preview_experiment)
@@ -248,7 +484,7 @@ class CameraGUI(QMainWindow):
 		self.status_text.setReadOnly(True)
 		status_layout.addWidget(self.status_text)
 
-		self.stats_label = QLabel("FPS: 0 | Frames: 0 | Saved: 0 | Queue: 0")
+		self.stats_label = QLabel("FPS: 0 | Frames: 0 | Saved: 0 | Save Queue: 0")
 		status_layout.addWidget(self.stats_label)
 
 		status_group.setLayout(status_layout)
@@ -260,6 +496,8 @@ class CameraGUI(QMainWindow):
 
 	def populate_experiment_controls(self):
 		self.exp_combo.clear()
+		# Keep index 0 empty so the user must explicitly choose an experiment.
+		self.exp_combo.addItem("")
 		experiment_list = []
 		if self.camera_app and getattr(self.camera_app, 'exp_list', None):
 			experiment_list = self.camera_app.exp_list
@@ -270,10 +508,12 @@ class CameraGUI(QMainWindow):
 				self.update_status(f"Error loading experiment list: {e}.")
 
 		if not experiment_list:
+			self.exp_combo.setCurrentIndex(0)
 			self.exp_combo.setEnabled(False)
 			return
 
 		self.exp_combo.addItems(experiment_list)
+		self.exp_combo.setCurrentIndex(0)
 		self.exp_combo.setEnabled(True)
 
 	def get_selected_experiment_params(self):
@@ -303,7 +543,9 @@ class CameraGUI(QMainWindow):
 
 	def start_camera(self):
 		try:
-			self.camera_app = App(self.config, gui_mode=True)
+			self.camera_app = CameraProcessClient(self.config)
+			self.camera_app.start()
+			self.display_target_size = self.video_label.size()
 			self.last_stats_time = time.time()
 			self.last_stats_frame_count = 0
 			self.fps_samples.clear()
@@ -312,14 +554,7 @@ class CameraGUI(QMainWindow):
 				from PyQt6.QtCore import QTimer
 				QTimer.singleShot(0, self._auto_stop_after_logic_analyzer)
 			self.camera_app.on_logic_analyzer_terminated = _on_logic_analyzer_terminated
-
-			self.camera_app.save_thread.start()
-			if not self.camera_app.gui_mode:
-				self.camera_app.display_thread.start()
-
-			self.camera_thread = threading.Thread(target=self.camera_app.main)
-			self.camera_thread.daemon = True
-			self.camera_thread.start()
+			self.camera_app.on_experiment_finished = _on_logic_analyzer_terminated
 
 			self.timer.start(30)
 			self.stats_timer.start(100)
@@ -327,6 +562,9 @@ class CameraGUI(QMainWindow):
 			self.start_btn.setEnabled(False)
 			self.stop_btn.setEnabled(True)
 			self.trigger_btn.setEnabled(True)
+			self.teensy_toggle_btn.setEnabled(True)
+			self.teensy_active = False
+			self.teensy_toggle_btn.setText("Enable Teensy")
 			self.exp_btn.setEnabled(False)
 			self.preview_btn.setEnabled(True)
 			self.populate_experiment_controls()
@@ -339,41 +577,55 @@ class CameraGUI(QMainWindow):
 			self.update_status(f"Error starting camera: {str(e)}.")
 
 	def _auto_stop_after_logic_analyzer(self):
+		if self._auto_stop_pending:
+			self._auto_stop_pending = False
 		self.disable_hardware_trigger()
 		self.stop_experiment()
 		self.stop_camera()
 
 	def disable_hardware_trigger(self):
-		if self.camera_app and self.camera_app.hCamera:
+		if self.camera_app:
 			try:
-				mvsdk.CameraSetTriggerMode(self.camera_app.hCamera, 0)
+				self.camera_app.set_trigger_mode(False)
 			except Exception as e:
 				self.update_status(f"Error disabling hardware trigger: {e}.")
-			self.camera_app.saving = False
+			self.camera_app.set_saving(False)
 
+		self.hardware_trigger_enabled = False
 		self.trigger_btn.setText("Enable Hardware Trigger")
 		self.exp_btn.setEnabled(False)
 
 	def stop_camera(self):
 		if self.camera_app:
 			self.disable_hardware_trigger()
-			self.camera_app.quit = True
+			if self.teensy_controller is not None:
+				try:
+					if self.teensy_active:
+						self.teensy_controller.stop_teensy()
+				except Exception as e:
+					self.update_status(f"Error stopping Teensy: {e}.")
+				try:
+					if hasattr(self.teensy_controller, 'ser') and self.teensy_controller.ser and self.teensy_controller.ser.is_open:
+						self.teensy_controller.ser.close()
+				except Exception:
+					pass
+				self.teensy_controller = None
+				self.teensy_active = False
+			self.camera_app.stop()
 			self.timer.stop()
 			self.stats_timer.stop()
-
-			if hasattr(self.camera_app, 'save_thread') and self.camera_app.save_thread.ident is not None:
-				self.camera_app.save_thread.join(timeout=2.0)
-			if hasattr(self.camera_app, 'display_thread') and self.camera_app.display_thread.ident is not None:
-				self.camera_app.display_thread.join(timeout=2.0)
-			if hasattr(self, 'camera_thread') and self.camera_thread.ident is not None:
-				self.camera_thread.join(timeout=2.0)
+			self.camera_app = None
 
 		self.start_btn.setEnabled(True)
 		self.stop_btn.setEnabled(False)
 		self.trigger_btn.setEnabled(False)
+		self.teensy_toggle_btn.setEnabled(False)
+		self.teensy_toggle_btn.setText("Enable Teensy")
+		self.hardware_trigger_enabled = False
 		self.exp_btn.setEnabled(False)
 		self.preview_btn.setEnabled(False)
 		self.video_label.setText("Camera Stopped.")
+		self.display_target_size = None
 		self.cam_config_display.setText("Camera stopped. \n\n Start camera to begin.")
 		self.current_cam_config = None
 		self.populate_experiment_controls()
@@ -476,13 +728,18 @@ class CameraGUI(QMainWindow):
 			bytes_per_line = w
 			q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
 			pixmap = QPixmap.fromImage(q_img)
-			self.video_label.setPixmap(pixmap.scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio))
+			target_size = self.display_target_size if self.display_target_size is not None else self.video_label.size()
+			if target_size.width() <= 0 or target_size.height() <= 0:
+				target_size = self.video_label.size()
+			self.video_label.setPixmap(pixmap.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
 		except Exception as e:
 			print(f"Display frame error: {e}.")
 
 	def update_stats(self):
 		if self.camera_app:
 			try:
+				if hasattr(self.camera_app, 'poll_messages'):
+					self.camera_app.poll_messages()
 				current_time = time.time()
 				if self.last_stats_time is None:
 					self.last_stats_time = current_time
@@ -497,32 +754,56 @@ class CameraGUI(QMainWindow):
 				self.last_stats_frame_count = self.camera_app.frame_count
 				average_fps = sum(self.fps_samples) / len(self.fps_samples) if self.fps_samples else 0
 
-				stats_text = f"FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Queue: {self.camera_app.display_queue.qsize()}"
+				save_queue_size = getattr(self.camera_app, 'save_queue_size', 0)
+				stats_text = f"FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}"
 				self.stats_label.setText(stats_text)
 			except:
 				pass
 
 	def toggle_trigger_mode(self):
-		if self.camera_app and self.camera_app.hCamera:
+		if self.camera_app:
 			try:
-				if not self.camera_app.saving:
+				if not self.hardware_trigger_enabled:
 					print("\n Switching to hardware trigger mode.")
-					mvsdk.CameraSetTriggerMode(self.camera_app.hCamera, 2)
-					self.camera_app.saving = True
+					self.camera_app.set_trigger_mode(True)
+					self.hardware_trigger_enabled = True
 					
 					self.trigger_btn.setText("Disable Hardware Trigger")
 					self.exp_btn.setEnabled(True)
 					self.update_status("Hardware trigger mode enabled - ready for experiment.")
 				else:
-					self.camera_app.saving = False
+					self.hardware_trigger_enabled = False
+					self.camera_app.set_saving(False)
+					self.camera_app.set_trigger_mode(False)
 					print("\n Switching to continuous mode.")
-					mvsdk.CameraSetTriggerMode(self.camera_app.hCamera, 0)
 
 					self.trigger_btn.setText("Enable Hardware Trigger")
 					self.exp_btn.setEnabled(False)
 					self.update_status("Continuous mode enabled.")
 			except Exception as e:
 				self.update_status(f"Error toggling trigger mode: {e}.")
+
+	def toggle_teensy_mode(self):
+		if not self.camera_app:
+			self.update_status("Error: Camera must be started first.")
+			return
+
+		try:
+			if self.teensy_controller is None:
+				self.teensy_controller = TeensyController("gui", True, str(CONFIG_DIR / "teensyParams.yaml"))
+
+			if not self.teensy_active:
+				self.teensy_controller.start_teensy()
+				self.teensy_active = True
+				self.teensy_toggle_btn.setText("Disable Teensy")
+				self.update_status("Teensy started.")
+			else:
+				self.teensy_controller.stop_teensy()
+				self.teensy_active = False
+				self.teensy_toggle_btn.setText("Enable Teensy")
+				self.update_status("Teensy stopped.")
+		except Exception as e:
+			self.update_status(f"Error toggling Teensy: {e}.")
 
 	def preview_experiment(self):
 		if not self.camera_app:
@@ -560,14 +841,30 @@ class CameraGUI(QMainWindow):
 			self.current_exp_config = None
 
 	def start_experiment(self):
-		if self.camera_app and self.camera_app.saving:
+		if self.camera_app and self.hardware_trigger_enabled:
 			params = self.get_selected_experiment_params()
 			if params is None:
 				return
 
 			exp_name, experiment_id, mouse_id = params
+			try:
+				# Ensure GUI-side Teensy is fully stopped and released before
+				# the experiment process (simple_cam_mx) initializes Teensy.
+				if self.teensy_controller is not None:
+					self.teensy_controller.stop_teensy()
+					if hasattr(self.teensy_controller, 'ser') and self.teensy_controller.ser and self.teensy_controller.ser.is_open:
+						self.teensy_controller.ser.close()
+					self.teensy_controller = None
+				self.teensy_active = False
+				self.teensy_toggle_btn.setText("Enable Teensy")
+			except Exception as e:
+				self.update_status(f"Error stopping Teensy before experiment start: {e}.")
+				return
+
+			self.camera_app.set_saving(True)
 			started = self.camera_app.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
 			if not started:
+				self.camera_app.set_saving(False)
 				self.update_status('Error: Failed to start experiment subprocess.')
 				return
 			self.load_and_display_exp_config()
@@ -582,6 +879,7 @@ class CameraGUI(QMainWindow):
 
 	def stop_experiment(self):
 		if self.camera_app:
+			self.camera_app.set_saving(False)
 			self.camera_app.stop_stim()
 			self.exp_btn.setEnabled(True)
 			self.stop_exp_btn.setEnabled(False)
@@ -747,20 +1045,20 @@ class CameraGUI(QMainWindow):
 			self.teensy_config_display.setText(f"Error loading teensy configuration: \n{str(e)}.")
 
 	def update_exposure(self, value):
-		if self.camera_app and self.camera_app.hCamera:
+		if self.camera_app:
 			try:
 				self.camera_app.exposure = value
-				mvsdk.CameraSetExposureTime(self.camera_app.hCamera, value * 1000)
+				self.camera_app.set_exposure(value)
 				self.load_and_display_camera_config()
 				self.update_status(f"Exposure set to {value}ms.")
 			except Exception as e:
 				self.update_status(f'Error setting exposure: {e}.')
 
 	def update_gain(self, value):
-		if self.camera_app and self.camera_app.hCamera:
+		if self.camera_app:
 			try:
 				self.camera_app.analog_gain = value
-				mvsdk.CameraSetAnalogGain(self.camera_app.hCamera, value)
+				self.camera_app.set_gain(value)
 				self.load_and_display_camera_config()
 				self.update_status(f"Gain set to {value}.")
 			except Exception as e:
@@ -809,19 +1107,92 @@ class CameraGUI(QMainWindow):
 				self.update_status('dFoF disabled.')
 
 	def toggle_histogram(self, state):
-		if self.camera_app:
-			if state == Qt.CheckState.Checked.value:
-				self.camera_app.toggle_histogram()
-				self.update_status('Histogram enabled.')
-			else:
-				if self.camera_app.histogram_open:
-					self.camera_app.toggle_histogram()
-				self.update_status('Histogram disabled.')
+		if not self.camera_app:
+			return
+
+		if state == Qt.CheckState.Checked.value:
+			if self.histogram_open:
+				return
+			self.histogram_open = True
+			self.histogram_thread_running = True
+			self.histogram_thread = threading.Thread(target=self.update_histogram, daemon=True)
+			self.histogram_thread.start()
+			self.update_status('Histogram enabled.')
+		else:
+			self.histogram_open = False
+			self.histogram_thread_running = False
+			self.update_status('Histogram disabled.')
+
+	def update_histogram(self):
+		hist_width = 512
+		hist_height = 400
+		bin_width = 2
+		max_history = 50
+		intensity_history = []
+
+		while self.histogram_open and self.histogram_thread_running and self.camera_app:
+			frame_data = self.camera_app.get_frame_for_display()
+			if frame_data is not None:
+				try:
+					frame = np.frombuffer(frame_data, dtype=self.camera_app.dtype)
+					if hasattr(self.camera_app, 'height') and hasattr(self.camera_app, 'width') and self.camera_app.height and self.camera_app.width:
+						frame = frame.reshape((self.camera_app.height, self.camera_app.width))
+
+					if self.camera_app.dFoF_open and self.camera_app.F0 is not None:
+						dfof = (frame.astype(np.float32) - self.camera_app.F0) / self.camera_app.F0
+						dfof = np.nan_to_num(dfof, nan=0.0)
+
+						if self.camera_app.normalizeImage:
+							clipped = np.clip(dfof, self.camera_app.minI, self.camera_app.maxI)
+							display_frame = ((clipped - self.camera_app.minI) / (self.camera_app.maxI - self.camera_app.minI)) * 255
+						else:
+							fmin, fmax = dfof.min(), dfof.max()
+							if fmax > fmin:
+								display_frame = ((dfof - fmin) / (fmax - fmin)) * 255
+							else:
+								display_frame = np.zeros_like(dfof)
+
+						display_frame = display_frame.astype(np.uint8)
+					else:
+						if self.camera_app.normalizeImage:
+							clipped = np.clip(frame, self.camera_app.minI, self.camera_app.maxI)
+							display_frame = ((clipped - self.camera_app.minI) / (self.camera_app.maxI - self.camera_app.minI)) * 255
+							display_frame = display_frame.astype(np.uint8)
+						else:
+							display_frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+					intensity_history.extend(display_frame.ravel().tolist())
+					if len(intensity_history) > max_history * display_frame.size:
+						intensity_history = intensity_history[-max_history * display_frame.size:]
+
+					hist = cv2.calcHist([np.array(intensity_history, dtype=np.uint8)], [0], None, [256], [0, 256])
+					cv2.normalize(hist, hist, 0, hist_height, cv2.NORM_MINMAX)
+
+					hist_image = np.zeros((hist_height, hist_width, 3), dtype=np.uint8)
+					for i in range(256):
+						intensity = int(hist[i, 0])
+						cv2.rectangle(hist_image, (i * bin_width, hist_height - intensity), ((i + 1) * bin_width - 1, hist_height), (255, 255, 255), -1)
+
+					if self.camera_app.normalizeImage:
+						min_x = int(self.camera_app.minI * bin_width)
+						max_x = int(self.camera_app.maxI * bin_width)
+						cv2.line(hist_image, (min_x, 0), (min_x, hist_height), (0, 0, 255), 2)
+						cv2.line(hist_image, (max_x, 0), (max_x, hist_height), (255, 0, 0), 2)
+
+					cv2.putText(hist_image, f'Frame {self.camera_app.frame_count}', (hist_width // 2 - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+					cv2.imshow('Live Histogram', hist_image)
+					cv2.waitKey(1)
+				except Exception as e:
+					print(f"\nHistogram error: {e}.")
+
+			time.sleep(0.01)
+
+		cv2.destroyWindow('Live Histogram')
 
 	def update_trigger_mode(self, index):
-		if self.camera_app and self.camera_app.hCamera:
+		if self.camera_app:
 			try:
-				mvsdk.CameraSetTriggerMode(self.camera_app.hCamera, index)
+				self.camera_app.set_trigger_mode(index != 0)
 				mode_name = "Continuous" if index == 0 else "Hardware Trigger"
 				self.update_status(f"Trigger mode set to: {mode_name}.")
 			except Exception as e:
