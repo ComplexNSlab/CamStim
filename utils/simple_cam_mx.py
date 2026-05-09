@@ -94,6 +94,10 @@ class App(object):
         self.saving = False
         self.normalizeImage = False
         self.removeBackground = False
+        self.software_mirror_horizontal = False
+        self.mirror_enabled = False
+        self.mirror_flip_flags = 1
+        self._mirror_runtime_warning_emitted = False
         self.save_queue_max_frames = int(config.get('SAVE_QUEUE_MAX_FRAMES', 2000))
         self.frame_queue = queue.Queue(maxsize=self.save_queue_max_frames)  # Buffer for save path
         self.display_queue = queue.Queue(maxsize=3)  # Keep only recent frames for display
@@ -112,18 +116,14 @@ class App(object):
         self.display_update_interval_when_saving = max(1, int(config.get('DISPLAY_UPDATE_INTERVAL_WHEN_SAVING', 10)))
         self.live_speck = config['USE_LIVE_SPECKLE']
         self.exposure = config['EXPOSURE_TIME'] # in ms
-        self.analog_gain = config['ANALOG_GAIN'] 
+        self.analog_gain = float(config['ANALOG_GAIN'])
+        self.analog_gain_step = 1.0
+        self.analog_gain_min_units = 1
+        self.analog_gain_max_units = 100
 
         self.filename = str(config.get('EXPERIMENT', 'recording'))
         self.bin_exp = bool(config['BIN_EXP_LIVE'])
         self.bin_size = config['BIN_SIZE']
-        self.bin_mode = str(config.get('BIN_MODE', 'software')).strip().lower()
-        if self.bin_mode not in ('software', 'camera'):
-            print(f"Warning: invalid BIN_MODE '{self.bin_mode}', defaulting to software.")
-            self.bin_mode = 'software'
-        self.hardware_bin_enabled = False
-        self.request_camera_bin = self.bin_exp and self.bin_mode == 'camera'
-        self.bin_exp = self.bin_exp and self.bin_mode == 'software'
         self.zeros = np.zeros((255, 255), dtype=np.uint8) # debug image in case I have problems with camera
         self.frame_timestamps = []  # List to store timestamps
         self.sys_clock_timestamps = []
@@ -197,7 +197,21 @@ class App(object):
             pass
 
     def _publish_status(self, payload):
-        self._queue_put_latest(self.status_queue, payload)
+        if self.status_queue is None:
+            return
+
+        try:
+            self.status_queue.put_nowait(payload)
+        except queue.Full:
+            # Status queue is typically unbounded; if bounded, drop the oldest and retry.
+            try:
+                self.status_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.status_queue.put_nowait(payload)
+            except queue.Full:
+                pass
 
     def _publish_ready_state(self):
         if self.ready_state_published:
@@ -206,6 +220,8 @@ class App(object):
             return
 
         self.ready_state_published = True
+        gain_min = self.analog_gain_min_units * self.analog_gain_step
+        gain_max = self.analog_gain_max_units * self.analog_gain_step
         self._publish_status({
             'type': 'ready',
             'width': int(self.width),
@@ -213,6 +229,10 @@ class App(object):
             'dtype': self.dtype,
             'bin_exp': bool(self.bin_exp),
             'bin_size': int(self.bin_size),
+            'analog_gain_step': float(self.analog_gain_step),
+            'analog_gain_min': float(gain_min),
+            'analog_gain_max': float(gain_max),
+            'analog_gain': float(self.analog_gain),
         })
 
     def _handle_command(self, command):
@@ -245,11 +265,9 @@ class App(object):
                     mvsdk.CameraSetExposureTime(self.hCamera, exposure_ms * 1000)
                 self._publish_status({'type': 'exposure', 'value': exposure_ms})
             elif name == 'set_gain':
-                gain = int(payload)
-                self.analog_gain = gain
-                if self.hCamera:
-                    mvsdk.CameraSetAnalogGain(self.hCamera, gain)
-                self._publish_status({'type': 'gain', 'value': gain})
+                gain = float(payload)
+                applied_gain = self._apply_analog_gain_multiplier(gain)
+                self._publish_status({'type': 'gain', 'value': applied_gain})
             elif name == 'set_saving':
                 self.saving = bool(payload)
                 self._publish_status({'type': 'saving', 'value': self.saving})
@@ -373,21 +391,33 @@ class App(object):
             print(f"Warning: save file exists for '{base_name}'. Using '{candidate}' instead.")
             self.filename = candidate
 
-    def _decode_mode_mask(self, mask):
-        return [bit + 2 for bit in range(32) if mask & (1 << bit)]
+    def _configure_analog_gain_scale(self, cap):
+        expose = cap.sExposeDesc
+        self.analog_gain_step = float(expose.fAnalogGainStep) if float(expose.fAnalogGainStep) > 0 else 1.0
+        self.analog_gain_min_units = int(expose.uiAnalogGainMin)
+        self.analog_gain_max_units = int(expose.uiAnalogGainMax)
 
-    def _probe_camera_binning_support(self, cap, mono_camera):
-        res_range = cap.sResolutionRange
-        print(f"Hardware skip modes: {self._decode_mode_mask(res_range.uSkipModeMask)}")
-        print(f"Hardware bin-sum modes: {self._decode_mode_mask(res_range.uBinSumModeMask)}")
-        print(f"Hardware bin-average modes: {self._decode_mode_mask(res_range.uBinAverageModeMask)}")
+        gain_min = self.analog_gain_min_units * self.analog_gain_step
+        gain_max = self.analog_gain_max_units * self.analog_gain_step
+        print(
+            f"Analog gain scale: step={self.analog_gain_step} "
+            f"units=[{self.analog_gain_min_units}, {self.analog_gain_max_units}] , "
+            f"multiplier=[{gain_min}, {gain_max}]"
+        )
 
-    def _fallback_to_software_binning(self, reason):
-        print(f"Camera binning unavailable: {reason}. Falling back to software binning.")
-        self.request_camera_bin = False
-        self.hardware_bin_enabled = False
-        self.bin_mode = 'software'
-        self.bin_exp = True
+    def _gain_multiplier_to_units(self, gain_multiplier):
+        units = int(round(float(gain_multiplier) / self.analog_gain_step))
+        return max(self.analog_gain_min_units, min(self.analog_gain_max_units, units))
+
+    def _gain_units_to_multiplier(self, gain_units):
+        return float(gain_units) * self.analog_gain_step
+
+    def _apply_analog_gain_multiplier(self, gain_multiplier):
+        units = self._gain_multiplier_to_units(gain_multiplier)
+        if self.hCamera:
+            mvsdk.CameraSetAnalogGain(self.hCamera, units)
+        self.analog_gain = self._gain_units_to_multiplier(units)
+        return self.analog_gain
 
     def _apply_output_bit_depth(self, mono_camera):
         if not mono_camera:
@@ -400,9 +430,29 @@ class App(object):
         self.dtype = 'uint8'
         print("Using 8-bit output format (MONO8).")
 
-    def _apply_camera_binning(self, cap, mono_camera):
-        if self.request_camera_bin:
-            self._fallback_to_software_binning('camera binning mode is disabled in MONO8-only mode')
+        # Mirror handling for frame orientation consistency across display/save.
+        # Uses CameraFlipFrameBuffer in the callback path.
+        mirror_cfg = self.config.get('CAMERA_MIRROR_HORIZONTAL', False)
+        if isinstance(mirror_cfg, str):
+            mirror_h = mirror_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            mirror_h = bool(mirror_cfg)
+
+        mirror_flip_flags_cfg = self.config.get('CAMERA_MIRROR_FLIP_FLAGS', 1)
+        try:
+            mirror_flip_flags = int(mirror_flip_flags_cfg)
+        except (TypeError, ValueError):
+            mirror_flip_flags = 1
+
+        self.mirror_enabled = mirror_h
+        self.mirror_flip_flags = mirror_flip_flags
+        self.software_mirror_horizontal = False
+
+        if not mirror_h:
+            print("Horizontal mirror disabled (CAMERA_MIRROR_HORIZONTAL=false).")
+            return
+
+        print(f"Horizontal mirror enabled via CameraFlipFrameBuffer (flags={self.mirror_flip_flags}).")
 
     def experiment_status_callback(self, message):
         if hasattr(self, 'exp_status_queue'):
@@ -736,7 +786,7 @@ class App(object):
                     print("\nEnsuring logic analyzer is stopped...")
                     self.stop_logic_analyzer()  
 
-            if exp_completed and self.saving:
+            if exp_completed:
                 self._publish_status({'type': 'experiment_finished'})
 
             self._copy_teensy_params_to_save_dir()
@@ -777,8 +827,8 @@ class App(object):
             'sys_clock_timestamps': self.session_sys_clock_timestamps,
             'frame_exposure': self.exposure,
             'frame_gain': self.analog_gain,
-            'binned_live': self.bin_exp or self.hardware_bin_enabled,
-            'bin_mode': self.bin_mode if (self.bin_exp or self.hardware_bin_enabled) else 'none',
+            'binned_live': self.bin_exp,
+            'bin_mode': 'software' if self.bin_exp else 'none',
             'bin_size': self.bin_size,
             'timestamp_gap_analysis': {
                 'camera_timestamp': camera_gap_stats,
@@ -797,7 +847,11 @@ class App(object):
             f"estimated_total_triggered={metadata['timestamp_gap_analysis']['estimated_total_triggered_frames']}"
         )
         print(summary)
-        self.experiment_status_callback(summary)
+        try:
+            self.experiment_status_callback(summary)
+        except Exception as exc:
+            # Status publishing can fail during shutdown if IPC handles are already closed.
+            print(f"Warning: failed to publish metadata summary status: {exc}")
 
     def _analyze_timestamp_gaps(self, timestamps):
         """Estimate missing frames from timestamp gaps using a robust expected interval."""
@@ -860,11 +914,22 @@ class App(object):
             return
 
         try:
-            if not self.save_file_handle.closed:
+            if not getattr(self.save_file_handle, 'closed', True):
                 self.save_file_handle.flush()
                 self.save_file_handle.close()
+        except (OSError, ValueError) as exc:
+            print(f"Warning: save file handle was already closed during teardown: {exc}")
         finally:
             self.save_file_handle = None
+
+    def _finalize_save_session(self):
+        try:
+            self._write_metadata()
+        except (OSError, ValueError) as exc:
+            print(f"Warning: failed to write session metadata: {exc}")
+        finally:
+            self._close_save_file_handle()
+            self._reset_save_session_metadata()
 
     def std_filter_frame(self, frame):
         # Binning
@@ -882,38 +947,53 @@ class App(object):
 
         def flush_batch(force_flush=False):
             nonlocal last_flush_time
-            if not write_batch or self.save_file_handle is None:
+            if not write_batch or self.save_file_handle is None or getattr(self.save_file_handle, 'closed', False):
                 return
 
-            # Process entire batch at once using vectorized 3D operations.
             n = len(write_batch)
-            batch = np.frombuffer(b''.join(write_batch), dtype=self.dtype).reshape((n, self.height, self.width))
-            batch = np.ascontiguousarray(batch[:, :, ::-1])  # horizontal flip
+            h, w = int(self.height), int(self.width)
+
+            # b''.join: single C-level allocation + memcpy.
+            # frombuffer: zero-copy view.
+            raw = np.frombuffer(b''.join(write_batch), dtype=self.dtype).reshape(n, h, w)
+
+            if self.software_mirror_horizontal:
+                # Fallback path when CameraFlipFrameBuffer fails at runtime.
+                raw = np.ascontiguousarray(raw[:, :, ::-1])
+
             if self.bin_exp:
                 bs = self.bin_size
+                data = raw.astype(np.uint16, copy=False)
                 if bs in (2, 4, 8, 16, 32, 64):
-                    # Faster path for power-of-two bin sizes via iterative 2x2 reductions.
-                    batch = batch.astype(np.uint16, copy=False)
                     for _ in range(bs.bit_length() - 1):
-                        batch = (
-                            batch[:, 0::2, 0::2]
-                            + batch[:, 1::2, 0::2]
-                            + batch[:, 0::2, 1::2]
-                            + batch[:, 1::2, 1::2]
+                        data = (
+                            data[:, 0::2, 0::2]
+                            + data[:, 1::2, 0::2]
+                            + data[:, 0::2, 1::2]
+                            + data[:, 1::2, 1::2]
                         )
                 else:
-                    batch = batch.reshape(n, self.height // bs, bs, self.width // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
-            batch.tofile(self.save_file_handle)
+                    data = data.reshape(n, h // bs, bs, w // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
+                write_slice = data
+            else:
+                write_slice = raw  # contiguous, no extra copy
+
+            try:
+                write_slice.tofile(self.save_file_handle)
+            except (OSError, ValueError) as exc:
+                print(f"Warning: failed to write frame batch to save file: {exc}")
+                self._close_save_file_handle()
+                write_batch.clear(); ts_batch.clear(); sys_ts_batch.clear()
+                return
 
             self.frame_timestamps.extend(ts_batch)
             self.sys_clock_timestamps.extend(sys_ts_batch)
             self.session_frame_timestamps.extend(ts_batch)
             self.session_sys_clock_timestamps.extend(sys_ts_batch)
-            self.frames_written += len(write_batch)
-            self.session_frames_written += len(write_batch)
+            self.frames_written += n
+            self.session_frames_written += n
 
-            should_flush = force_flush or ((time.time() - last_flush_time) >= flush_interval_s)
-            if should_flush:
+            if force_flush or ((time.time() - last_flush_time) >= flush_interval_s):
                 self.save_file_handle.flush()
                 last_flush_time = time.time()
 
@@ -942,8 +1022,8 @@ class App(object):
                     if os.path.exists(file_path):
                         self._ensure_unique_filename()
                         file_path = os.path.join(self.save_dir, self.filename + '.bin')
-                    # Buffered writes improve sustained throughput when frame rate is high.
-                    self.save_file_handle = open(file_path, 'wb', buffering=4 * 1024 * 1024)
+                    # Large Python-level buffer reduces syscall overhead for fast cameras.
+                    self.save_file_handle = open(file_path, 'wb', buffering=64 * 1024 * 1024)
 
                 # Process frames if available
                 try:
@@ -979,18 +1059,14 @@ class App(object):
 
                 flush_batch(force_flush=True)
                 if self.save_file_handle is not None and self.frame_queue.empty():
-                    self._close_save_file_handle()
-                    self._write_metadata()
-                    self._reset_save_session_metadata()
+                    self._finalize_save_session()
                 if self.quit:
                     break
                 time.sleep(0.005)
 
         if self.save_file_handle is not None:
             flush_batch(force_flush=True)
-            self._close_save_file_handle()
-            self._write_metadata()
-            self._reset_save_session_metadata()
+            self._finalize_save_session()
 
     def display_frames(self):
         print(f"DEBUG: display_frames started, gui_mode = {self.gui_mode}")
@@ -1014,7 +1090,7 @@ class App(object):
                 # Display frame
                 frame = np.frombuffer(frame_data, dtype=self.dtype)
                 frame = frame.reshape((self.height, self.width))
-                frame = cv2.flip(frame, 1)
+                # Mirror is normally applied in callback via CameraFlipFrameBuffer.
 
                 self.n_saturated_pixels = (frame.flatten() == 255).sum()
                 
@@ -1321,8 +1397,8 @@ class App(object):
 
     def change_gain(self):
         try:
-            self.analog_gain = int(input("\nEnter new gain (current: {}): \n".format(self.analog_gain)))
-            mvsdk.CameraSetAnalogGain(self.hCamera, self.analog_gain) 
+            requested = float(input("\nEnter new gain (current: {}): \n".format(self.analog_gain)))
+            self._apply_analog_gain_multiplier(requested)
         except ValueError:
             print("\n Failed to set gain, invalid value.")
 
@@ -1448,12 +1524,9 @@ class App(object):
             mvsdk.CameraUnInit(self.hCamera)
             return
 
-        self._probe_camera_binning_support(cap, monoCamera)
-
         self.height = cap.sResolutionRange.iHeightMax
         self.width = cap.sResolutionRange.iWidthMax
-
-        self._apply_camera_binning(cap, monoCamera)
+        self._configure_analog_gain_scale(cap)
 
         # For monochrome cameras, output configured bit depth directly.
         self._apply_output_bit_depth(monoCamera)
@@ -1462,7 +1535,6 @@ class App(object):
         applied_res = mvsdk.CameraGetImageResolution(self.hCamera)
         self.width = applied_res.iWidth
         self.height = applied_res.iHeight
-        self._publish_ready_state()
 
         # Switch camera mode to continuous capture
         mvsdk.CameraSetTriggerMode(self.hCamera, 0)
@@ -1471,7 +1543,8 @@ class App(object):
         # Manual exposure, exposure time 
         mvsdk.CameraSetAeState(self.hCamera, 0)
         mvsdk.CameraSetExposureTime(self.hCamera, self.exposure * 1000)
-        mvsdk.CameraSetAnalogGain(self.hCamera, self.analog_gain)
+        self._apply_analog_gain_multiplier(self.analog_gain)
+        self._publish_ready_state()
 
         print(f"Camera resolution: {self.width}x{self.height}")
 
@@ -1536,6 +1609,16 @@ class App(object):
 
         current_time = time.time()
         FrameHead = pFrameHead[0]
+
+        if self.mirror_enabled:
+            flip_err = mvsdk.CameraFlipFrameBuffer(pRawData, FrameHead, self.mirror_flip_flags)
+            if flip_err != 0 and not self._mirror_runtime_warning_emitted:
+                self._mirror_runtime_warning_emitted = True
+                print(
+                    f"Warning: CameraFlipFrameBuffer failed (err={flip_err}, flags={self.mirror_flip_flags}); "
+                    "falling back to software mirror."
+                )
+                self.software_mirror_horizontal = True
 
         frame_data = bytes((mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData))
         mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)

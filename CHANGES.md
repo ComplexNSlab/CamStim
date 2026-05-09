@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-05-09
+- Gain controls now use camera capability-reported multiplier range/step in the GUI, including step-locked spinner increments and value snapping to valid hardware steps.
+- Clarified `ANALOG_GAIN` semantics in `config_files/cam_config.yaml` as real multiplier units (float values like `2.5`) rather than raw SDK integer units.
+- Removed legacy root-level `cam_config.yaml`; runtime now uses `config_files/cam_config.yaml` as the config source.
+- Restored GUI-side normalization behavior in multiprocessing mode by computing display dynamic range from live GUI frames.
+- Reworked GUI `Remove Background` and `Enable dFoF` toggles to run fully in the GUI process (display-only) with no worker-side acquisition changes.
+- Added shape-alignment safeguards for GUI background/dFoF references so display processing no longer fails on mixed-size frames (for example binned display vs full-resolution references).
+- Updated histogram rendering to always use the full 8-bit domain (`0..255`) with adaptive bin count based on observed intensity distribution.
+- Reduced histogram GUI overhead with throttled redraw cadence and skip-when-frame-unchanged logic.
+- Added GUI-only special-pixel highlighting (0 shown in blue, 255 shown in red) and exposed it as a new toggle in Image Processing controls.
+- Rearranged Image Processing controls into a 2-column layout (3 options per column).
+
 ## 2026-05-08
 - Moved the camera acquisition path into a dedicated subprocess so the GUI no longer shares the same Python execution path as frame grabbing.
 - Added a GUI proxy layer in `camstim.py` to control camera, trigger, experiment, and status flow through IPC queues.

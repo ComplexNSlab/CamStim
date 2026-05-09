@@ -7,15 +7,13 @@ DEBUG_SKIP_TEENSY: false
 
 # What exposure time to use (in ms, can be < 0)
 EXPOSURE_TIME: 15
-# Analog gain of the camera, try to keep as low as possible
-ANALOG_GAIN: 1
+# Analog gain multiplier (real units, e.g. 2.5). Keep as low as possible.
+ANALOG_GAIN: 2.5
 
 # Whether the data should be binned during the experiment
 # raw data is huge (2048, 2048) images
 BIN_EXP_LIVE: false
-# Where binning should happen: software or camera
-BIN_MODE: "software"
-# What bin size is done (e.g., 4 means final image size will be 512, 512)
+# Software bin size (e.g., 4 means final image size will be 512, 512)
 BIN_SIZE: 2
 
 # Save pipeline settings for high-throughput acquisition
@@ -31,3 +29,10 @@ SAVE_TARGET_BATCH_BYTES: 33554432
 PRIORITIZE_ACQUISITION: true
 # Update latest/display frame every N acquired frames while saving.
 DISPLAY_UPDATE_INTERVAL_WHEN_SAVING: 10
+
+# Apply horizontal mirror to each grabbed frame via CameraFlipFrameBuffer.
+# Set to true when the camera is mounted so the raw image is left-right flipped.
+CAMERA_MIRROR_HORIZONTAL: true
+# Flags passed to CameraFlipFrameBuffer.
+# 1 is commonly horizontal flip in many SDK builds.
+CAMERA_MIRROR_FLIP_FLAGS: 1

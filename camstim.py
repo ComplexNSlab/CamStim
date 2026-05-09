@@ -4,6 +4,7 @@ import multiprocessing as mp
 import queue
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
 							QWidget, QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
+							QGridLayout,
 							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit)
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QImage, QPixmap
@@ -51,6 +52,7 @@ class CameraProcessClient:
 		self.F0 = None
 		self.minI = 0
 		self.maxI = 255
+		self.autoI = 0.05
 		self.backgroundImg = None
 		self.buffer_size = int(config.get('BUFFER_SIZE', 50))
 		self.circular_buffer = None
@@ -63,6 +65,10 @@ class CameraProcessClient:
 		self.display_queue_size = 0
 		self.exp_status_queue = queue.Queue()
 		self.exp_list = get_experiment_list()
+		self.analog_gain = float(config.get('ANALOG_GAIN', 1.0))
+		self.analog_gain_step = 0.1
+		self.analog_gain_min = 0.1
+		self.analog_gain_max = 100.0
 		self.exp_name = None
 		self.experiment_id = None
 		self.mouse_id = None
@@ -115,6 +121,10 @@ class CameraProcessClient:
 				self.dtype = msg.get('dtype', self.dtype)
 				self.bin_exp = bool(msg.get('bin_exp', self.bin_exp))
 				self.bin_size = int(msg.get('bin_size', self.bin_size))
+				self.analog_gain_step = float(msg.get('analog_gain_step', self.analog_gain_step))
+				self.analog_gain_min = float(msg.get('analog_gain_min', self.analog_gain_min))
+				self.analog_gain_max = float(msg.get('analog_gain_max', self.analog_gain_max))
+				self.analog_gain = float(msg.get('analog_gain', self.analog_gain))
 				if self.circular_buffer is None and self.width and self.height:
 					self.circular_buffer = np.zeros((self.buffer_size, self.height // self.bin_size, self.width // self.bin_size), dtype=np.float32)
 			elif msg_type == 'stats':
@@ -183,7 +193,25 @@ class CameraProcessClient:
 		return self._send_command('set_saving', bool(enabled))
 
 	def toggle_background_removal(self):
-		self.removeBackground = not self.removeBackground
+		if self.removeBackground:
+			self.removeBackground = False
+			return self.removeBackground
+
+		frame_data = self.get_frame_for_display()
+		if frame_data is None or not self.height or not self.width:
+			self.removeBackground = False
+			return self.removeBackground
+
+		frame = np.frombuffer(frame_data, dtype=self.dtype)
+		expected_pixels = int(self.height) * int(self.width)
+		if frame.size < expected_pixels:
+			self.removeBackground = False
+			return self.removeBackground
+
+		frame = frame[:expected_pixels].reshape((self.height, self.width)).astype(np.float32)
+		kernel = np.ones((10, 10), np.float32) / 100.0
+		self.backgroundImg = cv2.filter2D(frame, -1, kernel)
+		self.removeBackground = True
 		return self.removeBackground
 
 	def toggle_speckle(self):
@@ -191,7 +219,54 @@ class CameraProcessClient:
 		return self.enable_live_speckle
 
 	def toggle_dFoF(self):
-		self.dFoF_open = not self.dFoF_open
+		if self.dFoF_open:
+			self.dFoF_open = False
+			return self.dFoF_open
+
+		if not self.height or not self.width:
+			self.dFoF_open = False
+			return self.dFoF_open
+
+		baseline_frames = []
+		f0_n_frames = 50
+		expected_pixels = int(self.height) * int(self.width)
+		for _ in range(f0_n_frames):
+			frame_data = self.get_frame_for_display()
+			if frame_data is None:
+				time.sleep(0.02)
+				continue
+			frame = np.frombuffer(frame_data, dtype=self.dtype)
+			if frame.size < expected_pixels:
+				continue
+			frame = frame[:expected_pixels].reshape((self.height, self.width))
+			baseline_frames.append(frame.astype(np.float32))
+			time.sleep(0.01)
+
+		if len(baseline_frames) < f0_n_frames:
+			self.dFoF_open = False
+			return self.dFoF_open
+
+		sampled_stack = np.stack(baseline_frames, axis=0)
+		self.F0 = np.percentile(sampled_stack, 10, axis=0)
+		epsilon = 1e-6
+		self.F0[self.F0 == 0] = epsilon
+
+		if not self.normalizeImage:
+			test_dfof = []
+			for frame in baseline_frames[:10]:
+				dfof_test = (frame - self.F0) / self.F0
+				test_dfof.append(dfof_test)
+
+			test_dfof_stack = np.stack(test_dfof, axis=0)
+			valid_values = test_dfof_stack[~np.isnan(test_dfof_stack)]
+			if valid_values.size > 0:
+				self.minI = float(np.percentile(valid_values, 1))
+				self.maxI = float(np.percentile(valid_values, 99))
+				if self.maxI <= self.minI:
+					self.maxI = self.minI + 1.0
+				self.normalizeImage = True
+
+		self.dFoF_open = True
 		return self.dFoF_open
 
 	def toggle_histogram(self):
@@ -199,7 +274,35 @@ class CameraProcessClient:
 		return self.histogram_open
 
 	def adjust_dynamic_range(self):
-		self.normalizeImage = not self.normalizeImage
+		if self.normalizeImage:
+			self.normalizeImage = False
+			return self.normalizeImage
+
+		self.normalizeImage = True
+		self.autoI *= 2
+		if self.autoI > 49:
+			self.autoI = 0.05
+
+		frame_data = self.get_frame_for_display()
+		if frame_data is None or not self.height or not self.width:
+			return self.normalizeImage
+
+		frame = np.frombuffer(frame_data, dtype=self.dtype)
+		expected_pixels = int(self.height) * int(self.width)
+		if frame.size < expected_pixels:
+			return self.normalizeImage
+		frame = frame[:expected_pixels].reshape((self.height, self.width))
+
+		if self.dFoF_open and self.F0 is not None and getattr(self.F0, 'shape', None) == frame.shape:
+			data = (frame.astype(np.float32) - self.F0) / self.F0
+			data = np.nan_to_num(data, nan=0.0)
+		else:
+			data = frame.astype(np.float32)
+
+		self.minI = float(np.percentile(data, self.autoI))
+		self.maxI = float(np.percentile(data, 100 - self.autoI))
+		if self.maxI <= self.minI:
+			self.maxI = self.minI + 1.0
 		return self.normalizeImage
 
 	def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None):
@@ -239,6 +342,7 @@ class CameraGUI(QMainWindow):
 		self.reset_display_average_on_next_frame = False
 		self.reset_fps_on_next_frame = False
 		self._auto_stop_pending = False
+		self.highlight_special_pixels = True
 		self.histogram_open = False
 		self.histogram_thread_running = False
 		self.histogram_thread = None
@@ -251,6 +355,12 @@ class CameraGUI(QMainWindow):
 		self.init_ui()
 		self.populate_experiment_controls()
 		self.setup_timer()
+
+	def _schedule_auto_stop(self):
+		if self._auto_stop_pending:
+			return
+		self._auto_stop_pending = True
+		QTimer.singleShot(0, self._auto_stop_after_logic_analyzer)
 
 	def resizeEvent(self, event):
 		super().resizeEvent(event)
@@ -267,10 +377,7 @@ class CameraGUI(QMainWindow):
 				elif msg[0] == "trial":
 					self.update_status(msg[3])
 				elif msg[0] in ("logic_analyzer_terminated", "experiment_finished"):
-					if not self._auto_stop_pending:
-						self._auto_stop_pending = True
-						from PyQt6.QtCore import QTimer
-						QTimer.singleShot(0, self._auto_stop_after_logic_analyzer)
+					self._schedule_auto_stop()
 
 	def init_ui(self):
 		self.setWindowTitle('Camera GUI')
@@ -390,9 +497,13 @@ class CameraGUI(QMainWindow):
 
 		gain_layout = QHBoxLayout()
 		gain_layout.addWidget(QLabel("Gain:"))
-		self.gain_spin = QSpinBox()
-		self.gain_spin.setRange(1, 100)
-		self.gain_spin.setValue(self.config['ANALOG_GAIN'])
+		self.gain_spin = QDoubleSpinBox()
+		self.gain_spin.setRange(0.1, 100.0)
+		self.gain_spin.setDecimals(3)
+		self.gain_spin.setSingleStep(0.1)
+		self.gain_spin.setKeyboardTracking(False)
+		self.gain_spin.setValue(float(self.config['ANALOG_GAIN']))
+		self.gain_spin.setEnabled(False)
 		self.gain_spin.valueChanged.connect(self.update_gain)
 		gain_layout.addWidget(self.gain_spin)
 		settings_layout.addLayout(gain_layout)
@@ -450,27 +561,32 @@ class CameraGUI(QMainWindow):
 
 		# Live video processing
 		proc_group = QGroupBox("Image Processing")
-		proc_layout = QVBoxLayout()
+		proc_layout = QGridLayout()
 
 		self.normalize_cb = QCheckBox("Normalize Image")
 		self.normalize_cb.stateChanged.connect(self.toggle_normalize)
-		proc_layout.addWidget(self.normalize_cb)
+		proc_layout.addWidget(self.normalize_cb, 0, 0)
 
 		self.background_cb = QCheckBox("Remove Background")
 		self.background_cb.stateChanged.connect(self.toggle_background)
-		proc_layout.addWidget(self.background_cb)
+		proc_layout.addWidget(self.background_cb, 1, 0)
 
 		self.speckle_cb = QCheckBox("Live Speckle")
 		self.speckle_cb.stateChanged.connect(self.toggle_speckle)
-		proc_layout.addWidget(self.speckle_cb)
+		proc_layout.addWidget(self.speckle_cb, 2, 0)
 
 		self.dfof_cb = QCheckBox("Enable dFoF")
 		self.dfof_cb.stateChanged.connect(self.toggle_dfof)
-		proc_layout.addWidget(self.dfof_cb)
+		proc_layout.addWidget(self.dfof_cb, 0, 1)
 
 		self.histogram_cb = QCheckBox("Show Histogram")
 		self.histogram_cb.stateChanged.connect(self.toggle_histogram)
-		proc_layout.addWidget(self.histogram_cb)
+		proc_layout.addWidget(self.histogram_cb, 1, 1)
+
+		self.highlight_pixels_cb = QCheckBox("Highlight 0/255 Pixels")
+		self.highlight_pixels_cb.setChecked(True)
+		self.highlight_pixels_cb.stateChanged.connect(self.toggle_special_pixel_highlight)
+		proc_layout.addWidget(self.highlight_pixels_cb, 2, 1)
 
 		proc_group.setLayout(proc_layout)
 		layout.addWidget(proc_group)
@@ -551,8 +667,7 @@ class CameraGUI(QMainWindow):
 			self.fps_samples.clear()
 
 			def _on_logic_analyzer_terminated():
-				from PyQt6.QtCore import QTimer
-				QTimer.singleShot(0, self._auto_stop_after_logic_analyzer)
+				self._schedule_auto_stop()
 			self.camera_app.on_logic_analyzer_terminated = _on_logic_analyzer_terminated
 			self.camera_app.on_experiment_finished = _on_logic_analyzer_terminated
 
@@ -568,6 +683,7 @@ class CameraGUI(QMainWindow):
 			self.exp_btn.setEnabled(False)
 			self.preview_btn.setEnabled(True)
 			self.populate_experiment_controls()
+			self._sync_gain_spinner_with_camera()
 
 			self.load_and_display_camera_config()
 			self.load_and_display_teensy_config()
@@ -575,6 +691,47 @@ class CameraGUI(QMainWindow):
 			self.update_status("Camera started successfully in continuous mode.")
 		except Exception as e:
 			self.update_status(f"Error starting camera: {str(e)}.")
+	def _sync_gain_spinner_with_camera(self):
+		if not self.camera_app or not hasattr(self, 'gain_spin'):
+			return
+
+		step = float(getattr(self.camera_app, 'analog_gain_step', 0.1))
+		gmin = float(getattr(self.camera_app, 'analog_gain_min', 0.1))
+		gmax = float(getattr(self.camera_app, 'analog_gain_max', 100.0))
+		gval = float(getattr(self.camera_app, 'analog_gain', self.gain_spin.value()))
+
+		if step <= 0:
+			step = 0.1
+		if gmin > gmax:
+			gmin, gmax = gmax, gmin
+
+		self.gain_spin.blockSignals(True)
+		self.gain_spin.setEnabled(bool(getattr(self.camera_app, 'ready', False)))
+		self.gain_spin.setRange(gmin, gmax)
+		self.gain_spin.setSingleStep(step)
+		decimals = 0
+		tmp = step
+		while decimals < 6 and abs(tmp - round(tmp)) > 1e-9:
+			tmp *= 10.0
+			decimals += 1
+		self.gain_spin.setDecimals(max(1, min(6, decimals)))
+		self.gain_spin.setValue(self._quantize_gain_value(gval, gmin, gmax, step))
+		self.gain_spin.blockSignals(False)
+
+	def _quantize_gain_value(self, value, gmin=None, gmax=None, step=None):
+		if gmin is None:
+			gmin = float(self.gain_spin.minimum())
+		if gmax is None:
+			gmax = float(self.gain_spin.maximum())
+		if step is None:
+			step = float(self.gain_spin.singleStep())
+
+		if step <= 0:
+			step = 0.1
+		clamped = max(gmin, min(gmax, float(value)))
+		steps_from_min = round((clamped - gmin) / step)
+		quantized = gmin + (steps_from_min * step)
+		return max(gmin, min(gmax, quantized))
 
 	def _auto_stop_after_logic_analyzer(self):
 		if self._auto_stop_pending:
@@ -624,6 +781,8 @@ class CameraGUI(QMainWindow):
 		self.hardware_trigger_enabled = False
 		self.exp_btn.setEnabled(False)
 		self.preview_btn.setEnabled(False)
+		if hasattr(self, 'gain_spin'):
+			self.gain_spin.setEnabled(False)
 		self.video_label.setText("Camera Stopped.")
 		self.display_target_size = None
 		self.cam_config_display.setText("Camera stopped. \n\n Start camera to begin.")
@@ -656,7 +815,10 @@ class CameraGUI(QMainWindow):
 
 				if hasattr(self.camera_app, 'height') and hasattr(self.camera_app, 'width'):
 					frame = frame.reshape((self.camera_app.height, self.camera_app.width))
-					frame = cv2.flip(frame, 1)
+					# Keep GUI display orientation identical to saved raw frames.
+					# Prefer hardware mirror; fall back to software mirror if needed.
+					if getattr(self.camera_app, 'software_mirror_horizontal', False):
+						frame = cv2.flip(frame, 1)
 				
 				if self.camera_app.bin_exp:
 					bs = self.camera_app.bin_size
@@ -695,8 +857,9 @@ class CameraGUI(QMainWindow):
 				clipped = np.clip(frame, self.camera_app.vmin, self.camera_app.vmax)
 				frame = ((clipped - self.camera_app.vmin) / (self.camera_app.vmax - self.camera_app.vmin)) * 255
 
-		if self.camera_app.removeBackground and hasattr(self.camera_app, 'backgroundImg'):
-			frame = frame - self.camera_app.backgroundImg
+		if self.camera_app.removeBackground and getattr(self.camera_app, 'backgroundImg', None) is not None:
+			bg_ref = self._align_reference_to_frame(self.camera_app.backgroundImg, frame.shape, avoid_zero=False)
+			frame = frame - bg_ref
 			frame = np.clip(frame, 0, 255)
 
 		if self.camera_app.normalizeImage:
@@ -704,7 +867,8 @@ class CameraGUI(QMainWindow):
 			frame = ((clipped - self.camera_app.minI) / (self.camera_app.maxI - self.camera_app.minI)) * 255
 
 		if self.camera_app.dFoF_open and self.camera_app.F0 is not None:
-			dfof = (frame.astype(np.float32) - self.camera_app.F0) / self.camera_app.F0
+			f0_ref = self._align_reference_to_frame(self.camera_app.F0, frame.shape, avoid_zero=True)
+			dfof = (frame.astype(np.float32) - f0_ref) / f0_ref
 			dfof = np.nan_to_num(dfof, nan=0.0)
 
 			if self.camera_app.normalizeImage:
@@ -722,11 +886,38 @@ class CameraGUI(QMainWindow):
 
 		return frame.astype(np.uint8)
 
+	def _align_reference_to_frame(self, ref, target_shape, avoid_zero=False):
+		if ref is None:
+			return ref
+		if tuple(ref.shape) == tuple(target_shape):
+			aligned = ref.astype(np.float32, copy=False)
+			if avoid_zero:
+				aligned = aligned.copy()
+				aligned[aligned == 0] = 1e-6
+			return aligned
+		target_h, target_w = int(target_shape[0]), int(target_shape[1])
+		aligned = cv2.resize(ref.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_AREA)
+		if avoid_zero:
+			aligned[aligned == 0] = 1e-6
+		return aligned
+
 	def display_processed_frame(self, frame):
 		try:
 			h, w = frame.shape
-			bytes_per_line = w
-			q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
+			if self.highlight_special_pixels:
+				rgb_frame = np.stack([frame, frame, frame], axis=-1)
+
+				# Highlight special values in the GUI only: 0 -> blue, 255 -> red.
+				zero_mask = (frame == 0)
+				sat_mask = (frame == 255)
+				rgb_frame[zero_mask] = [0, 0, 255]
+				rgb_frame[sat_mask] = [255, 0, 0]
+				rgb_frame = np.ascontiguousarray(rgb_frame)
+			else:
+				rgb_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+
+			bytes_per_line = 3 * w
+			q_img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
 			pixmap = QPixmap.fromImage(q_img)
 			target_size = self.display_target_size if self.display_target_size is not None else self.video_label.size()
 			if target_size.width() <= 0 or target_size.height() <= 0:
@@ -740,6 +931,7 @@ class CameraGUI(QMainWindow):
 			try:
 				if hasattr(self.camera_app, 'poll_messages'):
 					self.camera_app.poll_messages()
+				self._sync_gain_spinner_with_camera()
 				current_time = time.time()
 				if self.last_stats_time is None:
 					self.last_stats_time = current_time
@@ -1057,10 +1249,15 @@ class CameraGUI(QMainWindow):
 	def update_gain(self, value):
 		if self.camera_app:
 			try:
-				self.camera_app.analog_gain = value
-				self.camera_app.set_gain(value)
+				quantized = self._quantize_gain_value(value)
+				if abs(quantized - value) > 1e-9:
+					self.gain_spin.blockSignals(True)
+					self.gain_spin.setValue(quantized)
+					self.gain_spin.blockSignals(False)
+				self.camera_app.analog_gain = quantized
+				self.camera_app.set_gain(quantized)
 				self.load_and_display_camera_config()
-				self.update_status(f"Gain set to {value}.")
+				self.update_status(f"Gain set to {quantized}.")
 			except Exception as e:
 				self.update_status(f'Error setting gain: {e}.')
 
@@ -1068,7 +1265,7 @@ class CameraGUI(QMainWindow):
 		if self.camera_app:
 			if state == Qt.CheckState.Checked.value:
 				self.camera_app.adjust_dynamic_range()
-				self.update_status("Normalization enabled.")
+				self.update_status(f"Normalization enabled [{self.camera_app.minI:.3f}, {self.camera_app.maxI:.3f}].")
 
 			else:
 				if self.camera_app.normalizeImage:
@@ -1078,8 +1275,14 @@ class CameraGUI(QMainWindow):
 	def toggle_background(self, state):
 		if self.camera_app:
 			if state == Qt.CheckState.Checked.value:
-				self.camera_app.toggle_background_removal()
-				self.update_status("Background subtraction enabled.")
+				enabled = self.camera_app.toggle_background_removal()
+				if enabled:
+					self.update_status("Background subtraction enabled.")
+				else:
+					self.background_cb.blockSignals(True)
+					self.background_cb.setChecked(False)
+					self.background_cb.blockSignals(False)
+					self.update_status('Background subtraction unavailable (no valid frame yet).')
 
 			else:
 				if self.camera_app.removeBackground:
@@ -1100,8 +1303,14 @@ class CameraGUI(QMainWindow):
 	def toggle_dfof(self, state):
 		if self.camera_app:
 			if state == Qt.CheckState.Checked.value:
-				self.camera_app.toggle_dFoF()
-				self.update_status('dFoF enabled.')
+				enabled = self.camera_app.toggle_dFoF()
+				if enabled:
+					self.update_status('dFoF enabled.')
+				else:
+					self.dfof_cb.blockSignals(True)
+					self.dfof_cb.setChecked(False)
+					self.dfof_cb.blockSignals(False)
+					self.update_status('dFoF unavailable (need baseline frames).')
 			else:
 				self.camera_app.dFoF_open = False
 				self.update_status('dFoF disabled.')
@@ -1123,14 +1332,30 @@ class CameraGUI(QMainWindow):
 			self.histogram_thread_running = False
 			self.update_status('Histogram disabled.')
 
+	def toggle_special_pixel_highlight(self, state):
+		self.highlight_special_pixels = (state == Qt.CheckState.Checked.value)
+		if self.highlight_special_pixels:
+			self.update_status('Special pixel highlight enabled (0->blue, 255->red).')
+		else:
+			self.update_status('Special pixel highlight disabled.')
+
 	def update_histogram(self):
 		hist_width = 512
 		hist_height = 400
-		bin_width = 2
-		max_history = 50
-		intensity_history = []
+		hist_update_interval_s = 0.10
+		last_draw_time = 0.0
+		last_frame_count = -1
 
 		while self.histogram_open and self.histogram_thread_running and self.camera_app:
+			now = time.time()
+			if now - last_draw_time < hist_update_interval_s:
+				time.sleep(0.005)
+				continue
+
+			if self.camera_app.frame_count == last_frame_count:
+				time.sleep(0.01)
+				continue
+
 			frame_data = self.camera_app.get_frame_for_display()
 			if frame_data is not None:
 				try:
@@ -1161,27 +1386,51 @@ class CameraGUI(QMainWindow):
 						else:
 							display_frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-					intensity_history.extend(display_frame.ravel().tolist())
-					if len(intensity_history) > max_history * display_frame.size:
-						intensity_history = intensity_history[-max_history * display_frame.size:]
+					# Use all displayed pixels so saturation statistics are exact.
+					history_arr = display_frame.ravel()
 
-					hist = cv2.calcHist([np.array(intensity_history, dtype=np.uint8)], [0], None, [256], [0, 256])
-					cv2.normalize(hist, hist, 0, hist_height, cv2.NORM_MINMAX)
+					# Keep full 8-bit domain on x-axis; adapt bin count to observed data spread.
+					if history_arr.size > 1:
+						q25 = np.percentile(history_arr, 25)
+						q75 = np.percentile(history_arr, 75)
+						iqr = float(q75 - q25)
+						n = float(history_arr.size)
+						if iqr > 0 and n > 1:
+							bin_width_fd = 2.0 * iqr / (n ** (1.0 / 3.0))
+							bin_count = int(np.clip(np.ceil(256.0 / max(bin_width_fd, 1e-6)), 16, 256))
+						else:
+							span = int(history_arr.max()) - int(history_arr.min()) + 1
+							bin_count = int(np.clip(span, 16, 256))
+					else:
+						bin_count = 16
+
+					counts, edges = np.histogram(history_arr, bins=bin_count, range=(0, 256))
+					hist = counts.astype(np.float32)
+					if hist.max() > 0:
+						hist = (hist / hist.max()) * hist_height
 
 					hist_image = np.zeros((hist_height, hist_width, 3), dtype=np.uint8)
-					for i in range(256):
-						intensity = int(hist[i, 0])
-						cv2.rectangle(hist_image, (i * bin_width, hist_height - intensity), ((i + 1) * bin_width - 1, hist_height), (255, 255, 255), -1)
+					for i in range(bin_count):
+						intensity = int(hist[i])
+						x1 = int((edges[i] / 256.0) * hist_width)
+						x2 = int((edges[i + 1] / 256.0) * hist_width) - 1
+						if x2 < x1:
+							x2 = x1
+						cv2.rectangle(hist_image, (x1, hist_height - intensity), (x2, hist_height), (255, 255, 255), -1)
 
 					if self.camera_app.normalizeImage:
-						min_x = int(self.camera_app.minI * bin_width)
-						max_x = int(self.camera_app.maxI * bin_width)
+						x_scale = (hist_width - 1) / 255.0
+						min_x = int(np.clip(self.camera_app.minI, 0, 255) * x_scale)
+						max_x = int(np.clip(self.camera_app.maxI, 0, 255) * x_scale)
 						cv2.line(hist_image, (min_x, 0), (min_x, hist_height), (0, 0, 255), 2)
 						cv2.line(hist_image, (max_x, 0), (max_x, hist_height), (255, 0, 0), 2)
 
 					cv2.putText(hist_image, f'Frame {self.camera_app.frame_count}', (hist_width // 2 - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+					cv2.putText(hist_image, f'Bins {bin_count} | Range 0-255', (10, hist_height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 					cv2.imshow('Live Histogram', hist_image)
 					cv2.waitKey(1)
+					last_draw_time = now
+					last_frame_count = self.camera_app.frame_count
 				except Exception as e:
 					print(f"\nHistogram error: {e}.")
 
