@@ -5,9 +5,10 @@ import queue
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
 							QWidget, QPushButton, QLabel, QDoubleSpinBox,
 							QGridLayout,
-							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit)
+							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit,
+							QFileDialog, QInputDialog, QMessageBox)
 from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QImage, QPixmap, QAction
 import time
 from collections import deque
 import threading
@@ -16,7 +17,7 @@ import cv2
 import yaml
 from pathlib import Path
 
-from utils.simple_cam_mx import load_camera_config, run_camera_worker
+from utils.simple_cam_mx import load_camera_config, load_save_root, run_camera_worker
 from core.experiment_discovery import get_experiment_list
 
 CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
@@ -69,6 +70,7 @@ class CameraProcessClient:
 		self.frames_written = 0
 		self.save_queue_size = 0
 		self.display_queue_size = 0
+		self.average_fps = None
 		self.exp_status_queue = queue.Queue()
 		self.analog_gain = float(config.get('ANALOG_GAIN', 1.0))
 		self.analog_gain_step = 0.1
@@ -137,6 +139,8 @@ class CameraProcessClient:
 				self.frames_written = int(msg.get('frames_written', self.frames_written))
 				self.save_queue_size = int(msg.get('save_queue_size', self.save_queue_size))
 				self.display_queue_size = int(msg.get('display_queue_size', self.display_queue_size))
+				if 'average_fps' in msg:
+					self.average_fps = float(msg['average_fps'])
 			elif msg_type == 'trigger_mode':
 				self.hardware_trigger_enabled = msg.get('mode') == 2
 			elif msg_type == 'exposure':
@@ -362,6 +366,7 @@ class CameraGUI(QMainWindow):
 		self.last_stats_time = None
 		self.last_stats_frame_count = 0
 		self.fps_samples = deque(maxlen=100)
+		self.last_display_frame = None
 		self.exp_status_timer = QTimer()
 		self.exp_status_timer.timeout.connect(self.check_experiment_status)
 		self.exp_status_timer.start(100)
@@ -395,6 +400,7 @@ class CameraGUI(QMainWindow):
 	def init_ui(self):
 		self.setWindowTitle(f'camstim {self.app_version}')
 		self.setGeometry(100, 100, 1400, 800)
+		self._create_menu_bar()
 
 		central_widget = QWidget()
 		self.setCentralWidget(central_widget)
@@ -408,6 +414,195 @@ class CameraGUI(QMainWindow):
 		right_panel = self.create_control_panel()
 		right_panel.setFixedWidth(420)
 		main_layout.addWidget(right_panel, 1)
+
+	def _create_menu_bar(self):
+		menu_bar = self.menuBar()
+		file_menu = menu_bar.addMenu('File')
+		image_menu = menu_bar.addMenu('Image')
+
+		quit_action = QAction('Quit', self)
+		quit_action.triggered.connect(self.close)
+		file_menu.addAction(quit_action)
+
+		save_menu = image_menu.addMenu('Save')
+
+		save_current_action = QAction('Current frame', self)
+		save_current_action.triggered.connect(self.save_current_frame_image)
+		save_menu.addAction(save_current_action)
+
+		save_average_action = QAction('Average frame', self)
+		save_average_action.triggered.connect(self.save_average_frame_image)
+		save_menu.addAction(save_average_action)
+
+		save_snapshot_action = QAction('Snapshot', self)
+		save_snapshot_action.triggered.connect(self.save_snapshot_image)
+		save_menu.addAction(save_snapshot_action)
+
+	def _prompt_image_save_path(self, title):
+		default_dir = self._default_image_save_dir()
+		file_path, _ = QFileDialog.getSaveFileName(
+			self,
+			title,
+			default_dir,
+			'TIFF (*.tiff *.tif);;PNG (*.png);;BMP (*.bmp);;All Files (*)',
+		)
+		if not file_path:
+			return None
+
+		path = Path(file_path)
+		if path.suffix == '':
+			path = path.with_suffix('.tiff')
+		return str(path)
+
+	def _default_image_save_dir(self):
+		try:
+			save_root = Path(load_save_root())
+		except Exception:
+			save_root = CONFIG_DIR
+
+		mouse_id = ''
+		experiment_id = ''
+
+		if self.camera_app is not None:
+			mouse_id = (getattr(self.camera_app, 'mouse_id', '') or '').strip()
+			experiment_id = (getattr(self.camera_app, 'experiment_id', '') or '').strip()
+
+		if not mouse_id and hasattr(self, 'mouse_id_input'):
+			mouse_id = self.mouse_id_input.text().strip()
+		if not experiment_id and hasattr(self, 'experiment_id_input'):
+			experiment_id = self.experiment_id_input.text().strip()
+
+		default_dir = save_root
+		if mouse_id and experiment_id:
+			default_dir = save_root / mouse_id / experiment_id
+
+		try:
+			default_dir.mkdir(parents=True, exist_ok=True)
+		except OSError:
+			pass
+
+		return str(default_dir)
+
+	def _save_image_to_path(self, frame, file_path):
+		ok = cv2.imwrite(file_path, frame)
+		if not ok:
+			raise OSError(f'cv2.imwrite returned False for {file_path}')
+
+	def save_current_frame_image(self):
+		if self.camera_app is None:
+			QMessageBox.warning(self, 'Save Current Frame', 'Camera is not running.')
+			return
+
+		frame = self.last_display_frame
+		if frame is None:
+			try:
+				frame_data = self.camera_app.get_frame_for_display()
+				if frame_data is not None:
+					frame = self._frame_data_to_display_frame(frame_data)
+			except Exception:
+				frame = None
+
+		if frame is None:
+			QMessageBox.warning(self, 'Save Current Frame', 'No frame is currently available to save.')
+			return
+
+		file_path = self._prompt_image_save_path('Save Current Frame')
+		if not file_path:
+			return
+
+		try:
+			self._save_image_to_path(frame, file_path)
+			self.update_status(f'Saved current frame: {file_path}')
+		except Exception as e:
+			QMessageBox.critical(self, 'Save Current Frame', f'Failed to save image: {e}')
+
+	def _capture_next_display_frames(self, frame_count, timeout_s=10.0):
+		if self.camera_app is None or frame_count <= 0:
+			return []
+
+		frames = []
+		timer_was_active = hasattr(self, 'timer') and self.timer.isActive()
+		timer_interval_ms = self.timer.interval() if timer_was_active else 0
+
+		if timer_was_active:
+			self.timer.stop()
+
+		deadline = time.time() + max(timeout_s, frame_count * 0.15)
+		try:
+			while len(frames) < frame_count and time.time() < deadline:
+				frame_data = self.camera_app.get_frame_for_display()
+				if frame_data is None:
+					QApplication.processEvents()
+					time.sleep(0.005)
+					continue
+
+				display_frame = self._frame_data_to_display_frame(frame_data)
+				if display_frame is None:
+					continue
+
+				frames.append(display_frame.astype(np.float32))
+				QApplication.processEvents()
+		finally:
+			if timer_was_active:
+				self.timer.start(timer_interval_ms)
+
+		return frames
+
+	def save_average_frame_image(self):
+		if self.camera_app is None:
+			QMessageBox.warning(self, 'Save Average Frame', 'Camera is not running.')
+			return
+
+		frame_count, ok = QInputDialog.getInt(
+			self,
+			'Save Average Frame',
+			'Number of frames to average:',
+			10,
+			1,
+			10000,
+			1,
+		)
+		if not ok:
+			return
+
+		file_path = self._prompt_image_save_path('Save Average Frame')
+		if not file_path:
+			return
+
+		frames = self._capture_next_display_frames(frame_count)
+		if len(frames) < frame_count:
+			QMessageBox.warning(
+				self,
+				'Save Average Frame',
+				f'Only captured {len(frames)} of {frame_count} frame(s). Try again.',
+			)
+			return
+
+		avg_frame = np.mean(np.stack(frames, axis=0), axis=0)
+		avg_frame = np.clip(np.rint(avg_frame), 0, 255).astype(np.uint8)
+
+		try:
+			self._save_image_to_path(avg_frame, file_path)
+			self.update_status(f'Saved average frame ({frame_count}): {file_path}')
+		except Exception as e:
+			QMessageBox.critical(self, 'Save Average Frame', f'Failed to save image: {e}')
+
+	def save_snapshot_image(self):
+		pixmap = self.video_label.pixmap() if hasattr(self, 'video_label') else None
+		if pixmap is None or pixmap.isNull():
+			QMessageBox.warning(self, 'Save Snapshot', 'No displayed image is available to snapshot.')
+			return
+
+		file_path = self._prompt_image_save_path('Save Snapshot')
+		if not file_path:
+			return
+
+		try:
+			if not pixmap.save(file_path):
+				raise OSError(f'QPixmap.save returned False for {file_path}')
+			self.update_status(f'Saved snapshot: {file_path}')
+		except Exception as e:
+			QMessageBox.critical(self, 'Save Snapshot', f'Failed to save snapshot: {e}')
 
 	def create_display_panel(self):
 		panel = QWidget()
@@ -810,7 +1005,6 @@ class CameraGUI(QMainWindow):
 				frame_data = self.camera_app.get_frame_for_display()
 				if frame_data is None:
 					return
-				frame = np.frombuffer(frame_data, dtype=self.camera_app.dtype)
 
 				if self.reset_display_average_on_next_frame:
 					if hasattr(self.camera_app, 'circular_buffer'):
@@ -827,28 +1021,40 @@ class CameraGUI(QMainWindow):
 					self.fps_samples.clear()
 					self.reset_fps_on_next_frame = False
 
-				if hasattr(self.camera_app, 'height') and hasattr(self.camera_app, 'width'):
-					frame = frame.reshape((self.camera_app.height, self.camera_app.width))
-					# Keep GUI display orientation identical to saved raw frames.
-					# Prefer hardware mirror; fall back to software mirror if needed.
-					if getattr(self.camera_app, 'software_mirror_horizontal', False):
-						frame = cv2.flip(frame, 1)
-				
-				if self.camera_app.bin_exp:
-					bs = self.camera_app.bin_size
-					frame = frame.astype(np.float32)
-					if bs in (2, 4, 8, 16):
-						for _ in range(bs.bit_length() - 1):
-							frame = (frame[0::2, 0::2] + frame[1::2, 0::2] + frame[0::2, 1::2] + frame[1::2, 1::2])
-					else:
-						h, w = frame.shape
-						frame = frame.reshape(h // bs, bs, w // bs, bs).sum(axis=(1, 3))
-					frame /= (bs * bs)
-
-				display_frame = self.process_frame_for_display(frame)
+				display_frame = self._frame_data_to_display_frame(frame_data)
+				if display_frame is None:
+					return
+				self.last_display_frame = np.ascontiguousarray(display_frame.copy())
 				self.display_processed_frame(display_frame)
 			except Exception as e:
 				print(f"Display error: {e}.")
+
+	def _frame_data_to_display_frame(self, frame_data):
+		if self.camera_app is None or frame_data is None:
+			return None
+
+		frame = np.frombuffer(frame_data, dtype=self.camera_app.dtype)
+
+		if hasattr(self.camera_app, 'height') and hasattr(self.camera_app, 'width'):
+			frame = frame.reshape((self.camera_app.height, self.camera_app.width))
+			# Keep GUI display orientation identical to saved raw frames.
+			# Prefer hardware mirror; fall back to software mirror if needed.
+			if getattr(self.camera_app, 'software_mirror_horizontal', False):
+				frame = cv2.flip(frame, 1)
+
+		if self.camera_app.bin_exp:
+			bs = self.camera_app.bin_size
+			frame = frame.astype(np.float32)
+			if bs in (2, 4, 8, 16):
+				for _ in range(bs.bit_length() - 1):
+					frame = (frame[0::2, 0::2] + frame[1::2, 0::2] + frame[0::2, 1::2] + frame[1::2, 1::2])
+			else:
+				h, w = frame.shape
+				frame = frame.reshape(h // bs, bs, w // bs, bs).sum(axis=(1, 3))
+			frame /= (bs * bs)
+
+		display_frame = self.process_frame_for_display(frame)
+		return display_frame
 
 	def process_frame_for_display(self, frame):
 		if self.camera_app.dtype == 'uint16':
@@ -946,19 +1152,23 @@ class CameraGUI(QMainWindow):
 				if hasattr(self.camera_app, 'poll_messages'):
 					self.camera_app.poll_messages()
 				self._sync_gain_spinner_with_camera()
-				current_time = time.time()
-				if self.last_stats_time is None:
+				worker_average_fps = getattr(self.camera_app, 'average_fps', None)
+				if worker_average_fps is None:
+					current_time = time.time()
+					if self.last_stats_time is None:
+						self.last_stats_time = current_time
+						self.last_stats_frame_count = self.camera_app.frame_count
+
+					delta_time = current_time - self.last_stats_time
+					delta_frames = self.camera_app.frame_count - self.last_stats_frame_count
+					if delta_time > 0 and delta_frames >= 0:
+						self.fps_samples.append(delta_frames / delta_time)
+
 					self.last_stats_time = current_time
 					self.last_stats_frame_count = self.camera_app.frame_count
-
-				delta_time = current_time - self.last_stats_time
-				delta_frames = self.camera_app.frame_count - self.last_stats_frame_count
-				if delta_time > 0 and delta_frames >= 0:
-					self.fps_samples.append(delta_frames / delta_time)
-
-				self.last_stats_time = current_time
-				self.last_stats_frame_count = self.camera_app.frame_count
-				average_fps = sum(self.fps_samples) / len(self.fps_samples) if self.fps_samples else 0
+					average_fps = sum(self.fps_samples) / len(self.fps_samples) if self.fps_samples else 0
+				else:
+					average_fps = float(worker_average_fps)
 
 				save_queue_size = getattr(self.camera_app, 'save_queue_size', 0)
 				stats_text = f"Version: {self.app_version} | FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}"

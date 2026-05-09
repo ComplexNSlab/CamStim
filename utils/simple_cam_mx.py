@@ -12,13 +12,16 @@ from pathlib import Path
 import os
 import subprocess
 import shutil
+from collections import deque
+import cv2
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
 CONFIG_DIR = REPO_ROOT / 'config_files'
-
 _VERSION_FILE = REPO_ROOT / 'VERSION'
-
+APP_VERSION = _load_app_version()
+CONFIG_FILE = str(CONFIG_DIR / 'cam_config.yaml')
+TEENSY_PARAMS_FILE = str(CONFIG_DIR / 'teensyParams.yaml')
+SAVE_SETTINGS_CONFIG_FILE = str(CONFIG_DIR / 'config.yaml')
 
 def _load_app_version(default='0.0.0'):
     try:
@@ -26,10 +29,6 @@ def _load_app_version(default='0.0.0'):
         return version_text if version_text else default
     except OSError:
         return default
-
-
-APP_VERSION = _load_app_version()
-
 
 def _inject_version_into_yaml(yaml_path, version=APP_VERSION):
     """Prepend 'VERSION: <version>' to a YAML file if no VERSION key already exists."""
@@ -46,9 +45,6 @@ def _inject_version_into_yaml(yaml_path, version=APP_VERSION):
         path.write_text(f'VERSION: {version}\n' + text, encoding='utf-8')
     except OSError as exc:
         print(f'Warning: could not inject VERSION into {yaml_path}: {exc}')
-CONFIG_FILE = str(CONFIG_DIR / 'cam_config.yaml')
-TEENSY_PARAMS_FILE = str(CONFIG_DIR / 'teensyParams.yaml')
-SAVE_SETTINGS_CONFIG_FILE = str(CONFIG_DIR / 'config.yaml')
 
 
 def _resolve_config_path(path_value):
@@ -137,11 +133,10 @@ class App(object):
         self.sys_clock_timestamps = []
         self.session_frame_timestamps = []
         self.session_sys_clock_timestamps = []
-        self.USE_MONO16 = False
-        self.bytes_per_pixel = 1
         self.t_start = None
         self.hCamera = None
         self.session_frames_written = 0
+        self.session_preview_frames_saved = 0
         self.on_logic_analyzer_terminated = None
 
         self.exp_thread = None
@@ -162,6 +157,9 @@ class App(object):
         self.latest_frame_lock = threading.Lock()
         self._windows_camera_thread_priority_boosted = False
         self._windows_callback_thread_priority_boosted = False
+        self.last_stats_time = None
+        self.last_stats_frame_count = 0
+        self.fps_samples = deque(maxlen=100)
 
         # self.check_and_fix_existing_experiment()
 
@@ -390,8 +388,6 @@ class App(object):
 
         # Mono8 is enforced for stability and compatibility.
         mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
-        self.USE_MONO16 = False
-        self.bytes_per_pixel = 1
         self.dtype = 'uint8'
         print("Using 8-bit output format (MONO8).")
 
@@ -796,6 +792,32 @@ class App(object):
         self.session_frames_written = 0
         self.session_frame_timestamps = []
         self.session_sys_clock_timestamps = []
+        self.session_preview_frames_saved = 0
+
+    def _save_initial_frame_tiff(self, frame_data):
+        if self.session_preview_frames_saved >= 2:
+            return
+        if not self.save_dir_ready or self.save_dir is None:
+            return
+        if not hasattr(self, 'width') or not hasattr(self, 'height'):
+            return
+
+        try:
+            frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(int(self.height), int(self.width))
+            if self.software_mirror_horizontal:
+                frame = np.ascontiguousarray(frame[:, ::-1])
+
+            frame_idx = int(self.session_preview_frames_saved)
+            frame_path = os.path.join(self.save_dir, f"{self.filename}_frame{frame_idx}.tiff")
+
+            # Use TIFF compression tag 1 (none) for uncompressed output.
+            ok = cv2.imwrite(frame_path, frame, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
+            if not ok:
+                raise OSError(f"cv2.imwrite returned False for {frame_path}")
+
+            self.session_preview_frames_saved += 1
+        except Exception as exc:
+            print(f"Warning: failed to save frame preview TIFF: {exc}")
 
     def _close_save_file_handle(self):
         if self.save_file_handle is None:
@@ -891,7 +913,7 @@ class App(object):
                     continue
 
                 if hasattr(self, 'width') and hasattr(self, 'height'):
-                    frame_bytes = max(1, int(self.width) * int(self.height) * int(self.bytes_per_pixel))
+                    frame_bytes = max(1, int(self.width) * int(self.height))
                     max_frames_by_bytes = max(1, self.save_target_batch_bytes // frame_bytes)
                     effective_batch = max(1, min(self.save_batch_frames, max_frames_by_bytes))
                     if effective_batch != flush_every_n_frames:
@@ -918,6 +940,7 @@ class App(object):
                     continue
 
                 write_batch.append(frame_data)
+                self._save_initial_frame_tiff(frame_data)
                 ts_batch.append(timestamp)
                 sys_ts_batch.append(sys_stamp)
                 if len(write_batch) >= flush_every_n_frames:
@@ -935,6 +958,7 @@ class App(object):
                         break
 
                     write_batch.append(frame_data)
+                    self._save_initial_frame_tiff(frame_data)
                     ts_batch.append(timestamp)
                     sys_ts_batch.append(sys_stamp)
                     if len(write_batch) >= flush_every_n_frames:
@@ -1017,9 +1041,6 @@ class App(object):
         # Let the SDK's internal image capture thread start working
         mvsdk.CameraPlay(self.hCamera)
 
-        # Allocate ISP output buffer for worst-case mono frame size at current bit depth.
-        FrameBufferSize = cap.sResolutionRange.iWidthMax * cap.sResolutionRange.iHeightMax * self.bytes_per_pixel
-
         # Set the capture callback function
         self.quit = False
         mvsdk.CameraSetCallbackFunction(self.hCamera, self.GrabCallback, 0)
@@ -1031,8 +1052,18 @@ class App(object):
         while not self.quit:
             self._process_command_queue()
             current_time = time.time()
-            elapsed_time = current_time - self.t_start
-            average_fps = self.frame_count / elapsed_time if elapsed_time > 0 else 0
+            if self.last_stats_time is None:
+                self.last_stats_time = current_time
+                self.last_stats_frame_count = self.frame_count
+
+            delta_time = current_time - self.last_stats_time
+            delta_frames = self.frame_count - self.last_stats_frame_count
+            if delta_time > 0 and delta_frames >= 0:
+                self.fps_samples.append(delta_frames / delta_time)
+
+            self.last_stats_time = current_time
+            self.last_stats_frame_count = self.frame_count
+            average_fps = sum(self.fps_samples) / len(self.fps_samples) if self.fps_samples else 0
 
             self._publish_status({
                 'type': 'stats',
@@ -1040,6 +1071,7 @@ class App(object):
                 'frames_written': self.frames_written,
                 'save_queue_size': self.frame_queue.qsize(),
                 'display_queue_size': 0,
+                'average_fps': float(average_fps),
             })
 
             # Print stats, reusing the same terminal line

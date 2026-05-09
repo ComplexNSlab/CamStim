@@ -3,6 +3,7 @@ import threading
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_DIR = Path(__file__).resolve().parent.parent / 'config_files'
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -21,7 +22,6 @@ stop_flag = False
 bool_DEBUG = True
 
 exp_types = discover_experiment_types()
-CONFIG_DIR = Path(__file__).resolve().parent.parent / 'config_files'
 
 
 def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False):
