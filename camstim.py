@@ -20,6 +20,15 @@ from utils.simple_cam_mx import load_camera_config, run_camera_worker
 from core.experiment_discovery import get_experiment_list
 
 CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
+VERSION_FILE = Path(__file__).resolve().parent / 'VERSION'
+
+
+def load_app_version(default='0.0.0'):
+	try:
+		version_text = VERSION_FILE.read_text(encoding='utf-8').strip()
+		return version_text if version_text else default
+	except OSError:
+		return default
 
 
 class CameraProcessClient:
@@ -324,6 +333,7 @@ class CameraProcessClient:
 class CameraGUI(QMainWindow):
 	def __init__(self):
 		super().__init__()
+		self.app_version = load_app_version()
 		self.config = load_camera_config(str(CONFIG_DIR / 'cam_config.yaml'))
 		self.display_target_size = None
 		self.camera_app = None
@@ -376,7 +386,7 @@ class CameraGUI(QMainWindow):
 					self._schedule_auto_stop()
 
 	def init_ui(self):
-		self.setWindowTitle('Camera GUI')
+		self.setWindowTitle(f'camstim {self.app_version}')
 		self.setGeometry(100, 100, 1400, 800)
 
 		central_widget = QWidget()
@@ -398,7 +408,7 @@ class CameraGUI(QMainWindow):
 		panel.setLayout(layout)
 
 		self.video_label = QLabel()
-		self.video_label.setText('Camera not started.\n\nClick "Start Camera" to begin.')
+		self.video_label.setText(f'camstim {self.app_version}\n\nCamera not started.\n\nClick "Start Camera" to begin.')
 		self.video_label.setMinimumSize(640, 480)
 		self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 		self.video_label.setStyleSheet('border: 1px solid gray; background-color: #f0f0f0;')
@@ -596,11 +606,12 @@ class CameraGUI(QMainWindow):
 		self.status_text.setReadOnly(True)
 		status_layout.addWidget(self.status_text)
 
-		self.stats_label = QLabel("FPS: 0 | Frames: 0 | Saved: 0 | Save Queue: 0")
+		self.stats_label = QLabel(f"Version: {self.app_version} | FPS: 0 | Frames: 0 | Saved: 0 | Save Queue: 0")
 		status_layout.addWidget(self.stats_label)
 
 		status_group.setLayout(status_layout)
 		layout.addWidget(status_group)
+		self.statusBar().showMessage(f"camstim {self.app_version}")
 
 		layout.addStretch()
 
@@ -779,7 +790,7 @@ class CameraGUI(QMainWindow):
 		self.preview_btn.setEnabled(False)
 		if hasattr(self, 'gain_spin'):
 			self.gain_spin.setEnabled(False)
-		self.video_label.setText("Camera Stopped.")
+		self.video_label.setText(f"camstim {self.app_version}\n\nCamera Stopped.")
 		self.display_target_size = None
 		self.cam_config_display.setText("Camera stopped. \n\n Start camera to begin.")
 		self.current_cam_config = None
@@ -943,7 +954,7 @@ class CameraGUI(QMainWindow):
 				average_fps = sum(self.fps_samples) / len(self.fps_samples) if self.fps_samples else 0
 
 				save_queue_size = getattr(self.camera_app, 'save_queue_size', 0)
-				stats_text = f"FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}"
+				stats_text = f"Version: {self.app_version} | FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}"
 				self.stats_label.setText(stats_text)
 			except:
 				pass

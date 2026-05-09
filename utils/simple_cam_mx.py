@@ -22,6 +22,36 @@ from core.experiment_discovery import get_experiment_list
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 CONFIG_DIR = REPO_ROOT / 'config_files'
+
+_VERSION_FILE = REPO_ROOT / 'VERSION'
+
+
+def _load_app_version(default='0.0.0'):
+    try:
+        version_text = _VERSION_FILE.read_text(encoding='utf-8').strip()
+        return version_text if version_text else default
+    except OSError:
+        return default
+
+
+APP_VERSION = _load_app_version()
+
+
+def _inject_version_into_yaml(yaml_path, version=APP_VERSION):
+    """Prepend 'VERSION: <version>' to a YAML file if no VERSION key already exists."""
+    path = Path(yaml_path)
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding='utf-8')
+        # Check whether a VERSION key already exists at the start of any line.
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.upper().startswith('VERSION') and ':' in stripped:
+                return  # Already present – leave the file untouched.
+        path.write_text(f'VERSION: {version}\n' + text, encoding='utf-8')
+    except OSError as exc:
+        print(f'Warning: could not inject VERSION into {yaml_path}: {exc}')
 CONFIG_FILE = str(CONFIG_DIR / 'cam_config.yaml')
 TEENSY_PARAMS_FILE = str(CONFIG_DIR / 'teensyParams.yaml')
 SAVE_SETTINGS_CONFIG_FILE = str(CONFIG_DIR / 'config.yaml')
@@ -594,6 +624,7 @@ class App(object):
         cam_config_target = Path(save_dir) / 'cam_config.yaml'
         if cam_config_source.is_file():
             shutil.copyfile(cam_config_source, cam_config_target)
+            _inject_version_into_yaml(cam_config_target)
         else:
             print("Warning: {} not found; skipping config copy.".format(cam_config_source))
 
@@ -609,6 +640,7 @@ class App(object):
         teensy_params_target = Path(self.save_dir) / 'teensyParams.yaml'
         if teensy_params_source.is_file():
             shutil.copyfile(teensy_params_source, teensy_params_target)
+            _inject_version_into_yaml(teensy_params_target)
         else:
             print("Warning: {} not found; skipping config copy.".format(teensy_params_source))
 

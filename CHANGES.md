@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-05-09 (2)
+- Added root `VERSION` file containing the application version string (currently `0.1.0`).
+- `camstim.py` now reads `VERSION` at startup and displays the version in the window title (`camstim 0.1.0`), startup/stop display text, and the stats label.
+- `utils/simple_cam_mx.py` injects a `VERSION:` line into each copied YAML config file (`cam_config.yaml`, `teensyParams.yaml`) during experiment save-directory setup, preserving any pre-existing `VERSION` key unchanged.
+- Removed `.DS_Store`, `__pycache__` directories, and `.pyc` bytecode files from the working tree; these are already covered by `.gitignore`.
+
 ## 2026-05-09
 - Gain controls now use camera capability-reported multiplier range/step in the GUI, including step-locked spinner increments and value snapping to valid hardware steps.
 - Clarified `ANALOG_GAIN` semantics in `config_files/cam_config.yaml` as real multiplier units (float values like `2.5`) rather than raw SDK integer units.
