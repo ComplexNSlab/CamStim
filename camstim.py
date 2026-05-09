@@ -3,18 +3,15 @@ import numpy as np
 import multiprocessing as mp
 import queue
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
-							QWidget, QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
+							QWidget, QPushButton, QLabel, QDoubleSpinBox,
 							QGridLayout,
 							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit)
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QImage, QPixmap
 import time
 from collections import deque
-from utils.simple_cam_mx import App, load_camera_config
 import threading
-from core import mvsdk
 from core.TeensyController import TeensyController
-from core.experiment_discovery import get_experiment_list
 import cv2
 import yaml
 from pathlib import Path
@@ -64,7 +61,6 @@ class CameraProcessClient:
 		self.save_queue_size = 0
 		self.display_queue_size = 0
 		self.exp_status_queue = queue.Queue()
-		self.exp_list = get_experiment_list()
 		self.analog_gain = float(config.get('ANALOG_GAIN', 1.0))
 		self.analog_gain_step = 0.1
 		self.analog_gain_min = 0.1

@@ -8,7 +8,6 @@ import time
 import platform
 import queue
 import threading
-import serial
 import yaml
 from pathlib import Path
 import os
