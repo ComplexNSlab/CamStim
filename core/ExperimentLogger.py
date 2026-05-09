@@ -31,8 +31,15 @@ class ExperimentLogger():
 
         # for each of the settings filenames we make a copy of them to always have them available.
         for filename in experiment_settings_filenames:
-            new_filename = os.path.join(log_dir, filename.split("/")[-1])
-            shutil.copyfile(filename, new_filename)
+            src = os.path.abspath(filename)
+            new_filename = os.path.join(log_dir, os.path.basename(filename))
+            dst = os.path.abspath(new_filename)
+
+            # Avoid shutil.SameFileError when a settings file is already in log_dir.
+            if src == dst:
+                continue
+
+            shutil.copyfile(src, dst)
         print("Copied experiment settings.")
 
 

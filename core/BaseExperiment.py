@@ -93,9 +93,14 @@ class BaseExperiment(ABC):
             return str(config_path)
 
         repo_root = Path(__file__).resolve().parent.parent
-        config_dir_path = repo_root / 'config_files' / config_path
-        if config_dir_path.is_file():
-            return str(config_dir_path)
+        # Accept either "monitor_config.yaml" or "config_files/monitor_config.yaml".
+        candidate_paths = [
+            repo_root / 'config_files' / config_path,
+            repo_root / config_path,
+        ]
+        for candidate in candidate_paths:
+            if candidate.is_file():
+                return str(candidate)
 
         # Backward-compatible fallback for callers that pass core-relative paths.
         return str(Path(__file__).resolve().parent / config_path)

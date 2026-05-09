@@ -1,6 +1,6 @@
-# Changes Summary
+# Changelog
 
-## Camera Subprocess Split and Runtime Fixes
+## 2026-05-08
 - Moved the camera acquisition path into a dedicated subprocess so the GUI no longer shares the same Python execution path as frame grabbing.
 - Added a GUI proxy layer in `camstim.py` to control camera, trigger, experiment, and status flow through IPC queues.
 - Kept live display working by forwarding the latest frame snapshot from the worker back to the GUI.

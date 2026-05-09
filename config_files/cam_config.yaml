@@ -3,7 +3,7 @@ USE_LIVE_SPECKLE: true
 BUFFER_SIZE: 10
 
 # Debug option: run experiments without initializing the Teensy board.
-DEBUG_SKIP_TEENSY: true
+DEBUG_SKIP_TEENSY: false
 
 # What exposure time to use (in ms, can be < 0)
 EXPOSURE_TIME: 15
@@ -24,3 +24,10 @@ BIN_SIZE: 2
 SAVE_QUEUE_MAX_FRAMES: 1200
 # Frames grouped into one write batch. Larger batches reduce syscall overhead.
 SAVE_BATCH_FRAMES: 64
+# Upper bound on raw frame bytes per batch (helps avoid long periodic write stalls).
+SAVE_TARGET_BATCH_BYTES: 33554432
+
+# Acquisition-priority mode: when saving, reduce display update rate so callback stays fast.
+PRIORITIZE_ACQUISITION: true
+# Update latest/display frame every N acquired frames while saving.
+DISPLAY_UPDATE_INTERVAL_WHEN_SAVING: 10
