@@ -5,6 +5,7 @@
 - `camstim.py` now reads `VERSION` at startup and displays the version in the window title (`camstim 0.1.0`), startup/stop display text, and the stats label.
 - `utils/simple_cam_mx.py` injects a `VERSION:` line into each copied YAML config file (`cam_config.yaml`, `teensyParams.yaml`) during experiment save-directory setup, preserving any pre-existing `VERSION` key unchanged.
 - Removed `.DS_Store`, `__pycache__` directories, and `.pyc` bytecode files from the working tree; these are already covered by `.gitignore`.
+- Removed UDP command-server functionality from `utils/wf_main.py`; experiment launch is now CLI-only via script arguments (with optional `--skip-teensy`).
 
 ## 2026-05-09
 - Gain controls now use camera capability-reported multiplier range/step in the GUI, including step-locked spinner increments and value snapping to valid hardware steps.

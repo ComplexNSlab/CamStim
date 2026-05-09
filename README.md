@@ -99,7 +99,7 @@ camstim/
 ## Entry Points
 
 - **`camstim.py`** — Main GUI application (camera control, experiment selection, live preview)
-- **`utils/wf_main.py`** — Experiment launcher (runs selected experiment via subprocess)
+- **`utils/wf_main.py`** — CLI experiment launcher subprocess (`python utils/wf_main.py <exp_name> <experiment_id> <mouse_id> [--skip-teensy]`)
 - **`utils/teensyConnectTest.py`** — Test Teensy connectivity
 
 ## Adding New Experiments

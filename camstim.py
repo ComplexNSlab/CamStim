@@ -223,6 +223,13 @@ class CameraProcessClient:
 		self.enable_live_speckle = not self.enable_live_speckle
 		return self.enable_live_speckle
 
+	def std_filter_frame(self, frame):
+		bs = int(self.bin_size)
+		if bs <= 1:
+			return frame.astype(np.float32)
+		h, w = frame.shape
+		return frame.reshape((h // bs, bs, w // bs, bs)).std(axis=(1, 3), dtype=np.float32)
+
 	def toggle_dFoF(self):
 		if self.dFoF_open:
 			self.dFoF_open = False
