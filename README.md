@@ -56,17 +56,16 @@ camstim/
    ```bash
    conda install -c conda-forge opencv gtk3 gstreamer pyqt qt-main pyqt6
    pip install 'setuptools<70'
-   pip install --upgrade psychopy
-   pip install pyserial pyyaml matplotlib
+   pip install --upgrade psychopy tifffile h5py scikit-image
    ```
    
-   **Notes on compatibility:**
+   **Notes on compatibility (only for windows):**
    - The setuptools downgrade to <70 is required for the `pkg_resources` module that psychopy needs
    - Upgrading psychopy ensures Python 3.10 compatibility and installs all required dependencies
    
    Optional (for data analysis):
    ```bash
-   pip install jupyter h5py
+   pip install jupyter
    ```
 
    Optional (for `RetinotopyExperiment`):

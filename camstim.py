@@ -20,6 +20,7 @@ from pathlib import Path
 from utils.simple_cam_mx import load_camera_config, load_save_root, run_camera_worker
 from core.experiment_discovery import get_experiment_list
 
+
 CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
 VERSION_FILE = Path(__file__).resolve().parent / 'VERSION'
 

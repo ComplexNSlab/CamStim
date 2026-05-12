@@ -15,6 +15,14 @@ import shutil
 from collections import deque
 import cv2
 
+
+def _load_app_version(default='0.0.0'):
+    try:
+        version_text = _VERSION_FILE.read_text(encoding='utf-8').strip()
+        return version_text if version_text else default
+    except OSError:
+        return default
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / 'config_files'
 _VERSION_FILE = REPO_ROOT / 'VERSION'
@@ -23,12 +31,7 @@ CONFIG_FILE = str(CONFIG_DIR / 'cam_config.yaml')
 TEENSY_PARAMS_FILE = str(CONFIG_DIR / 'teensyParams.yaml')
 SAVE_SETTINGS_CONFIG_FILE = str(CONFIG_DIR / 'config.yaml')
 
-def _load_app_version(default='0.0.0'):
-    try:
-        version_text = _VERSION_FILE.read_text(encoding='utf-8').strip()
-        return version_text if version_text else default
-    except OSError:
-        return default
+
 
 def _inject_version_into_yaml(yaml_path, version=APP_VERSION):
     """Prepend 'VERSION: <version>' to a YAML file if no VERSION key already exists."""

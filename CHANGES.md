@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-05-11
+- Added support for running Huateng Cameras on Apple Silicon
+
 ## 2026-05-09 (2)
 - Added root `VERSION` file containing the application version string (currently `0.1.0`).
 - `camstim.py` now reads `VERSION` at startup and displays the version in the window title (`camstim 0.1.0`), startup/stop display text, and the stats label.

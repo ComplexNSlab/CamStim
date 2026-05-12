@@ -1,5 +1,6 @@
 #coding=utf-8
 import platform
+import os
 from ctypes import *
 from threading import local
 
@@ -9,7 +10,8 @@ CALLBACK_FUNC_TYPE = None
 # SDK动态库
 _sdk = None
 
-def _Init():
+# JO May 11 2026 - Adding Apple silicon compatibility
+def _Init_original():
 	global _sdk
 	global CALLBACK_FUNC_TYPE
 
@@ -23,6 +25,37 @@ def _Init():
 		_sdk = cdll.LoadLibrary("libMVSDK.so")
 		CALLBACK_FUNC_TYPE = CFUNCTYPE
 
+def _Init():
+    global _sdk
+    global CALLBACK_FUNC_TYPE
+
+    if _sdk is not None:
+        return _sdk  # already initialized
+
+    system = platform.system()
+    is_x86 = (platform.architecture()[0] == '32bit')
+
+    if system == "Windows":
+        _sdk = windll.MVCAMSDK if is_x86 else windll.MVCAMSDK_X64
+        CALLBACK_FUNC_TYPE = WINFUNCTYPE
+
+    elif system == "Darwin":  # macOS (Intel + Apple Silicon)
+        here = os.path.dirname(__file__)
+        lib_path = os.path.join(here, "libmvsdk.dylib")
+
+        if os.path.exists(lib_path):
+            _sdk = cdll.LoadLibrary(lib_path)
+        else:
+            # fallback if user installed it globally
+            _sdk = cdll.LoadLibrary("libmvsdk.dylib")
+
+        CALLBACK_FUNC_TYPE = CFUNCTYPE
+
+    else:  # Linux
+        _sdk = cdll.LoadLibrary("libMVSDK.so")
+        CALLBACK_FUNC_TYPE = CFUNCTYPE
+
+    return _sdk
 _Init()
 
 #-------------------------------------------类型定义--------------------------------------------------
