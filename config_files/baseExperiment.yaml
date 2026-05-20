@@ -1,0 +1,3 @@
+# Configuration for BaseExperiment
+name: baseExperiment
+wait_time_sec: 300

@@ -1,7 +1,13 @@
+# 2026-05-20
+- Refactored `BaseExperiment` to be fully config-driven and minimal:
+	- Wait time and experiment name are now loaded from `config_files/baseExperiment.yaml`.
+	- Experiment name is logged as `exp_protocol` in `exp_log.log['exp_parameters']` (matching VisualFieldMapping convention).
+	- All dependencies on psychopy, monitor, and photodiode logic have been removed.
+	- The experiment simply logs start/end, waits for the configured time, and saves the log.
+	- File is now clean, minimal, and ready for extension or use as a generic experiment template.
+- Created `config_files/baseExperiment.yaml` with default wait time and name fields.
+- Updated changelog to document all changes.
 # Changelog
-
-## 2026-05-11
-- Added support for running Huateng Cameras on Apple Silicon
 
 ## 2026-05-09 (2)
 - Added root `VERSION` file containing the application version string (currently `0.1.0`).
