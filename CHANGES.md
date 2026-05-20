@@ -1,4 +1,14 @@
 # 2026-05-20
+- Major camera framegrab callback and save pipeline improvements:
+	- Refactored threading and queueing for camera acquisition and save path to eliminate queue corruption and runaway save queue issues.
+	- Implemented bounded queues, latest-frame snapshot for display, and non-blocking enqueue for high-throughput, no-drop saving.
+	- Added YAML-configurable queue and batch sizes for the save pipeline.
+	- Strict overflow handling: no silent frame drops, with warnings if the pipeline is overloaded.
+	- Added preallocated frame buffer pool for the camera callback to avoid per-frame allocation stalls.
+	- Optionally disables Python garbage collection during acquisition for lower latency.
+	- Added callback timing instrumentation (perf_counter) and session summary/metadata export for performance debugging.
+	- Save file path and collision handling now robust and user-informative.
+	- All changes validated for 2048x2048@50fps, 16GB RAM, SSD, and strict no-frame-loss requirements.
 - Refactored `BaseExperiment` to be fully config-driven and minimal:
 	- Wait time and experiment name are now loaded from `config_files/baseExperiment.yaml`.
 	- Experiment name is logged as `exp_protocol` in `exp_log.log['exp_parameters']` (matching VisualFieldMapping convention).
