@@ -1,2 +1,0 @@
-"""Experiment type modules package."""
-

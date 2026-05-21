@@ -1,0 +1,3 @@
+# Configuration for SpontaneousActivity
+name: spontaneousActivity
+wait_time_sec: 300

@@ -37,7 +37,7 @@ def discover_experiment_types():
             print(f"Skipping experiment module '{module_name}': {e}")
             continue
 
-        exp_class = getattr(module, module_name, None)
+        exp_class = getattr(module, "SpontaneousActivity", None) if module_name == "spontaneousActivity" else getattr(module, module_name, None)
         if exp_class is None:
             continue
 

@@ -1,3 +1,10 @@
+# 2026-05-20 (3)
+- Renamed `baseExperiment` experiment type to `spontaneousActivity` for clarity:
+  - `experiment_types/baseExperiment.py` → `experiment_types/spontaneousActivity.py`; class renamed `SpontaneousActivity`.
+  - `config_files/baseExperiment.yaml` → `config_files/spontaneousActivity.yaml`; `EXPERIMENT_NAME` updated to match.
+  - `experiment_types/__init__.py` removed (no longer needed; experiment discovery is fully dynamic).
+  - `core/experiment_discovery.py` patched to handle the new class/module naming so `SpontaneousActivity` is correctly discovered and listed in the GUI dropdown.
+
 # 2026-05-20 (2)
 - Added `utils/cgrabcallback.c` — a C extension that replaces `ctypes.memmove` in the camera `GrabCallback` hot path with a direct address-to-address `memcpy`, eliminating Python object creation overhead per frame.
   - Exposes `fast_memcpy(dst_addr, src_addr, nbytes)` (raw integer pointer addresses) and `fast_memcpy_from_buf(dst_addr, src_buffer, nbytes)` (Python buffer as source).
