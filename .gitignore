@@ -23,3 +23,12 @@ Thumbs.db
 # Virtual environments
 venv/
 env/
+
+# C extension build artifacts (platform/version-specific, must be rebuilt locally)
+*.so
+*.pyd
+utils/build/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/Untitled*.ipynb
