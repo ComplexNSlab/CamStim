@@ -1,6 +1,7 @@
 # coding=utf-8
 import ctypes
 import sys
+import gc
 import numpy as np
 from core import mvsdk
 import time
@@ -122,6 +123,15 @@ class App(object):
         self.save_batch_frames = int(config.get('SAVE_BATCH_FRAMES', 64))
         # Cap batch memory to avoid periodic large allocations that can stall writes.
         self.save_target_batch_bytes = int(config.get('SAVE_TARGET_BATCH_BYTES', 32 * 1024 * 1024))
+        self.frame_pool_frames = int(config.get('FRAME_POOL_FRAMES', 256))
+        self.disable_gc_during_acquire = bool(config.get('DISABLE_GC_DURING_ACQUIRE', True))
+        self.debug_callback_timing = bool(config.get('DEBUG_CALLBACK_TIMING', False))
+        self._gc_was_enabled = False
+        self.frame_bytes = 0
+        self._frame_pool = []
+        self._frame_pool_views = []
+        self._frame_pool_ptrs = []
+        self._free_frame_slots = queue.SimpleQueue()
         self.live_speck = config['USE_LIVE_SPECKLE']
         self.exposure = config['EXPOSURE_TIME'] # in ms
         self.analog_gain = float(config['ANALOG_GAIN'])
@@ -140,6 +150,9 @@ class App(object):
         self.hCamera = None
         self.session_frames_written = 0
         self.session_preview_frames_saved = 0
+        self.session_callback_timing_count = 0
+        self.session_callback_timing_total_s = 0.0
+        self.session_callback_timing_max_s = 0.0
         self.on_logic_analyzer_terminated = None
 
         self.exp_thread = None
@@ -337,6 +350,58 @@ class App(object):
         except queue.Full:
             self.save_overflow = True
             return False
+
+    def _configure_frame_pool(self):
+        if not hasattr(self, 'width') or not hasattr(self, 'height'):
+            return
+
+        bytes_per_pixel = np.dtype(self.dtype).itemsize
+        self.frame_bytes = int(self.width) * int(self.height) * int(bytes_per_pixel)
+        if self.frame_bytes <= 0:
+            raise RuntimeError('Invalid frame size while configuring callback frame pool.')
+
+        target_frames = max(8, min(int(self.frame_pool_frames), int(self.save_queue_max_frames)))
+        self._frame_pool = [bytearray(self.frame_bytes) for _ in range(target_frames)]
+        self._frame_pool_views = [memoryview(buf) for buf in self._frame_pool]
+        self._frame_pool_ptrs = [(mvsdk.c_ubyte * self.frame_bytes).from_buffer(buf) for buf in self._frame_pool]
+        self._free_frame_slots = queue.SimpleQueue()
+        for i in range(target_frames):
+            self._free_frame_slots.put(i)
+
+        if target_frames < int(self.save_queue_max_frames):
+            print(
+                f"Warning: FRAME_POOL_FRAMES ({target_frames}) < SAVE_QUEUE_MAX_FRAMES ({self.save_queue_max_frames}). "
+                "In-flight save frames are limited by the pool size."
+            )
+        print(f"Preallocated callback frame pool: {target_frames} frame(s), {self.frame_bytes / (1024 * 1024):.2f} MiB per frame")
+
+    def _acquire_frame_slot(self):
+        try:
+            return self._free_frame_slots.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _release_frame_slot(self, slot_idx):
+        if slot_idx is None:
+            return
+        self._free_frame_slots.put(slot_idx)
+
+    def _frame_view_from_slot(self, slot_idx, nbytes):
+        return self._frame_pool_views[int(slot_idx)][:int(nbytes)]
+
+    def _disable_gc_if_configured(self):
+        if not self.disable_gc_during_acquire:
+            return
+        self._gc_was_enabled = gc.isenabled()
+        if self._gc_was_enabled:
+            gc.disable()
+            print('GC disabled during acquisition to reduce callback jitter.')
+
+    def _restore_gc_state(self):
+        if self._gc_was_enabled and not gc.isenabled():
+            gc.enable()
+            print('GC re-enabled after acquisition.')
+        self._gc_was_enabled = False
 
     def _ensure_unique_filename(self):
         if not self.save_dir_ready or self.save_dir is None:
@@ -723,6 +788,17 @@ class App(object):
                 'estimated_total_triggered_frames': estimated_total_triggered_frames,
             },
         }
+
+        if self.debug_callback_timing and self.session_callback_timing_count > 0:
+            callback_mean_s = self.session_callback_timing_total_s / self.session_callback_timing_count
+            metadata['callback_timing'] = {
+                'enabled': True,
+                'count': int(self.session_callback_timing_count),
+                'total_seconds': float(self.session_callback_timing_total_s),
+                'mean_ms': float(callback_mean_s * 1000.0),
+                'max_ms': float(self.session_callback_timing_max_s * 1000.0),
+            }
+
         np.save(os.path.join(self.save_dir, '{}.npy'.format(self.filename)), metadata)
 
         cam_gap = metadata['timestamp_gap_analysis']['camera_timestamp']
@@ -734,6 +810,21 @@ class App(object):
             f"estimated_total_triggered={metadata['timestamp_gap_analysis']['estimated_total_triggered_frames']}"
         )
         print(summary)
+
+        if self.debug_callback_timing and self.session_callback_timing_count > 0:
+            callback_mean_s = self.session_callback_timing_total_s / self.session_callback_timing_count
+            callback_summary = (
+                f"Callback timing: count={self.session_callback_timing_count}, "
+                f"total={self.session_callback_timing_total_s:.6f}s, "
+                f"mean={callback_mean_s * 1000.0:.3f}ms, "
+                f"max={self.session_callback_timing_max_s * 1000.0:.3f}ms"
+            )
+            print(callback_summary)
+            try:
+                self.experiment_status_callback(callback_summary)
+            except Exception as exc:
+                print(f"Warning: failed to publish callback timing summary status: {exc}")
+
         try:
             self.experiment_status_callback(summary)
         except Exception as exc:
@@ -791,11 +882,20 @@ class App(object):
             'estimated_missing_frames': estimated_missing_frames,
         }
 
+    def _record_callback_timing(self, elapsed_s):
+        self.session_callback_timing_count += 1
+        self.session_callback_timing_total_s += float(elapsed_s)
+        if elapsed_s > self.session_callback_timing_max_s:
+            self.session_callback_timing_max_s = float(elapsed_s)
+
     def _reset_save_session_metadata(self):
         self.session_frames_written = 0
         self.session_frame_timestamps = []
         self.session_sys_clock_timestamps = []
         self.session_preview_frames_saved = 0
+        self.session_callback_timing_count = 0
+        self.session_callback_timing_total_s = 0.0
+        self.session_callback_timing_max_s = 0.0
 
     def _save_initial_frame_tiff(self, frame_data):
         if self.session_preview_frames_saved >= 2:
@@ -855,15 +955,24 @@ class App(object):
 
         def flush_batch(force_flush=False):
             nonlocal last_flush_time
-            if not write_batch or self.save_file_handle is None or getattr(self.save_file_handle, 'closed', False):
+            if not write_batch:
+                return
+
+            if self.save_file_handle is None or getattr(self.save_file_handle, 'closed', False):
+                for slot_idx, _ in write_batch:
+                    self._release_frame_slot(slot_idx)
+                write_batch.clear()
+                ts_batch.clear()
+                sys_ts_batch.clear()
                 return
 
             n = len(write_batch)
             h, w = int(self.height), int(self.width)
+            source_views = [self._frame_view_from_slot(slot_idx, nbytes) for slot_idx, nbytes in write_batch]
 
             # b''.join: single C-level allocation + memcpy.
             # frombuffer: zero-copy view.
-            raw = np.frombuffer(b''.join(write_batch), dtype=self.dtype).reshape(n, h, w)
+            raw = np.frombuffer(b''.join(source_views), dtype=self.dtype).reshape(n, h, w)
 
             if self.software_mirror_horizontal:
                 # Fallback path when CameraFlipFrameBuffer fails at runtime.
@@ -891,6 +1000,8 @@ class App(object):
             except (OSError, ValueError) as exc:
                 print(f"Warning: failed to write frame batch to save file: {exc}")
                 self._close_save_file_handle()
+                for slot_idx, _ in write_batch:
+                    self._release_frame_slot(slot_idx)
                 write_batch.clear(); ts_batch.clear(); sys_ts_batch.clear()
                 return
 
@@ -905,6 +1016,8 @@ class App(object):
                 self.save_file_handle.flush()
                 last_flush_time = time.time()
 
+            for slot_idx, _ in write_batch:
+                self._release_frame_slot(slot_idx)
             write_batch.clear()
             ts_batch.clear()
             sys_ts_batch.clear()
@@ -943,7 +1056,8 @@ class App(object):
                     continue
 
                 write_batch.append(frame_data)
-                self._save_initial_frame_tiff(frame_data)
+                slot_idx, nbytes = frame_data
+                self._save_initial_frame_tiff(self._frame_view_from_slot(slot_idx, nbytes))
                 ts_batch.append(timestamp)
                 sys_ts_batch.append(sys_stamp)
                 if len(write_batch) >= flush_every_n_frames:
@@ -961,7 +1075,8 @@ class App(object):
                         break
 
                     write_batch.append(frame_data)
-                    self._save_initial_frame_tiff(frame_data)
+                    slot_idx, nbytes = frame_data
+                    self._save_initial_frame_tiff(self._frame_view_from_slot(slot_idx, nbytes))
                     ts_batch.append(timestamp)
                     sys_ts_batch.append(sys_stamp)
                     if len(write_batch) >= flush_every_n_frames:
@@ -1043,6 +1158,8 @@ class App(object):
 
         # Let the SDK's internal image capture thread start working
         mvsdk.CameraPlay(self.hCamera)
+        self._configure_frame_pool()
+        self._disable_gc_if_configured()
 
         # Set the capture callback function
         self.quit = False
@@ -1097,8 +1214,12 @@ class App(object):
         print("\n")  # Ensure to move to a new line after quitting
         # Uninitialize camera
         mvsdk.CameraUnInit(self.hCamera)
+        self._restore_gc_state()
     @mvsdk.method(mvsdk.CAMERA_SNAP_PROC)
     def GrabCallback(self, hCamera, pRawData, pFrameHead, pContext):
+        timing_active = self.debug_callback_timing and self.saving
+        callback_t0 = time.perf_counter() if timing_active else None
+
         if self.quit:
             #print("Returning without adding frames to the list")
             return
@@ -1118,7 +1239,30 @@ class App(object):
                 )
                 self.software_mirror_horizontal = True
 
-        frame_data = bytes((mvsdk.c_ubyte * FrameHead.uBytes).from_address(pRawData))
+        frame_nbytes = int(FrameHead.uBytes)
+        frame_slot = None
+        display_frame_data = None
+        wants_display = self.frame_output_queue is not None
+
+        if self.saving and self._frame_pool_ptrs:
+            frame_slot = self._acquire_frame_slot()
+            if frame_slot is None:
+                self.save_overflow = True
+                self.dropped_save_frames += 1
+                mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+                if timing_active:
+                    self._record_callback_timing(time.perf_counter() - callback_t0)
+                return
+            nbytes = min(frame_nbytes, self.frame_bytes)
+            ctypes.memmove(self._frame_pool_ptrs[frame_slot], pRawData, nbytes)
+
+            # Reuse pooled bytes for display when possible (avoid a second SDK-buffer copy).
+            if wants_display:
+                display_frame_data = bytes(self._frame_view_from_slot(frame_slot, nbytes))
+        elif wants_display:
+            # No save slot available (not saving): copy directly from SDK buffer for display.
+            display_frame_data = bytes((mvsdk.c_ubyte * frame_nbytes).from_address(pRawData))
+
         mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
 
         if not self.acquiring:
@@ -1128,13 +1272,20 @@ class App(object):
 
         if self.saving:
             frame_timestamp = time.time()
-            if not self._enqueue_save_frame(frame_data, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp):
+            queued_ref = (frame_slot, min(frame_nbytes, self.frame_bytes))
+            if not self._enqueue_save_frame(queued_ref, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp):
+                self._release_frame_slot(frame_slot)
                 self.dropped_save_frames += 1
+                if timing_active:
+                    self._record_callback_timing(time.perf_counter() - callback_t0)
                 return
         # Stop addding to the display queue if the frame queue is getting too full
-        if self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize:
-            self._put_display_frame(frame_data, self.frame_count)
+        if wants_display and self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize and display_frame_data is not None:
+            self._put_display_frame(display_frame_data, self.frame_count)
         self.frame_count += 1
+
+        if timing_active:
+            self._record_callback_timing(time.perf_counter() - callback_t0)
 
 def main():
     raise SystemExit("Standalone simple_cam_mx execution is disabled. Launch camstim.py instead.")
@@ -1143,7 +1294,13 @@ def main():
 def run_camera_worker(config, frame_output_queue=None, command_queue=None, status_queue=None):
     app = App(config, frame_output_queue=frame_output_queue, command_queue=command_queue, status_queue=status_queue)
     app.save_thread.start()
-    app.main()
+    try:
+        app.main()
+    finally:
+        app.quit = True
+        if app.save_thread.is_alive():
+            app.save_thread.join(timeout=10.0)
+        app._restore_gc_state()
 
 if __name__ == '__main__':
     main()

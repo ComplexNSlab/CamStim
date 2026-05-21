@@ -45,6 +45,7 @@ UART Command Format (send via serial terminal or script):
     3. "Q" = Stop all TTLs and reset session
 
 Example S for testing: S 50 18000 1000 0 0 1 1000
+Example S for testing: S 60 16000 500 0 1 1 1000
 
 NOTE: The current version of this code does not use hardware timers, to first see if the Teensy is fast enough as is. Happy to add this functionality later if needed.
 */

@@ -32,6 +32,19 @@ def load_runtime_config():
     if not sigrok_exe:
         raise Exception(f"SIGROK_EXE missing in {config_path}")
 
+    # Resolve sigrok_exe to absolute path if possible
+    exe_path = Path(sigrok_exe)
+    if not exe_path.is_absolute():
+        # Try to resolve relative to repo root or system PATH
+        repo_candidate = Path(__file__).resolve().parent.parent / sigrok_exe
+        if repo_candidate.exists():
+            sigrok_exe = str(repo_candidate)
+        else:
+            # Fallback: use as-is (system PATH)
+            sigrok_exe = str(sigrok_exe)
+    else:
+        sigrok_exe = str(exe_path)
+
     return save_root, sigrok_exe
 
 
@@ -57,36 +70,40 @@ def listen_for_stop_thread():
     global stop_flag
     print("\nListening for STOP command (type 'STOP' and press Enter)...")
 
-    if msvcrt is not None:
-        print("(Typing is not echoed - just type STOP and press Enter)")
-        buffer = ''
-        while not stop_flag:
-            try:
-                if msvcrt.kbhit():
-                    char = msvcrt.getch().decode('utf-8', errors='ignore')
-
-                    if char == '\r':  # Enter key
-                        if buffer.upper() == 'STOP':
-                            print("\n\n✓ STOP command received!", flush=True)
-                            stop_flag = True
-                            break
-                        print(f"\n[Received: {buffer}] - not STOP", flush=True)
-                        buffer = ''
-                    elif char == '\b':  # Backspace
-                        buffer = buffer[:-1]
-                    else:
-                        buffer += char
-            except Exception:
-                pass
+    # Always listen for STOP on stdin, regardless of platform
+    print("(Type STOP and press Enter in this terminal, or send STOP on stdin)")
+    buffer = ''
+    while not stop_flag:
+        # Check msvcrt for keypresses (Windows), but always check stdin non-blocking
+        try:
+            if msvcrt is not None and msvcrt.kbhit():
+                char = msvcrt.getch().decode('utf-8', errors='ignore')
+                if char == '\r':  # Enter key
+                    if buffer.upper() == 'STOP':
+                        print("\n\n✓ STOP command received!", flush=True)
+                        stop_flag = True
+                        break
+                    print(f"\n[Received: {buffer}] - not STOP", flush=True)
+                    buffer = ''
+                elif char == '\b':  # Backspace
+                    buffer = buffer[:-1]
+                else:
+                    buffer += char
+        except Exception:
+            pass
+        # Non-blocking check for stdin (works on Unix, and on Windows if piped)
+        import select
+        try:
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                line = sys.stdin.readline()
+                if line.strip().upper() == 'STOP':
+                    print("\n\n✓ STOP command received!", flush=True)
+                    stop_flag = True
+                    break
+        except Exception:
             time.sleep(0.1)
-        return
-
-    # Linux/macOS path: read stdin line-by-line so parent process can send STOP.
-    for line in sys.stdin:
-        if line.strip().upper() == 'STOP':
-            print("\n\n✓ STOP command received!", flush=True)
-            stop_flag = True
-            break
+            continue
+        time.sleep(0.05)
 
 def capture_sigrok_continuous(sigrok_exe, output_file, samplerate="20kHz"):
     """Start sigrok-cli with proper process handling and streaming output."""
@@ -164,10 +181,21 @@ def main():
     else:
         base_filename = f"{mouse_id}_{experiment_id}"
 
-    output_file = save_dir / f"{base_filename}.sr"
-    
+    # --- Output file collision handling ---
+    candidate = base_filename
+    suffix = 1
+    while True:
+        output_file = save_dir / f"{candidate}.sr"
+        if not output_file.exists():
+            break
+        candidate = f"{base_filename}_{suffix}"
+        suffix += 1
+    if candidate != base_filename:
+        print(f"Warning: .sr file exists for '{base_filename}'. Using '{candidate}' instead.")
+    # --- End collision handling ---
+
     samplerate = "20kHz"
-    
+
     print(f"\n{'-'*60}")
     print(f"LOGIC ANALYZER RECORDING")
     print(f"{'-'*60}")

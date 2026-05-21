@@ -19,7 +19,9 @@
 
 #     3. "Q" = Stop all TTLs and reset session
 
-# Example S for testing: S 50 18000 1000 0 0 1 1000
+# Example S for testing (50 fps 18ms exposure): S 50 19000 500 0 1 1 1000
+# Example S for testing (60 fps 15ms exposure): S 60 16000 500 0 1 1 1000
+# Example S for testing (80 fps 12ms exposure): S 80 12400 200 0 1 1 1000
 
 # See WF_Teensy40_V3.ino for script.
 

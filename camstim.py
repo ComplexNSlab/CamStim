@@ -367,6 +367,7 @@ class CameraGUI(QMainWindow):
 		self.last_stats_time = None
 		self.last_stats_frame_count = 0
 		self.fps_samples = deque(maxlen=100)
+		self.experiment_list_cache = None
 		self.last_display_frame = None
 		self.exp_status_timer = QTimer()
 		self.exp_status_timer.timeout.connect(self.check_experiment_status)
@@ -820,18 +821,26 @@ class CameraGUI(QMainWindow):
 
 		return panel
 
-	def populate_experiment_controls(self):
+	def populate_experiment_controls(self, force_refresh=False):
+		previous_selection = self.exp_combo.currentText().strip()
+
+		if force_refresh or self.experiment_list_cache is None:
+			experiment_list = []
+			if self.camera_app and getattr(self.camera_app, 'exp_list', None):
+				experiment_list = self.camera_app.exp_list
+			else:
+				try:
+					experiment_list = get_experiment_list()
+				except Exception as e:
+					self.update_status(f"Error loading experiment list: {e}.")
+			if experiment_list:
+				self.experiment_list_cache = list(experiment_list)
+
+		experiment_list = self.experiment_list_cache or []
+
 		self.exp_combo.clear()
 		# Keep index 0 empty so the user must explicitly choose an experiment.
 		self.exp_combo.addItem("")
-		experiment_list = []
-		if self.camera_app and getattr(self.camera_app, 'exp_list', None):
-			experiment_list = self.camera_app.exp_list
-		else:
-			try:
-				experiment_list = get_experiment_list()
-			except Exception as e:
-				self.update_status(f"Error loading experiment list: {e}.")
 
 		if not experiment_list:
 			self.exp_combo.setCurrentIndex(0)
@@ -839,7 +848,10 @@ class CameraGUI(QMainWindow):
 			return
 
 		self.exp_combo.addItems(experiment_list)
-		self.exp_combo.setCurrentIndex(0)
+		if previous_selection and previous_selection in experiment_list:
+			self.exp_combo.setCurrentText(previous_selection)
+		else:
+			self.exp_combo.setCurrentIndex(0)
 		self.exp_combo.setEnabled(True)
 
 	def get_selected_experiment_params(self):
@@ -867,8 +879,64 @@ class CameraGUI(QMainWindow):
 		self.stats_timer = QTimer()
 		self.stats_timer.timeout.connect(self.update_stats)
 
-	def start_camera(self):
+	def _validate_exposure_timing_before_start(self):
+		teensy_path = CONFIG_DIR / 'teensyParams.yaml'
 		try:
+			with open(teensy_path, 'r') as f:
+				teensy_cfg = yaml.safe_load(f) or {}
+		except Exception as e:
+			msg = f"Could not read Teensy timing config ({teensy_path}): {e}."
+			QMessageBox.warning(self, "Start Camera Blocked", msg)
+			self.update_status(msg)
+			return False
+
+		try:
+			f_led_hz = float(teensy_cfg['F_LED'])
+			o_cam_us = float(teensy_cfg['O_CAM'])
+			exposure_ms = float(self.exposure_spin.value())
+		except (KeyError, TypeError, ValueError) as e:
+			msg = (
+				"Invalid Teensy timing parameters. Ensure F_LED (Hz) and O_CAM (us) are valid numeric values in "
+				f"{teensy_path}."
+			)
+			QMessageBox.warning(self, "Start Camera Blocked", msg)
+			self.update_status(msg)
+			return False
+
+		if f_led_hz <= 0:
+			msg = f"Invalid F_LED={f_led_hz}. F_LED must be > 0 Hz."
+			QMessageBox.warning(self, "Start Camera Blocked", msg)
+			self.update_status(msg)
+			return False
+
+		max_exposure_ms = (1000.0 / f_led_hz) - (o_cam_us / 1000.0)
+		if max_exposure_ms <= 0:
+			msg = (
+				"Invalid Teensy timing: computed max exposure is <= 0 ms. "
+				f"(F_LED={f_led_hz} Hz, O_CAM={o_cam_us} us, max={max_exposure_ms:.3f} ms)"
+			)
+			QMessageBox.warning(self, "Start Camera Blocked", msg)
+			self.update_status(msg)
+			return False
+
+		if exposure_ms >= max_exposure_ms:
+			msg = (
+				"Exposure timing check failed. "
+				f"Exposure ({exposure_ms:.3f} ms) must be smaller than (1/F_LED - O_CAM) = {max_exposure_ms:.3f} ms "
+				f"(F_LED={f_led_hz:g} Hz, O_CAM={o_cam_us:g} us)."
+			)
+			QMessageBox.warning(self, "Start Camera Blocked", msg)
+			self.update_status(msg)
+			return False
+
+		return True
+
+	def start_camera(self):
+		if not self._validate_exposure_timing_before_start():
+			return
+
+		try:
+			selected_experiment_before_start = self.exp_combo.currentText().strip()
 			self.camera_app = CameraProcessClient(self.config)
 			self.camera_app.start()
 			self.display_target_size = self.video_label.size()
@@ -892,7 +960,14 @@ class CameraGUI(QMainWindow):
 			self.teensy_toggle_btn.setText("Enable Teensy")
 			self.exp_btn.setEnabled(False)
 			self.preview_btn.setEnabled(True)
-			self.populate_experiment_controls()
+			self.populate_experiment_controls(force_refresh=False)
+			if selected_experiment_before_start and selected_experiment_before_start in (self.experiment_list_cache or []):
+				self.exp_combo.setCurrentText(selected_experiment_before_start)
+
+			# Preserve the GUI exposure value across camera restarts.
+			exposure_value = float(self.exposure_spin.value())
+			self.camera_app.exposure = exposure_value
+			self.camera_app.set_exposure(exposure_value)
 			self._sync_gain_spinner_with_camera()
 
 			self.load_and_display_camera_config()
@@ -991,13 +1066,13 @@ class CameraGUI(QMainWindow):
 		self.hardware_trigger_enabled = False
 		self.exp_btn.setEnabled(False)
 		self.preview_btn.setEnabled(False)
+		self.exp_combo.setEnabled(False)
 		if hasattr(self, 'gain_spin'):
 			self.gain_spin.setEnabled(False)
 		self.video_label.setText(f"camstim {self.app_version}\n\nCamera Stopped.")
 		self.display_target_size = None
 		self.cam_config_display.setText("Camera stopped. \n\n Start camera to begin.")
 		self.current_cam_config = None
-		self.populate_experiment_controls()
 		self.update_status("Camera Stopped.")
 
 	def update_display(self):
