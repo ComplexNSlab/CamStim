@@ -15,6 +15,10 @@ import subprocess
 import shutil
 from collections import deque
 import cv2
+try:
+    import cgrabcallback as _cgrabcallback
+except ImportError:
+    _cgrabcallback = None
 
 
 def _load_app_version(default='0.0.0'):
@@ -364,6 +368,8 @@ class App(object):
         self._frame_pool = [bytearray(self.frame_bytes) for _ in range(target_frames)]
         self._frame_pool_views = [memoryview(buf) for buf in self._frame_pool]
         self._frame_pool_ptrs = [(mvsdk.c_ubyte * self.frame_bytes).from_buffer(buf) for buf in self._frame_pool]
+        # Cache raw integer addresses of pool slot buffers for zero-overhead fast_memcpy.
+        self._frame_pool_addrs = [ctypes.addressof(ptr) for ptr in self._frame_pool_ptrs]
         self._free_frame_slots = queue.SimpleQueue()
         for i in range(target_frames):
             self._free_frame_slots.put(i)
@@ -1254,7 +1260,13 @@ class App(object):
                     self._record_callback_timing(time.perf_counter() - callback_t0)
                 return
             nbytes = min(frame_nbytes, self.frame_bytes)
-            ctypes.memmove(self._frame_pool_ptrs[frame_slot], pRawData, nbytes)
+            if _cgrabcallback is not None:
+                # pRawData may be a ctypes pointer object on some SDK builds (common on Windows);
+                # cast to c_void_p to get a plain integer before passing to fast_memcpy.
+                src_addr = ctypes.cast(pRawData, ctypes.c_void_p).value
+                _cgrabcallback.fast_memcpy(self._frame_pool_addrs[frame_slot], src_addr, nbytes)
+            else:
+                ctypes.memmove(self._frame_pool_ptrs[frame_slot], pRawData, nbytes)
 
             # Reuse pooled bytes for display when possible (avoid a second SDK-buffer copy).
             if wants_display:

@@ -1,3 +1,12 @@
+# 2026-05-20 (2)
+- Added `utils/cgrabcallback.c` — a C extension that replaces `ctypes.memmove` in the camera `GrabCallback` hot path with a direct address-to-address `memcpy`, eliminating Python object creation overhead per frame.
+  - Exposes `fast_memcpy(dst_addr, src_addr, nbytes)` (raw integer pointer addresses) and `fast_memcpy_from_buf(dst_addr, src_buffer, nbytes)` (Python buffer as source).
+  - `simple_cam_mx.py` imports the extension with a graceful `ImportError` fallback to `ctypes.memmove` when the `.so`/`.pyd` is not present.
+  - `pRawData` is now cast through `ctypes.cast(..., c_void_p).value` before the call, ensuring compatibility on Windows where the mvsdk may pass a ctypes pointer object instead of a plain integer.
+  - Frame pool slot addresses are cached once in `_configure_frame_pool` (`self._frame_pool_addrs`) so no per-frame address lookup is needed in the callback.
+- Added `utils/setup.py` build script for the C extension (setuptools, Python 3.10).
+- Updated `README.md` Installation section with step-by-step build instructions for both macOS/Linux and Windows (including required MSVC Build Tools prerequisite).
+
 # 2026-05-20
 - Major camera framegrab callback and save pipeline improvements:
 	- Refactored threading and queueing for camera acquisition and save path to eliminate queue corruption and runaway save queue issues.

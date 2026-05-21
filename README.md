@@ -74,7 +74,37 @@ camstim/
    ```
    `RetinotopyExperiment` imports `WarpedVisualStim` from `external/WarpedVisualStim`.
 
-4. **Verify installation:**
+4. **Build the camera acquisition C extension (`cgrabcallback`):**
+
+   The C extension provides a fast `memcpy` path in the camera callback, avoiding Python object
+   creation overhead in the hot path. It is optional — `simple_cam_mx.py` falls back to
+   `ctypes.memmove` automatically if the extension is not present.
+
+   **macOS / Linux:**
+   ```bash
+   conda activate camstim
+   cd utils
+   python setup.py build_ext --inplace
+   ```
+
+   **Windows:**
+
+   Prerequisites (one-time setup):
+   - Install [Build Tools for Visual Studio 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+     and select the **"Desktop development with C++"** workload.
+
+   Then build from a **conda-enabled command prompt** (e.g. Anaconda Prompt):
+   ```bat
+   conda activate camstim
+   cd utils
+   python setup.py build_ext --inplace
+   ```
+   This produces `cgrabcallback.cpython-310-win_amd64.pyd` in `utils/`.
+
+   > **Note:** The `.so` / `.pyd` file is platform- and Python-version-specific and is not
+   > committed to the repository. It must be rebuilt on each machine.
+
+5. **Verify installation:**
    ```bash
    python -c "from core.BaseExperiment import BaseExperiment; print('✓ Installation successful')"
    ```
