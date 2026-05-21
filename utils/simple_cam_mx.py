@@ -16,7 +16,7 @@ import shutil
 from collections import deque
 import cv2
 try:
-    import cgrabcallback as _cgrabcallback
+    from . import cgrabcallback as _cgrabcallback
 except ImportError:
     _cgrabcallback = None
 
@@ -240,6 +240,120 @@ class App(object):
             'analog_gain': float(self.analog_gain),
         })
 
+    def _report_frame_grab_implementation(self):
+        if _cgrabcallback is not None:
+            message = 'Frame grab implementation: C extension (cgrabcallback.fast_memcpy).'
+        else:
+            message = 'Frame grab implementation: Python fallback (ctypes.memmove).'
+
+        print(message)
+        self._publish_status({'type': 'status', 'message': message})
+
+    def _clear_pending_frames(self):
+        while True:
+            try:
+                queued = self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            try:
+                frame_ref = queued[0]
+                if isinstance(frame_ref, tuple) and len(frame_ref) == 2:
+                    slot_idx, _ = frame_ref
+                    self._release_frame_slot(slot_idx)
+            except Exception:
+                continue
+
+    def _apply_roi(self, payload):
+        if not self.hCamera:
+            raise RuntimeError('Camera is not initialized.')
+        if self.saving:
+            raise RuntimeError('Cannot change ROI while saving.')
+
+        try:
+            x = int(payload['x'])
+            y = int(payload['y'])
+            width = int(payload['width'])
+            height = int(payload['height'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f'Invalid ROI payload: {exc}')
+
+        if width <= 1 or height <= 1:
+            raise RuntimeError('ROI width and height must be larger than 1 pixel.')
+
+        cap = mvsdk.CameraGetCapability(self.hCamera)
+        res_range = cap.sResolutionRange
+        max_width = int(res_range.iWidthMax)
+        max_height = int(res_range.iHeightMax)
+
+        x = max(0, min(x, max_width - 2))
+        y = max(0, min(y, max_height - 2))
+        width = max(2, min(width, max_width - x))
+        height = max(2, min(height, max_height - y))
+
+        # Many cameras require even ROI coordinates and extents.
+        x -= (x % 2)
+        y -= (y % 2)
+        width -= (width % 2)
+        height -= (height % 2)
+        width = max(2, width)
+        height = max(2, height)
+
+        current_res = mvsdk.CameraGetImageResolution(self.hCamera)
+        current_res.iIndex = 0xFF
+        current_res.iHOffsetFOV = x
+        current_res.iVOffsetFOV = y
+        current_res.iWidthFOV = width
+        current_res.iHeightFOV = height
+        current_res.iWidth = width
+        current_res.iHeight = height
+        current_res.iWidthZoomHd = 0
+        current_res.iHeightZoomHd = 0
+        current_res.iWidthZoomSw = 0
+        current_res.iHeightZoomSw = 0
+        current_res.uBinSumMode = 0
+        current_res.uBinAverageMode = 0
+        current_res.uSkipMode = 0
+
+        mvsdk.CameraPause(self.hCamera)
+        try:
+            err_code = mvsdk.CameraSetImageResolution(self.hCamera, current_res)
+            if err_code != mvsdk.CAMERA_STATUS_SUCCESS:
+                err_msg = mvsdk.CameraGetErrorString(err_code)
+                raise RuntimeError(f'CameraSetImageResolution failed (err={err_code}, {err_msg})')
+
+            applied_res = mvsdk.CameraGetImageResolution(self.hCamera)
+            self.width = int(applied_res.iWidth)
+            self.height = int(applied_res.iHeight)
+            self._clear_pending_frames()
+            self._configure_frame_pool()
+            self.ready_state_published = False
+            self._publish_ready_state()
+            self._publish_status({
+                'type': 'roi_applied',
+                'x': int(applied_res.iHOffsetFOV),
+                'y': int(applied_res.iVOffsetFOV),
+                'width': int(applied_res.iWidth),
+                'height': int(applied_res.iHeight),
+            })
+        finally:
+            mvsdk.CameraPlay(self.hCamera)
+
+    def _reset_roi(self):
+        if not self.hCamera:
+            raise RuntimeError('Camera is not initialized.')
+        if self.saving:
+            raise RuntimeError('Cannot change ROI while saving.')
+
+        cap = mvsdk.CameraGetCapability(self.hCamera)
+        res_range = cap.sResolutionRange
+        self._apply_roi({
+            'x': 0,
+            'y': 0,
+            'width': int(res_range.iWidthMax),
+            'height': int(res_range.iHeightMax),
+        })
+
     def _handle_command(self, command):
         if not command:
             return
@@ -261,7 +375,6 @@ class App(object):
                 mode = int(payload)
                 if self.hCamera:
                     mvsdk.CameraSetTriggerMode(self.hCamera, mode)
-                self.saving = (mode == 2)
                 self._publish_status({'type': 'trigger_mode', 'mode': mode})
             elif name == 'set_exposure':
                 exposure_ms = float(payload)
@@ -273,6 +386,10 @@ class App(object):
                 gain = float(payload)
                 applied_gain = self._apply_analog_gain_multiplier(gain)
                 self._publish_status({'type': 'gain', 'value': applied_gain})
+            elif name == 'set_roi':
+                self._apply_roi(payload)
+            elif name == 'reset_roi':
+                self._reset_roi()
             elif name == 'set_saving':
                 self.saving = bool(payload)
                 self._publish_status({'type': 'saving', 'value': self.saving})
@@ -488,6 +605,282 @@ class App(object):
             return
 
         print(f"Horizontal mirror enabled via CameraFlipFrameBuffer (flags={self.mirror_flip_flags}).")
+
+    def _probe_camera_setting(self, key, getter):
+        try:
+            value = getter(self.hCamera)
+            err_code = mvsdk.GetLastError()
+            err_msg = '' if err_code == mvsdk.CAMERA_STATUS_SUCCESS else mvsdk.CameraGetErrorString(err_code)
+            return {
+                'key': key,
+                'ok': bool(err_code == mvsdk.CAMERA_STATUS_SUCCESS),
+                'value': value,
+                'error_code': int(err_code),
+                'error_message': err_msg,
+            }
+        except Exception as exc:
+            return {
+                'key': key,
+                'ok': False,
+                'value': None,
+                'error_code': None,
+                'error_message': str(exc),
+            }
+
+    def _probe_camera_setting_with_arg(self, key, getter, arg):
+        try:
+            value = getter(self.hCamera, arg)
+            err_code = mvsdk.GetLastError()
+            err_msg = '' if err_code == mvsdk.CAMERA_STATUS_SUCCESS else mvsdk.CameraGetErrorString(err_code)
+            return {
+                'key': key,
+                'ok': bool(err_code == mvsdk.CAMERA_STATUS_SUCCESS),
+                'value': value,
+                'error_code': int(err_code),
+                'error_message': err_msg,
+            }
+        except Exception as exc:
+            return {
+                'key': key,
+                'ok': False,
+                'value': None,
+                'error_code': None,
+                'error_message': str(exc),
+            }
+
+    def _probe_image_resolution(self):
+        try:
+            res = mvsdk.CameraGetImageResolution(self.hCamera)
+            err_code = mvsdk.GetLastError()
+            err_msg = '' if err_code == mvsdk.CAMERA_STATUS_SUCCESS else mvsdk.CameraGetErrorString(err_code)
+            return {
+                'key': 'image_resolution',
+                'ok': bool(err_code == mvsdk.CAMERA_STATUS_SUCCESS),
+                'value': f"{res.iWidth}x{res.iHeight}",
+                'error_code': int(err_code),
+                'error_message': err_msg,
+            }
+        except Exception as exc:
+            return {
+                'key': 'image_resolution',
+                'ok': False,
+                'value': None,
+                'error_code': None,
+                'error_message': str(exc),
+            }
+
+    def _report_strobe_settings(self):
+        if not self.hCamera:
+            return
+
+        probes = [
+            ('frame_speed', mvsdk.CameraGetFrameSpeed),
+            ('trigger_mode', mvsdk.CameraGetTriggerMode),
+            ('trigger_delay_us', mvsdk.CameraGetTriggerDelayTime),
+            ('trigger_count', mvsdk.CameraGetTriggerCount),
+            ('strobe_mode', mvsdk.CameraGetStrobeMode),
+            ('strobe_delay_us', mvsdk.CameraGetStrobeDelayTime),
+            ('strobe_pulse_width_us', mvsdk.CameraGetStrobePulseWidth),
+            ('strobe_polarity', mvsdk.CameraGetStrobePolarity),
+            ('ext_trig_signal_type', mvsdk.CameraGetExtTrigSignalType),
+            ('ext_trig_shutter_type', mvsdk.CameraGetExtTrigShutterType),
+            ('ext_trig_delay_us', mvsdk.CameraGetExtTrigDelayTime),
+            ('ext_trig_jitter_us', mvsdk.CameraGetExtTrigJitterTime),
+            ('ext_trig_capability_mask', mvsdk.CameraGetExtTrigCapability),
+        ]
+
+        report = [self._probe_camera_setting(key, getter) for key, getter in probes]
+        report.append(self._probe_image_resolution())
+        report.extend([
+            self._probe_camera_setting_with_arg('mirror_horizontal', mvsdk.CameraGetMirror, 0),
+            self._probe_camera_setting_with_arg('mirror_vertical', mvsdk.CameraGetMirror, 1),
+        ])
+        frame_speed_options = self._get_frame_speed_options()
+        resolution_modes, binning_support, binning_masks_raw = self._get_resolution_modes()
+
+        lines = ['Strobe/trigger settings at camera load:']
+        for item in report:
+            if item['ok']:
+                lines.append(f"  {item['key']}: {item['value']}")
+            else:
+                code = item['error_code']
+                msg = item['error_message'] or 'unknown error'
+                if code is None:
+                    lines.append(f"  {item['key']}: unavailable ({msg})")
+                else:
+                    lines.append(f"  {item['key']}: unavailable (err={code}, {msg})")
+        if frame_speed_options:
+            lines.append('  frame_speed_options:')
+            for option in frame_speed_options:
+                lines.append(
+                    f"    index={option['index']}: {option['description']}"
+                )
+        else:
+            lines.append('  frame_speed_options: unavailable')
+
+        if binning_support:
+            lines.append('  binning_support:')
+            for key in ('sum', 'average', 'skip'):
+                values = binning_support.get(key, [])
+                lines.append(f"    {key}: {', '.join(values) if values else 'none'}")
+            lines.append('  binning_masks_raw:')
+            lines.append(
+                f"    sum={binning_masks_raw.get('sum', 0)} "
+                f"average={binning_masks_raw.get('average', 0)} "
+                f"skip={binning_masks_raw.get('skip', 0)}"
+            )
+
+        if resolution_modes:
+            lines.append('  resolution_modes:')
+            for mode in resolution_modes:
+                lines.append(
+                    f"    index={mode['index']}: {mode['description']} | "
+                    f"out={mode['output']} fov={mode['fov']} "
+                    f"bin_sum={mode['bin_sum']} bin_avg={mode['bin_avg']} skip={mode['skip']}"
+                )
+        else:
+            lines.append('  resolution_modes: unavailable')
+        print('\n'.join(lines))
+
+        payload = {
+            'type': 'strobe_report',
+            'values': {item['key']: item for item in report},
+            'frame_speed_options': frame_speed_options,
+            'binning_support': binning_support,
+            'binning_masks_raw': binning_masks_raw,
+            'resolution_modes': resolution_modes,
+        }
+        self._publish_status(payload)
+
+    def _decode_binning_mask(self, mask_value):
+        mask = int(mask_value)
+        modes = []
+        for bit in range(32):
+            if not (mask & (1 << bit)):
+                continue
+            factor = bit + 2
+            modes.append(f"{factor}x{factor}")
+        return modes
+
+    def _format_binning_mode_value(self, value):
+        mode_value = int(value)
+        if mode_value <= 0:
+            return 'off'
+
+        # SDK comments define bit0=>2x2, bit1=>3x3..., so keep both decoded and raw.
+        if (mode_value & (mode_value - 1)) == 0:
+            factor = mode_value.bit_length() + 1
+            return f"{factor}x{factor} (mask={mode_value})"
+
+        return f"mask={mode_value}"
+
+    def _get_resolution_modes(self):
+        if not self.hCamera:
+            return [], {}, {}
+
+        try:
+            cap = mvsdk.CameraGetCapability(self.hCamera)
+        except Exception:
+            return [], {}, {}
+
+        res_range = cap.sResolutionRange
+        binning_support = {
+            'sum': self._decode_binning_mask(res_range.uBinSumModeMask),
+            'average': self._decode_binning_mask(res_range.uBinAverageModeMask),
+            'skip': self._decode_binning_mask(res_range.uSkipModeMask),
+        }
+        binning_masks_raw = {
+            'sum': int(res_range.uBinSumModeMask),
+            'average': int(res_range.uBinAverageModeMask),
+            'skip': int(res_range.uSkipModeMask),
+        }
+
+        modes = []
+        count = max(0, int(cap.iImageSizeDesc))
+        for idx in range(count):
+            try:
+                desc = cap.pImageSizeDesc[idx]
+                modes.append({
+                    'index': int(desc.iIndex),
+                    'description': desc.GetDescription(),
+                    'output': f"{int(desc.iWidth)}x{int(desc.iHeight)}",
+                    'fov': f"{int(desc.iWidthFOV)}x{int(desc.iHeightFOV)}",
+                    'bin_sum': self._format_binning_mode_value(desc.uBinSumMode),
+                    'bin_avg': self._format_binning_mode_value(desc.uBinAverageMode),
+                    'skip': self._format_binning_mode_value(desc.uSkipMode),
+                })
+            except Exception:
+                continue
+
+        return modes, binning_support, binning_masks_raw
+    def _get_frame_speed_options(self):
+        if not self.hCamera:
+            return []
+
+        try:
+            cap = mvsdk.CameraGetCapability(self.hCamera)
+        except Exception:
+            return []
+
+        options = []
+        count = max(0, int(cap.iFrameSpeedDesc))
+        for idx in range(count):
+            try:
+                desc = cap.pFrameSpeedDesc[idx]
+                options.append({
+                    'index': int(desc.iIndex),
+                    'description': desc.GetDescription(),
+                })
+            except Exception:
+                continue
+        return options
+
+    def _apply_startup_strobe_settings(self):
+        if not self.hCamera:
+            return
+
+        targets = [
+            ('strobe_mode', 1, mvsdk.CameraSetStrobeMode),
+            ('strobe_delay_us', 0, mvsdk.CameraSetStrobeDelayTime),
+            ('strobe_pulse_width_us', 500, mvsdk.CameraSetStrobePulseWidth),
+            ('strobe_polarity', 1, mvsdk.CameraSetStrobePolarity),
+        ]
+
+        results = []
+        lines = ['Applying startup strobe/trigger settings:']
+        for key, value, setter in targets:
+            err_code = None
+            err_msg = ''
+            ok = False
+            try:
+                err_code = setter(self.hCamera, value)
+                ok = (err_code == mvsdk.CAMERA_STATUS_SUCCESS)
+                if not ok:
+                    err_msg = mvsdk.CameraGetErrorString(err_code)
+            except Exception as exc:
+                err_msg = str(exc)
+
+            results.append({
+                'key': key,
+                'target': value,
+                'ok': bool(ok),
+                'error_code': None if err_code is None else int(err_code),
+                'error_message': err_msg,
+            })
+
+            if ok:
+                lines.append(f"  {key}={value}: ok")
+            else:
+                if err_code is None:
+                    lines.append(f"  {key}={value}: failed ({err_msg})")
+                else:
+                    lines.append(f"  {key}={value}: failed (err={err_code}, {err_msg})")
+
+        print('\n'.join(lines))
+        self._publish_status({
+            'type': 'strobe_apply',
+            'results': results,
+        })
 
     def experiment_status_callback(self, message):
         if hasattr(self, 'exp_status_queue'):
@@ -1105,6 +1498,7 @@ class App(object):
     def main(self):
         # Enumerate cameras
         self._boost_windows_camera_thread_priority()
+        self._report_frame_grab_implementation()
 
         DevList = mvsdk.CameraEnumerateDevice()
         nDev = len(DevList)
@@ -1147,14 +1541,15 @@ class App(object):
         self.width = applied_res.iWidth
         self.height = applied_res.iHeight
 
-        # Switch camera mode to continuous capture
-        mvsdk.CameraSetTriggerMode(self.hCamera, 0)
+        # Start with requested strobe-trigger profile for acquisition.
+        self._apply_startup_strobe_settings()
         # Switch the camera to full speed transmission
         mvsdk.CameraSetFrameSpeed(self.hCamera, 1)
         # Manual exposure, exposure time 
         mvsdk.CameraSetAeState(self.hCamera, 0)
         mvsdk.CameraSetExposureTime(self.hCamera, self.exposure * 1000)
         self._apply_analog_gain_multiplier(self.analog_gain)
+        self._report_strobe_settings()
         self._publish_ready_state()
 
         print(f"Camera resolution: {self.width}x{self.height}")

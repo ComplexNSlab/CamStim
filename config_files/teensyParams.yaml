@@ -26,12 +26,16 @@
 # See WF_Teensy40_V3.ino for script.
 
 
-port: "COM7" # port the teensy board is connected to via USB
+#port: "COM7" # port the teensy board is connected to via USB
+port: "/dev/cu.usbmodem185040201"
 BAUD: 115200 # leave this 
 
 F_LED: 50 # LED frequency in Hz
 E_LED: 18000 # Duration of LED pulse in microseconds
 O_CAM: 1000 # Delay from LED ON to TTL to Task Teensy (microseconds)
+# F_LED: 20 # LED frequency in Hz
+# E_LED: 28000 # Duration of LED pulse in microseconds
+# O_CAM: 1000 # Delay from LED ON to TTL to Task Teensy (microseconds)
 cam_start_mode: 0 # 0 = external TTL, 1 = 'X' command
 ttls_start_mode: 1 # 0 = external TTL, 1 = immediate ('S'), 2 = 'X'
 dual_mode: 1 # 0 = TTL on LED1 only, 1 = TTLs on both LEDs

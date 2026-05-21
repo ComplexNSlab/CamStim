@@ -1,43 +1,141 @@
-from abc import ABC, abstractmethod
-from core.ExperimentLogger import ExperimentLogger
 import os
-import time
+from pathlib import Path
+from time import sleep, time
+
+from core.ExperimentLogger import ExperimentLogger
 import yaml
 
-class SpontaneousActivity(ABC):
-	"""
-	Simplified spontaneous activity experiment: no psychopy, photodiode, or monitor info.
-	Loads wait time and experiment name from config_files/spontaneousActivity.yaml.
-	Logs experiment start/end and saves log file.
-	"""
+class SpontaneousActivity:
+    def __init__(
+        self,
+        experiment_id,
+        mouse_id,
+        daq,
+        monitor_config_filename,
+        save_settings_config_filename,
+        exp_config_filename,
+        debug,
+    ):
+        self.experiment_id = experiment_id
+        self.mouse_id = mouse_id
+        self.daq = daq
+        self.debug = debug
 
-	def __init__(self, experiment_id, mouse_id, daq=None, log_dir="./logs", config_path=None, *args, **kwargs):
-		self.experiment_id = experiment_id
-		self.mouse_id = mouse_id
-		self.daq = daq
-		self.experiment_running = False
-		self.log_dir = log_dir
-		os.makedirs(self.log_dir, exist_ok=True)
-		self.config_path = config_path or os.path.join(os.path.dirname(__file__), '../config_files/spontaneousActivity.yaml')
-		# Load config
-		with open(self.config_path, 'r') as f:
-			config = yaml.safe_load(f)
-		self.experiment_name = config.get('name', 'spontaneousActivity')
-		self.wait_time_sec = config.get('wait_time_sec', 300)
+        self.status_callback = None
+        self.trial_callback = None
+        self.acquisition_running = False
+        self.experiment_running = False
 
-		self.experiment_log_filename = os.path.join(self.log_dir, f"{self.experiment_id}_exp_log")
-		self.exp_log = ExperimentLogger(self.experiment_log_filename, self.experiment_id, self.mouse_id, self.log_dir, [])
-		# Save experiment name as exp_protocol, as in VisualFieldMapping
-		self.exp_protocol = self.experiment_name
-		self.exp_log.log['exp_parameters'] = self.exp_protocol
+        self.monitor_config_filename = self.resolve_config_path(monitor_config_filename)
+        self.save_settings_config_filename = self.resolve_config_path(save_settings_config_filename)
+        self.exp_parameters_filename = self.resolve_config_path(exp_config_filename)
 
-	def run_experiment(self):
-		self.experiment_running = True
-		print(f"Experiment {self.experiment_name} ({self.experiment_id}) for mouse {self.mouse_id} started.")
-		self.exp_log.log_exp_start(time.time())
-		print(f"Waiting for {self.wait_time_sec} seconds...")
-		time.sleep(self.wait_time_sec)
-		print("Experiment finished.")
-		self.exp_log.log_exp_end(time.time(), 0)
-		self.exp_log.save_log()
-		self.experiment_running = False
+        self.exp_parameters = None
+        self.exp_protocol = 'spontaneousActivity'
+        self.wait_time_sec = 300.0
+
+        self.save_dir = None
+        self.data_log_dir = None
+        self.experiment_log_filename = None
+        self.ni_log_filename = None
+        self._create_save_directories()
+
+        self.experiment_settings_filenames = [
+            self.monitor_config_filename,
+            self.save_settings_config_filename,
+            self.exp_parameters_filename,
+        ]
+        self.exp_log = ExperimentLogger(
+            self.experiment_log_filename,
+            self.experiment_id,
+            self.mouse_id,
+            self.data_log_dir,
+            self.experiment_settings_filenames,
+        )
+        self.daq.ni_log_filename = self.ni_log_filename
+        self.exp_log.log['daq_sampling_rate'] = self.daq.sampling_rate
+
+    @staticmethod
+    def resolve_config_path(config_filename):
+        config_path = Path(config_filename)
+        if config_path.is_absolute():
+            return str(config_path)
+
+        repo_root = Path(__file__).resolve().parent.parent
+        candidate_paths = [
+            repo_root / 'config_files' / config_path,
+            repo_root / config_path,
+        ]
+        for candidate in candidate_paths:
+            if candidate.is_file():
+                return str(candidate)
+
+        return str(config_path)
+
+    def _create_save_directories(self):
+        with open(self.save_settings_config_filename, 'r') as file:
+            save_settings = yaml.load(file, Loader=yaml.FullLoader)
+
+        save_root = save_settings.get('SAVE_DIR')
+        if not save_root:
+            raise Exception(f"SAVE_DIR missing in {self.save_settings_config_filename}")
+
+        self.save_dir = os.path.join(save_root, self.mouse_id, self.experiment_id)
+        self.data_log_dir = self.save_dir
+        self.experiment_log_filename = os.path.join(self.data_log_dir, f"{self.mouse_id}_{self.experiment_id}")
+        self.ni_log_filename = os.path.join(self.data_log_dir, f"{self.experiment_id}_ni_log.npy")
+
+        if not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir)
+        elif not self.debug:
+            raise Exception(f"Experiment ID: {self.experiment_id} already exists make new ID...")
+
+    def set_status_callback(self, callback):
+        self.status_callback = callback
+
+    def set_trial_callback(self, callback):
+        self.trial_callback = callback
+
+    def update_status(self, message):
+        if self.status_callback:
+            self.status_callback(message)
+        else:
+            print(message)
+
+    def load_experiment_config(self):
+        with open(self.exp_parameters_filename, 'r') as file:
+            self.exp_parameters = yaml.load(file, Loader=yaml.FullLoader)
+
+        self.exp_protocol = self.exp_parameters.get('name', 'spontaneousActivity')
+        self.wait_time_sec = float(self.exp_parameters.get('wait_time_sec', 300))
+        self.exp_log.log['exp_parameters'] = self.exp_protocol
+
+    def start_data_acquisition(self):
+        if self.daq is None:
+            raise Exception('Please set the daq object, it has not been set.')
+
+        if os.sys.platform == 'win32' and not self.debug:
+            self.acquisition_running = True
+            self.daq.start_everything()
+
+    def stop_data_acquisition(self):
+        if os.sys.platform == 'win32' and not self.debug:
+            self.daq.stop_everything()
+            self.acquisition_running = False
+
+    def run_experiment(self):
+        self.experiment_running = True
+
+        self.update_status(f"Starting {self.exp_protocol} experiment.")
+        start_time = time()
+        self.exp_log.log_exp_start(start_time)
+
+        sleep(self.wait_time_sec)
+
+        self.exp_log.log_exp_end(time(), 0)
+        self.exp_log.save_log()
+        self.update_status('Spontaneous activity experiment finished.')
+        self.experiment_running = False
+
+    def stop_experiment(self):
+        self.experiment_running = False

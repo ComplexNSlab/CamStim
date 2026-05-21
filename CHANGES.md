@@ -1,3 +1,27 @@
+# 2026-05-21
+- Added richer camera startup diagnostics in `utils/simple_cam_mx.py`:
+	- Startup report now enumerates available resolution presets (`resolution_modes`) including output size, FOV, and per-mode bin/skip settings.
+	- Startup report now includes decoded binning capability masks (`binning_support`) and raw mask values (`binning_masks_raw`) for sum/average/skip.
+	- Added explicit startup status message indicating active frame-grab implementation:
+		- C extension path: `cgrabcallback.fast_memcpy`
+		- Python fallback path: `ctypes.memmove`
+
+- Added interactive ROI controls to the GUI (`camstim.py`):
+	- New `Image -> Select ROI` action (enabled only while camera is running).
+	- ROI drawing on the live preview via drag-rectangle interaction.
+	- GUI sends ROI requests to the camera worker and reports applied ROI dimensions/offsets in status.
+
+- Added ROI control commands to the camera worker (`utils/simple_cam_mx.py`):
+	- New `set_roi` command applies custom ROI using `CameraSetImageResolution` with pause/replay handling.
+	- New `reset_roi` command restores full-frame capture using camera capability max width/height.
+	- ROI apply path now refreshes frame pool configuration and republishes ready state after resolution changes.
+
+- Added GUI robustness for dynamic ROI resolution changes (`camstim.py`):
+	- Clears cached latest frame on ROI apply events.
+	- Drops stale frames whose byte/pixel count does not match current camera dimensions, preventing reshape errors during ROI transitions.
+
+- Added `Image -> Reset ROI` action (enabled only while camera is running) to return to full-frame acquisition from the GUI.
+
 # 2026-05-20 (3)
 - Renamed `baseExperiment` experiment type to `spontaneousActivity` for clarity:
   - `experiment_types/baseExperiment.py` → `experiment_types/spontaneousActivity.py`; class renamed `SpontaneousActivity`.

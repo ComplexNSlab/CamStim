@@ -24,6 +24,33 @@ bool_DEBUG = True
 exp_types = discover_experiment_types()
 
 
+def resolve_experiment_config_file(exp_name, exp_type):
+    candidates = []
+
+    display_stem = exp_name.replace(' ', '_')
+    candidates.append(CONFIG_DIR / f"{display_stem.lower()}_config.yaml")
+    candidates.append(CONFIG_DIR / f"{display_stem}.yaml")
+
+    module_stem = exp_type.__module__.split('.')[-1]
+    candidates.append(CONFIG_DIR / f"{module_stem}_config.yaml")
+    candidates.append(CONFIG_DIR / f"{module_stem}.yaml")
+
+    class_stem = exp_type.__name__
+    candidates.append(CONFIG_DIR / f"{class_stem}_config.yaml")
+    candidates.append(CONFIG_DIR / f"{class_stem}.yaml")
+
+    seen = set()
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        if candidate.is_file():
+            return candidate_str
+
+    return str(candidates[0])
+
+
 def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False):
     data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
     teensy_board = None
@@ -33,12 +60,12 @@ def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False):
     else:
         print("\nDEBUG: skipping Teensy startup.")
 
-    config_file = str(CONFIG_DIR / f"{exp_name.replace(' ', '_').lower()}_config.yaml")
-
     exp_type = exp_types.get(exp_name)
     if exp_type is None:
         print("\nExperiment name error.")
         return
+
+    config_file = resolve_experiment_config_file(exp_name, exp_type)
 
     exp = exp_type(experiment_id, mouse_id, data_aq, str(CONFIG_DIR / "monitor_config.yaml"), str(CONFIG_DIR / "config.yaml"), config_file, debug=bool_DEBUG)
 

@@ -3,7 +3,7 @@ USE_LIVE_SPECKLE: true
 BUFFER_SIZE: 10
 
 # Debug option: run experiments without initializing the Teensy board.
-DEBUG_SKIP_TEENSY: true
+DEBUG_SKIP_TEENSY: false
 
 # What exposure time to use (in ms, can be < 0)
 EXPOSURE_TIME: 15
@@ -31,7 +31,7 @@ FRAME_POOL_FRAMES: 256
 # GC is restored automatically when the worker exits.
 DISABLE_GC_DURING_ACQUIRE: true
 # Debug: measure callback wall time during active recording and store summary in metadata.
-DEBUG_CALLBACK_TIMING: false
+DEBUG_CALLBACK_TIMING: true
 
 # Apply horizontal mirror to each grabbed frame via CameraFlipFrameBuffer.
 # Set to true when the camera is mounted so the raw image is left-right flipped.

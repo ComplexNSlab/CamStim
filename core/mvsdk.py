@@ -1927,11 +1927,6 @@ def CameraGigeGetMac(pCameraInfo):
 	SetLastError(err_code)
 	return (_string_buffer_to_str(CamMac), _string_buffer_to_str(EtMac) )
 
-def CameraEnableFastResponse(hCamera):
-	err_code = _sdk.CameraEnableFastResponse(hCamera)
-	SetLastError(err_code)
-	return err_code
-
 def CameraSetCorrectDeadPixel(hCamera, bEnable):
 	err_code = _sdk.CameraSetCorrectDeadPixel(hCamera, bEnable)
 	SetLastError(err_code)

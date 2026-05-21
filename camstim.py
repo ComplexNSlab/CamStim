@@ -7,8 +7,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
 							QGridLayout,
 							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit,
 							QFileDialog, QInputDialog, QMessageBox)
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QImage, QPixmap, QAction
+from PyQt6.QtCore import QTimer, Qt, QRect
+from PyQt6.QtGui import QImage, QPixmap, QAction, QPainter, QPen, QColor
 import time
 from collections import deque
 import threading
@@ -31,6 +31,78 @@ def load_app_version(default='0.0.0'):
 		return version_text if version_text else default
 	except OSError:
 		return default
+
+
+class RoiSelectableLabel(QLabel):
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self._roi_mode_enabled = False
+		self._drag_start = None
+		self._drag_current = None
+		self.selection_finished_callback = None
+
+	def set_roi_mode_enabled(self, enabled):
+		self._roi_mode_enabled = bool(enabled)
+		self._drag_start = None
+		self._drag_current = None
+		self.setCursor(Qt.CursorShape.CrossCursor if self._roi_mode_enabled else Qt.CursorShape.ArrowCursor)
+		self.update()
+
+	def _pixmap_rect(self):
+		pixmap = self.pixmap()
+		if pixmap is None or pixmap.isNull():
+			return QRect()
+		pixmap_size = pixmap.size()
+		x = (self.width() - pixmap_size.width()) // 2
+		y = (self.height() - pixmap_size.height()) // 2
+		return QRect(x, y, pixmap_size.width(), pixmap_size.height())
+
+	def _clamp_to_pixmap(self, pos):
+		pixmap_rect = self._pixmap_rect()
+		if pixmap_rect.isNull():
+			return pos
+		x = min(max(pos.x(), pixmap_rect.left()), pixmap_rect.right())
+		y = min(max(pos.y(), pixmap_rect.top()), pixmap_rect.bottom())
+		return pos.__class__(x, y)
+
+	def mousePressEvent(self, event):
+		if self._roi_mode_enabled and event.button() == Qt.MouseButton.LeftButton:
+			pixmap_rect = self._pixmap_rect()
+			point = event.position().toPoint()
+			if pixmap_rect.contains(point):
+				self._drag_start = self._clamp_to_pixmap(point)
+				self._drag_current = self._drag_start
+				self.update()
+				return
+		super().mousePressEvent(event)
+
+	def mouseMoveEvent(self, event):
+		if self._roi_mode_enabled and self._drag_start is not None:
+			self._drag_current = self._clamp_to_pixmap(event.position().toPoint())
+			self.update()
+			return
+		super().mouseMoveEvent(event)
+
+	def mouseReleaseEvent(self, event):
+		if self._roi_mode_enabled and event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
+			self._drag_current = self._clamp_to_pixmap(event.position().toPoint())
+			selection_rect = QRect(self._drag_start, self._drag_current).normalized()
+			self._drag_start = None
+			self._drag_current = None
+			self.update()
+			if selection_rect.width() > 4 and selection_rect.height() > 4 and callable(self.selection_finished_callback):
+				self.selection_finished_callback(selection_rect, self._pixmap_rect())
+			return
+		super().mouseReleaseEvent(event)
+
+	def paintEvent(self, event):
+		super().paintEvent(event)
+		if self._drag_start is None or self._drag_current is None:
+			return
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+		painter.setPen(QPen(QColor(255, 64, 64), 2, Qt.PenStyle.SolidLine))
+		painter.drawRect(QRect(self._drag_start, self._drag_current).normalized())
 
 
 class CameraProcessClient:
@@ -111,6 +183,15 @@ class CameraProcessClient:
 		self.command_queue.put({'name': name, 'payload': payload})
 		return True
 
+	def _ensure_display_buffers(self):
+		if not self.width or not self.height:
+			return
+		target_shape = (self.buffer_size, self.height // self.bin_size, self.width // self.bin_size)
+		if self.circular_buffer is None or tuple(self.circular_buffer.shape) != target_shape:
+			self.circular_buffer = np.zeros(target_shape, dtype=np.float32)
+			self.current_buffer_item = 0
+			self.buffer_loop_reached = False
+
 	def poll_messages(self):
 		if self.status_queue is None:
 			return
@@ -133,8 +214,7 @@ class CameraProcessClient:
 				self.analog_gain_min = float(msg.get('analog_gain_min', self.analog_gain_min))
 				self.analog_gain_max = float(msg.get('analog_gain_max', self.analog_gain_max))
 				self.analog_gain = float(msg.get('analog_gain', self.analog_gain))
-				if self.circular_buffer is None and self.width and self.height:
-					self.circular_buffer = np.zeros((self.buffer_size, self.height // self.bin_size, self.width // self.bin_size), dtype=np.float32)
+				self._ensure_display_buffers()
 			elif msg_type == 'stats':
 				self.frame_count = int(msg.get('frame_count', self.frame_count))
 				self.frames_written = int(msg.get('frames_written', self.frames_written))
@@ -148,6 +228,13 @@ class CameraProcessClient:
 				self.exposure = msg.get('value', getattr(self, 'exposure', None))
 			elif msg_type == 'gain':
 				self.analog_gain = msg.get('value', getattr(self, 'analog_gain', None))
+			elif msg_type == 'roi_applied':
+				self.width = int(msg.get('width', self.width or 0)) or self.width
+				self.height = int(msg.get('height', self.height or 0)) or self.height
+				with self.latest_frame_lock:
+					self.latest_frame_data = None
+				self._ensure_display_buffers()
+				self.exp_status_queue.put(("status", f"ROI applied: {msg.get('width')}x{msg.get('height')} at ({msg.get('x')}, {msg.get('y')})."))
 			elif msg_type == 'status':
 				self.exp_status_queue.put(("status", msg.get('message', '')))
 			elif msg_type == 'trial':
@@ -197,6 +284,12 @@ class CameraProcessClient:
 
 	def set_gain(self, value):
 		return self._send_command('set_gain', value)
+
+	def set_roi(self, x, y, width, height):
+		return self._send_command('set_roi', {'x': x, 'y': y, 'width': width, 'height': height})
+
+	def reset_roi(self):
+		return self._send_command('reset_roi')
 
 	def set_saving(self, enabled):
 		self.saving = bool(enabled)
@@ -369,6 +462,8 @@ class CameraGUI(QMainWindow):
 		self.fps_samples = deque(maxlen=100)
 		self.experiment_list_cache = None
 		self.last_display_frame = None
+		self.select_roi_action = None
+		self.reset_roi_action = None
 		self.exp_status_timer = QTimer()
 		self.exp_status_timer.timeout.connect(self.check_experiment_status)
 		self.exp_status_timer.start(100)
@@ -439,6 +534,16 @@ class CameraGUI(QMainWindow):
 		save_snapshot_action = QAction('Snapshot', self)
 		save_snapshot_action.triggered.connect(self.save_snapshot_image)
 		save_menu.addAction(save_snapshot_action)
+
+		self.select_roi_action = QAction('Select ROI', self)
+		self.select_roi_action.setEnabled(False)
+		self.select_roi_action.triggered.connect(self.start_roi_selection)
+		image_menu.addAction(self.select_roi_action)
+
+		self.reset_roi_action = QAction('Reset ROI', self)
+		self.reset_roi_action.setEnabled(False)
+		self.reset_roi_action.triggered.connect(self.reset_roi)
+		image_menu.addAction(self.reset_roi_action)
 
 	def _prompt_image_save_path(self, title):
 		default_dir = self._default_image_save_dir()
@@ -606,12 +711,73 @@ class CameraGUI(QMainWindow):
 		except Exception as e:
 			QMessageBox.critical(self, 'Save Snapshot', f'Failed to save snapshot: {e}')
 
+	def start_roi_selection(self):
+		if self.camera_app is None:
+			QMessageBox.warning(self, 'Select ROI', 'Camera is not running.')
+			return
+		if self.camera_app.saving or self.hardware_trigger_enabled:
+			QMessageBox.warning(self, 'Select ROI', 'ROI selection is only available in live view when not saving.')
+			return
+		if self.last_display_frame is None:
+			QMessageBox.warning(self, 'Select ROI', 'No displayed frame is available yet.')
+			return
+		self.video_label.set_roi_mode_enabled(True)
+		self.update_status('ROI selection enabled. Drag a rectangle on the image to apply it.')
+
+	def apply_selected_roi(self, selection_rect, image_rect):
+		self.video_label.set_roi_mode_enabled(False)
+		if self.camera_app is None or self.last_display_frame is None:
+			return
+		if image_rect.isNull() or image_rect.width() <= 0 or image_rect.height() <= 0:
+			return
+
+		camera_width = int(getattr(self.camera_app, 'width', 0) or 0)
+		camera_height = int(getattr(self.camera_app, 'height', 0) or 0)
+		if camera_width <= 0 or camera_height <= 0:
+			QMessageBox.warning(self, 'Select ROI', 'Camera resolution is unavailable.')
+			return
+
+		x = round((selection_rect.left() - image_rect.left()) * camera_width / image_rect.width())
+		y = round((selection_rect.top() - image_rect.top()) * camera_height / image_rect.height())
+		width = round(selection_rect.width() * camera_width / image_rect.width())
+		height = round(selection_rect.height() * camera_height / image_rect.height())
+
+		x = max(0, min(x, camera_width - 2))
+		y = max(0, min(y, camera_height - 2))
+		width = max(2, min(width, camera_width - x))
+		height = max(2, min(height, camera_height - y))
+
+		if width <= 1 or height <= 1:
+			QMessageBox.warning(self, 'Select ROI', 'Selected ROI is too small.')
+			return
+
+		self.reset_display_average_on_next_frame = True
+		self.reset_fps_on_next_frame = True
+		self.last_display_frame = None
+		self.camera_app.set_roi(x, y, width, height)
+		self.update_status(f'Requested ROI: {width}x{height} at ({x}, {y}).')
+
+	def reset_roi(self):
+		if self.camera_app is None:
+			QMessageBox.warning(self, 'Reset ROI', 'Camera is not running.')
+			return
+		if self.camera_app.saving or self.hardware_trigger_enabled:
+			QMessageBox.warning(self, 'Reset ROI', 'ROI reset is only available in live view when not saving.')
+			return
+		self.video_label.set_roi_mode_enabled(False)
+		self.reset_display_average_on_next_frame = True
+		self.reset_fps_on_next_frame = True
+		self.last_display_frame = None
+		self.camera_app.reset_roi()
+		self.update_status('Requested ROI reset to full frame.')
+
 	def create_display_panel(self):
 		panel = QWidget()
 		layout = QVBoxLayout()
 		panel.setLayout(layout)
 
-		self.video_label = QLabel()
+		self.video_label = RoiSelectableLabel()
+		self.video_label.selection_finished_callback = self.apply_selected_roi
 		self.video_label.setText(f'camstim {self.app_version}\n\nCamera not started.\n\nClick "Start Camera" to begin.')
 		self.video_label.setMinimumSize(640, 480)
 		self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -810,7 +976,7 @@ class CameraGUI(QMainWindow):
 		self.status_text.setReadOnly(True)
 		status_layout.addWidget(self.status_text)
 
-		self.stats_label = QLabel(f"Version: {self.app_version} | FPS: 0 | Frames: 0 | Saved: 0 | Save Queue: 0")
+		self.stats_label = QLabel(f"FPS: 0 | Frames: 0 | Saved: 0 | Save Queue: 0")
 		status_layout.addWidget(self.stats_label)
 
 		status_group.setLayout(status_layout)
@@ -954,6 +1120,10 @@ class CameraGUI(QMainWindow):
 
 			self.start_btn.setEnabled(False)
 			self.stop_btn.setEnabled(True)
+			if self.select_roi_action is not None:
+				self.select_roi_action.setEnabled(True)
+			if self.reset_roi_action is not None:
+				self.reset_roi_action.setEnabled(True)
 			self.trigger_btn.setEnabled(True)
 			self.teensy_toggle_btn.setEnabled(True)
 			self.teensy_active = False
@@ -1039,6 +1209,7 @@ class CameraGUI(QMainWindow):
 
 	def stop_camera(self):
 		if self.camera_app:
+			self.video_label.set_roi_mode_enabled(False)
 			self.disable_hardware_trigger()
 			if self.teensy_controller is not None:
 				try:
@@ -1060,6 +1231,10 @@ class CameraGUI(QMainWindow):
 
 		self.start_btn.setEnabled(True)
 		self.stop_btn.setEnabled(False)
+		if self.select_roi_action is not None:
+			self.select_roi_action.setEnabled(False)
+		if self.reset_roi_action is not None:
+			self.reset_roi_action.setEnabled(False)
 		self.trigger_btn.setEnabled(False)
 		self.teensy_toggle_btn.setEnabled(False)
 		self.teensy_toggle_btn.setText("Enable Teensy")
@@ -1112,6 +1287,9 @@ class CameraGUI(QMainWindow):
 		frame = np.frombuffer(frame_data, dtype=self.camera_app.dtype)
 
 		if hasattr(self.camera_app, 'height') and hasattr(self.camera_app, 'width'):
+			expected_pixels = int(self.camera_app.height) * int(self.camera_app.width)
+			if frame.size != expected_pixels:
+				return None
 			frame = frame.reshape((self.camera_app.height, self.camera_app.width))
 			# Keep GUI display orientation identical to saved raw frames.
 			# Prefer hardware mirror; fall back to software mirror if needed.
@@ -1247,7 +1425,7 @@ class CameraGUI(QMainWindow):
 					average_fps = float(worker_average_fps)
 
 				save_queue_size = getattr(self.camera_app, 'save_queue_size', 0)
-				stats_text = f"Version: {self.app_version} | FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}"
+				stats_text = f"FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}"
 				self.stats_label.setText(stats_text)
 			except:
 				pass
