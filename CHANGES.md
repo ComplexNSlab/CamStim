@@ -1,4 +1,19 @@
 # 2026-05-21
+- Improved ROI and preview handling in the GUI and worker:
+	- ROI selection now stays anchored to the displayed image rect during drag, which fixes inconsistent ROI draw behavior on scaled previews.
+	- ROI apply in the GUI now trims requested ROI width/height to the nearest valid multiple of `BIN_SIZE` when `BIN_EXP_LIVE` is enabled and reports the adjustment in status.
+	- GUI frame decoding now tolerates oversized/padded frame buffers after ROI changes by slicing to the active resolution before reshape, preventing preview stalls after ROI apply.
+	- Histogram rendering now uses a Qt window instead of OpenCV HighGUI calls from a background thread, avoiding the OpenCV GUI crash seen on macOS and keeping behavior consistent in the existing Qt app.
+
+- Improved configuration display behavior in the GUI (`camstim.py`):
+	- Camera and Teensy configuration panes now populate on application load instead of waiting for camera start.
+	- Experiment configuration now refreshes immediately when the experiment dropdown selection changes.
+	- Experiment config file lookup now accepts both legacy and snake-case filenames so `SpontaneousActivity` config files still load correctly.
+
+- Improved saved frame provenance in `utils/simple_cam_mx.py`:
+	- Metadata now includes full ROI coordinates and ROI dimensions alongside saved frame dimensions.
+	- Initial preview TIFF export now also writes binned companion TIFFs when experiment binning is enabled.
+
 - Added richer camera startup diagnostics in `utils/simple_cam_mx.py`:
 	- Startup report now enumerates available resolution presets (`resolution_modes`) including output size, FOV, and per-mode bin/skip settings.
 	- Startup report now includes decoded binning capability masks (`binning_support`) and raw mask values (`binning_masks_raw`) for sum/average/skip.

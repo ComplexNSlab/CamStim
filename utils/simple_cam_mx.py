@@ -152,6 +152,10 @@ class App(object):
         self.session_sys_clock_timestamps = []
         self.t_start = None
         self.hCamera = None
+        self.roi_x = 0
+        self.roi_y = 0
+        self.roi_width = None
+        self.roi_height = None
         self.session_frames_written = 0
         self.session_preview_frames_saved = 0
         self.session_callback_timing_count = 0
@@ -350,6 +354,10 @@ class App(object):
             applied_res = mvsdk.CameraGetImageResolution(self.hCamera)
             self.width = int(applied_res.iWidth)
             self.height = int(applied_res.iHeight)
+            self.roi_x = int(applied_res.iHOffsetFOV)
+            self.roi_y = int(applied_res.iVOffsetFOV)
+            self.roi_width = int(applied_res.iWidth)
+            self.roi_height = int(applied_res.iHeight)
             self._clear_pending_frames()
             self._configure_frame_pool()
             self.ready_state_published = False
@@ -518,11 +526,6 @@ class App(object):
         for i in range(target_frames):
             self._free_frame_slots.put(i)
 
-        if target_frames < int(self.save_queue_max_frames):
-            print(
-                f"Warning: FRAME_POOL_FRAMES ({target_frames}) < SAVE_QUEUE_MAX_FRAMES ({self.save_queue_max_frames}). "
-                "In-flight save frames are limited by the pool size."
-            )
         print(f"Preallocated callback frame pool: {target_frames} frame(s), {self.frame_bytes / (1024 * 1024):.2f} MiB per frame")
 
     def _acquire_frame_slot(self):
@@ -1200,6 +1203,12 @@ class App(object):
             'num_frames': self.session_frames_written,
             'frame_width': self.width if not self.bin_exp else self.width//self.bin_size,
             'frame_height': self.height if not self.bin_exp else self.height//self.bin_size,
+            'roi': {
+                'x': int(self.roi_x),
+                'y': int(self.roi_y),
+                'width': int(self.roi_width if self.roi_width is not None else self.width),
+                'height': int(self.roi_height if self.roi_height is not None else self.height),
+            },
             'data_type': self.dtype if not self.bin_exp else 'uint16',
             'frame_timestamps': self.session_frame_timestamps,
             'sys_clock_timestamps': self.session_sys_clock_timestamps,
@@ -1326,6 +1335,33 @@ class App(object):
         # Mark FPS reset as pending for new experiment
         self._fps_reset_after_first_frame = True
 
+    def _bin_preview_frame(self, frame):
+        bs = int(self.bin_size)
+        if bs <= 1:
+            return frame
+
+        h, w = frame.shape
+        h_b = (h // bs) * bs
+        w_b = (w // bs) * bs
+        if h_b <= 0 or w_b <= 0:
+            raise ValueError(f"Frame too small for BIN_SIZE={bs}: {h}x{w}")
+
+        if h_b != h or w_b != w:
+            frame = frame[:h_b, :w_b]
+
+        data = frame.astype(np.uint16, copy=False)
+        if bs in (2, 4, 8, 16, 32, 64):
+            for _ in range(bs.bit_length() - 1):
+                data = (
+                    data[0::2, 0::2]
+                    + data[1::2, 0::2]
+                    + data[0::2, 1::2]
+                    + data[1::2, 1::2]
+                )
+        else:
+            data = data.reshape(h_b // bs, bs, w_b // bs, bs).sum(axis=(1, 3), dtype=np.uint16)
+        return data
+
     def _save_initial_frame_tiff(self, frame_data):
         if self.session_preview_frames_saved >= 2:
             return
@@ -1346,6 +1382,13 @@ class App(object):
             ok = cv2.imwrite(frame_path, frame, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
             if not ok:
                 raise OSError(f"cv2.imwrite returned False for {frame_path}")
+
+            if self.bin_exp and int(self.bin_size) > 1:
+                binned_frame = self._bin_preview_frame(frame)
+                binned_path = os.path.join(self.save_dir, f"{self.filename}_frame{frame_idx}_binned.tiff")
+                ok_binned = cv2.imwrite(binned_path, binned_frame, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
+                if not ok_binned:
+                    raise OSError(f"cv2.imwrite returned False for {binned_path}")
 
             self.session_preview_frames_saved += 1
 
@@ -1577,6 +1620,10 @@ class App(object):
         applied_res = mvsdk.CameraGetImageResolution(self.hCamera)
         self.width = applied_res.iWidth
         self.height = applied_res.iHeight
+        self.roi_x = int(applied_res.iHOffsetFOV)
+        self.roi_y = int(applied_res.iVOffsetFOV)
+        self.roi_width = int(applied_res.iWidth)
+        self.roi_height = int(applied_res.iHeight)
 
         # Start with requested strobe-trigger profile for acquisition.
         self._apply_startup_strobe_settings()

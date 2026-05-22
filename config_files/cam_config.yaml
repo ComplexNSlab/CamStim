@@ -19,7 +19,7 @@ ANALOG_GAIN: 2.5
 # raw data is huge (2048, 2048) images
 BIN_EXP_LIVE: false
 # Software bin size (e.g., 4 means final image size will be 512, 512)
-BIN_SIZE: 2
+BIN_SIZE: 16
 
 # Save pipeline settings for high-throughput acquisition
 # Number of frames buffered in RAM before disk writes catch up.

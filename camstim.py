@@ -7,11 +7,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
 							QGridLayout,
 							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit,
 							QFileDialog, QInputDialog, QMessageBox)
-from PyQt6.QtCore import QTimer, Qt, QRect
+from PyQt6.QtCore import QTimer, Qt, QRect, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QAction, QPainter, QPen, QColor
 import time
 from collections import deque
 import threading
+import re
 from core.TeensyController import TeensyController
 import cv2
 import yaml
@@ -39,14 +40,21 @@ class RoiSelectableLabel(QLabel):
 		self._roi_mode_enabled = False
 		self._drag_start = None
 		self._drag_current = None
+		self._roi_image_rect = QRect()
 		self.selection_finished_callback = None
 
 	def set_roi_mode_enabled(self, enabled):
 		self._roi_mode_enabled = bool(enabled)
 		self._drag_start = None
 		self._drag_current = None
+		self._roi_image_rect = self._pixmap_rect() if self._roi_mode_enabled else QRect()
 		self.setCursor(Qt.CursorShape.CrossCursor if self._roi_mode_enabled else Qt.CursorShape.ArrowCursor)
 		self.update()
+
+	def _active_image_rect(self):
+		if self._roi_mode_enabled and not self._roi_image_rect.isNull():
+			return self._roi_image_rect
+		return self._pixmap_rect()
 
 	def _pixmap_rect(self):
 		pixmap = self.pixmap()
@@ -58,7 +66,7 @@ class RoiSelectableLabel(QLabel):
 		return QRect(x, y, pixmap_size.width(), pixmap_size.height())
 
 	def _clamp_to_pixmap(self, pos):
-		pixmap_rect = self._pixmap_rect()
+		pixmap_rect = self._active_image_rect()
 		if pixmap_rect.isNull():
 			return pos
 		x = min(max(pos.x(), pixmap_rect.left()), pixmap_rect.right())
@@ -67,7 +75,7 @@ class RoiSelectableLabel(QLabel):
 
 	def mousePressEvent(self, event):
 		if self._roi_mode_enabled and event.button() == Qt.MouseButton.LeftButton:
-			pixmap_rect = self._pixmap_rect()
+			pixmap_rect = self._active_image_rect()
 			point = event.position().toPoint()
 			if pixmap_rect.contains(point):
 				self._drag_start = self._clamp_to_pixmap(point)
@@ -87,11 +95,12 @@ class RoiSelectableLabel(QLabel):
 		if self._roi_mode_enabled and event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
 			self._drag_current = self._clamp_to_pixmap(event.position().toPoint())
 			selection_rect = QRect(self._drag_start, self._drag_current).normalized()
+			image_rect = self._active_image_rect()
 			self._drag_start = None
 			self._drag_current = None
 			self.update()
 			if selection_rect.width() > 4 and selection_rect.height() > 4 and callable(self.selection_finished_callback):
-				self.selection_finished_callback(selection_rect, self._pixmap_rect())
+				self.selection_finished_callback(selection_rect, image_rect)
 			return
 		super().mouseReleaseEvent(event)
 
@@ -448,6 +457,9 @@ class CameraProcessClient:
 			self.process.join(timeout=3.0)
 
 class CameraGUI(QMainWindow):
+	histogram_frame_ready = pyqtSignal(object)
+	histogram_close_requested = pyqtSignal()
+
 	def __init__(self):
 		super().__init__()
 		self.app_version = load_app_version()
@@ -469,6 +481,8 @@ class CameraGUI(QMainWindow):
 		self.histogram_open = False
 		self.histogram_thread_running = False
 		self.histogram_thread = None
+		self.histogram_window = None
+		self.histogram_label = None
 		self.last_stats_time = None
 		self.last_stats_frame_count = 0
 		self.fps_samples = deque(maxlen=100)
@@ -480,9 +494,14 @@ class CameraGUI(QMainWindow):
 		self.exp_status_timer = QTimer()
 		self.exp_status_timer.timeout.connect(self.check_experiment_status)
 		self.exp_status_timer.start(100)
+		self.histogram_frame_ready.connect(self._on_histogram_frame_ready)
+		self.histogram_close_requested.connect(self._close_histogram_window)
 		self._last_experiment_display_time = 0.0
 		self.init_ui()
+		self.load_and_display_camera_config()
+		self.load_and_display_teensy_config()
 		self.populate_experiment_controls()
+		self.load_and_display_exp_config()
 		self.setup_timer()
 
 	def _schedule_auto_stop(self):
@@ -760,6 +779,27 @@ class CameraGUI(QMainWindow):
 		y = max(0, min(y, camera_height - 2))
 		width = max(2, min(width, camera_width - x))
 		height = max(2, min(height, camera_height - y))
+		requested_width = width
+		requested_height = height
+
+		# When live binning is enabled, ROI dimensions must be multiples of BIN_SIZE.
+		if bool(getattr(self.camera_app, 'bin_exp', False)):
+			bs = int(getattr(self.camera_app, 'bin_size', 1) or 1)
+			if bs > 1:
+				width -= (width % bs)
+				height -= (height % bs)
+				if width < bs or height < bs:
+					QMessageBox.warning(
+						self,
+						'Select ROI',
+						f'Selected ROI is too small for BIN_SIZE={bs}. Increase ROI size.',
+					)
+					return
+				if width != requested_width or height != requested_height:
+					self.update_status(
+						f'Adjusted ROI to {width}x{height} to match BIN_SIZE={bs} '
+						f'(requested {requested_width}x{requested_height}).'
+					)
 
 		if width <= 1 or height <= 1:
 			QMessageBox.warning(self, 'Select ROI', 'Selected ROI is too small.')
@@ -909,6 +949,7 @@ class CameraGUI(QMainWindow):
 		exp_select_layout.addWidget(QLabel("Experiment:"))
 		self.exp_combo = QComboBox()
 		self.exp_combo.setEnabled(False)
+		self.exp_combo.currentTextChanged.connect(self.on_experiment_selection_changed)
 		exp_select_layout.addWidget(self.exp_combo)
 		exp_layout.addLayout(exp_select_layout)
 
@@ -1018,6 +1059,7 @@ class CameraGUI(QMainWindow):
 
 		experiment_list = self.experiment_list_cache or []
 
+		self.exp_combo.blockSignals(True)
 		self.exp_combo.clear()
 		# Keep index 0 empty so the user must explicitly choose an experiment.
 		self.exp_combo.addItem("")
@@ -1025,6 +1067,8 @@ class CameraGUI(QMainWindow):
 		if not experiment_list:
 			self.exp_combo.setCurrentIndex(0)
 			self.exp_combo.setEnabled(False)
+			self.exp_combo.blockSignals(False)
+			self.load_and_display_exp_config()
 			return
 
 		self.exp_combo.addItems(experiment_list)
@@ -1033,6 +1077,11 @@ class CameraGUI(QMainWindow):
 		else:
 			self.exp_combo.setCurrentIndex(0)
 		self.exp_combo.setEnabled(True)
+		self.exp_combo.blockSignals(False)
+		self.load_and_display_exp_config()
+
+	def on_experiment_selection_changed(self, _text):
+		self.load_and_display_exp_config()
 
 	def get_selected_experiment_params(self):
 		exp_name = self.exp_combo.currentText().strip()
@@ -1322,9 +1371,9 @@ class CameraGUI(QMainWindow):
 
 		if hasattr(self.camera_app, 'height') and hasattr(self.camera_app, 'width'):
 			expected_pixels = int(self.camera_app.height) * int(self.camera_app.width)
-			if frame.size != expected_pixels:
+			if frame.size < expected_pixels:
 				return None
-			frame = frame.reshape((self.camera_app.height, self.camera_app.width))
+			frame = frame[:expected_pixels].reshape((self.camera_app.height, self.camera_app.width))
 			# Keep GUI display orientation identical to saved raw frames.
 			# Prefer hardware mirror; fall back to software mirror if needed.
 			if getattr(self.camera_app, 'software_mirror_horizontal', False):
@@ -1594,13 +1643,23 @@ class CameraGUI(QMainWindow):
 
 	def load_and_display_exp_config(self):
 		try:
-			exp_name = getattr(self.camera_app, 'exp_name', None)
-	        
-			if exp_name is None:
-				self.config_display.setText("No experiment selected.\nPlease start an experiment first.")
+			exp_name = ""
+			if hasattr(self, 'exp_combo') and self.exp_combo is not None:
+				exp_name = self.exp_combo.currentText().strip()
+			if not exp_name:
+				exp_name = (getattr(self.camera_app, 'exp_name', None) or "").strip()
+
+			if not exp_name:
+				self.config_display.setText("No experiment selected.\nSelect an experiment from the dropdown.")
 				return
 
-			config_file = CONFIG_DIR / f"{exp_name.replace(' ', '_').lower()}_config.yaml"
+			exp_snake = re.sub(r'(?<!^)(?=[A-Z])', '_', exp_name.replace(' ', '_')).lower()
+			config_candidates = [
+				CONFIG_DIR / f"{exp_name.replace(' ', '_').lower()}_config.yaml",
+				CONFIG_DIR / f"{exp_snake}_config.yaml",
+				CONFIG_DIR / f"{exp_name}.yaml",
+			]
+			config_file = next((candidate for candidate in config_candidates if candidate.exists()), config_candidates[0])
 	        
 			try:
 				with open(config_file, 'r') as f:
@@ -1842,6 +1901,7 @@ class CameraGUI(QMainWindow):
 		else:
 			self.histogram_open = False
 			self.histogram_thread_running = False
+			self._close_histogram_window()
 			self.update_status('Histogram disabled.')
 
 	def toggle_special_pixel_highlight(self, state):
@@ -1939,8 +1999,7 @@ class CameraGUI(QMainWindow):
 
 					cv2.putText(hist_image, f'Frame {self.camera_app.frame_count}', (hist_width // 2 - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 					cv2.putText(hist_image, f'Bins {bin_count} | Range 0-255', (10, hist_height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-					cv2.imshow('Live Histogram', hist_image)
-					cv2.waitKey(1)
+					self.histogram_frame_ready.emit(hist_image.copy())
 					last_draw_time = now
 					last_frame_count = self.camera_app.frame_count
 				except Exception as e:
@@ -1948,7 +2007,35 @@ class CameraGUI(QMainWindow):
 
 			time.sleep(0.01)
 
-		cv2.destroyWindow('Live Histogram')
+		self.histogram_close_requested.emit()
+
+	def _on_histogram_frame_ready(self, hist_image):
+		if hist_image is None:
+			return
+		if self.histogram_window is None:
+			self.histogram_window = QWidget(self)
+			self.histogram_window.setWindowTitle('Live Histogram')
+			layout = QVBoxLayout()
+			self.histogram_label = QLabel()
+			self.histogram_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+			layout.addWidget(self.histogram_label)
+			self.histogram_window.setLayout(layout)
+			self.histogram_window.resize(560, 460)
+
+		if not self.histogram_window.isVisible():
+			self.histogram_window.show()
+
+		rgb = cv2.cvtColor(hist_image, cv2.COLOR_BGR2RGB)
+		h, w, ch = rgb.shape
+		q_img = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+		pixmap = QPixmap.fromImage(q_img.copy())
+		self.histogram_label.setPixmap(pixmap)
+
+	def _close_histogram_window(self):
+		if self.histogram_window is not None:
+			self.histogram_window.close()
+		self.histogram_window = None
+		self.histogram_label = None
 
 	def update_trigger_mode(self, index):
 		if self.camera_app:
@@ -1965,6 +2052,9 @@ class CameraGUI(QMainWindow):
 		self.status_text.verticalScrollBar().setValue(self.status_text.verticalScrollBar().maximum())
 
 	def closeEvent(self, event):
+		self.histogram_open = False
+		self.histogram_thread_running = False
+		self._close_histogram_window()
 		self.stop_camera()
 		super().closeEvent(event)
 
