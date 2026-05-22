@@ -1,3 +1,12 @@
+# 2026-05-22
+- Simplified display-frame copy handling in `utils/simple_cam_mx.py`:
+	- Added optional mutable display mode controlled by `DISPLAY_MUTABLE_BUFFERS`.
+	- When enabled, the callback preallocates a single full-frame `display_frame_data` buffer once and reuses it for every frame.
+	- The callback now copies directly into that preallocated buffer via `cgrabcallback.fast_memcpy` (or `ctypes.memmove` fallback), removing per-frame bytes allocation overhead in display mode.
+	- Default behavior remains immutable display handoff when mutable mode is disabled.
+
+- Added `DISPLAY_MUTABLE_BUFFERS` to `config_files/cam_config.yaml` (default `false`) to keep safe defaults while allowing display-only low-overhead mode.
+
 # 2026-05-21
 - Improved ROI and preview handling in the GUI and worker:
 	- ROI selection now stays anchored to the displayed image rect during drag, which fixes inconsistent ROI draw behavior on scaled previews.

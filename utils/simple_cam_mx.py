@@ -191,6 +191,14 @@ class App(object):
             self.use_cgrabcallback = use_cgrab_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
         else:
             self.use_cgrabcallback = bool(use_cgrab_cfg)
+        use_mutable_display_cfg = config.get('DISPLAY_MUTABLE_BUFFERS', False)
+        if isinstance(use_mutable_display_cfg, str):
+            self.use_mutable_display_buffers = use_mutable_display_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            self.use_mutable_display_buffers = bool(use_mutable_display_cfg)
+        self._display_frame_buffer = None
+        self._display_frame_buffer_ptr = None
+        self._display_frame_buffer_addr = None
 
         # self.check_and_fix_existing_experiment()
 
@@ -527,6 +535,23 @@ class App(object):
             self._free_frame_slots.put(i)
 
         print(f"Preallocated callback frame pool: {target_frames} frame(s), {self.frame_bytes / (1024 * 1024):.2f} MiB per frame")
+        self._configure_display_buffer()
+
+    def _configure_display_buffer(self):
+        self._display_frame_buffer = None
+        self._display_frame_buffer_ptr = None
+        self._display_frame_buffer_addr = None
+
+        if not self.use_mutable_display_buffers:
+            return
+        if self.frame_bytes <= 0:
+            return
+
+        # Single reusable mutable display buffer sized exactly to one frame.
+        self._display_frame_buffer = bytearray(self.frame_bytes)
+        self._display_frame_buffer_ptr = (ctypes.c_char * self.frame_bytes).from_buffer(self._display_frame_buffer)
+        self._display_frame_buffer_addr = ctypes.addressof(self._display_frame_buffer_ptr)
+        print("Preallocated single mutable display buffer (1 frame).")
 
     def _acquire_frame_slot(self):
         try:
@@ -1728,6 +1753,12 @@ class App(object):
         frame_slot = None
         display_frame_data = None
         wants_display = self.frame_output_queue is not None
+        use_mutable_display = (
+            wants_display
+            and self.use_mutable_display_buffers
+            and frame_nbytes == self.frame_bytes
+            and self._display_frame_buffer_addr is not None
+        )
 
         if self.saving and self._frame_pool_ptrs:
             frame_slot = self._acquire_frame_slot()
@@ -1749,27 +1780,28 @@ class App(object):
 
             # Reuse pooled bytes for display when possible (avoid a second SDK-buffer copy).
             if wants_display:
-                # Use fast memcpy into a preallocated display buffer for display, matching the display-only path.
-                if not hasattr(self, '_display_frame_buffer') or self._display_frame_buffer is None or len(self._display_frame_buffer) != nbytes:
-                    self._display_frame_buffer = bytearray(nbytes)
-                dest_addr = (ctypes.c_char * nbytes).from_buffer(self._display_frame_buffer)
-                src_addr = self._frame_pool_addrs[frame_slot]
-                if self._is_using_c_framegrab() and _cgrabcallback is not None:
-                    _cgrabcallback.fast_memcpy(ctypes.addressof(dest_addr), src_addr, nbytes)
+                if use_mutable_display:
+                    src_addr = self._frame_pool_addrs[frame_slot]
+                    if self._is_using_c_framegrab() and _cgrabcallback is not None:
+                        _cgrabcallback.fast_memcpy(self._display_frame_buffer_addr, src_addr, nbytes)
+                    else:
+                        ctypes.memmove(ctypes.c_void_p(self._display_frame_buffer_addr), ctypes.c_void_p(src_addr), nbytes)
+                    display_frame_data = self._display_frame_buffer
                 else:
-                    ctypes.memmove(dest_addr, ctypes.c_void_p(src_addr), nbytes)
-                display_frame_data = bytes(self._display_frame_buffer)
+                    # Freeze an immutable snapshot directly from the pooled slot.
+                    # This avoids an extra slot->display-buffer copy before publishing.
+                    display_frame_data = bytes(self._frame_view_from_slot(frame_slot, nbytes))
         elif wants_display:
-            # No save slot available (not saving): use fast memcpy into a preallocated display buffer.
-            if not hasattr(self, '_display_frame_buffer') or self._display_frame_buffer is None or len(self._display_frame_buffer) != frame_nbytes:
-                self._display_frame_buffer = bytearray(frame_nbytes)
-            dest_addr = (ctypes.c_char * frame_nbytes).from_buffer(self._display_frame_buffer)
             src_addr = ctypes.cast(pRawData, ctypes.c_void_p).value
-            if self._is_using_c_framegrab() and _cgrabcallback is not None:
-                _cgrabcallback.fast_memcpy(ctypes.addressof(dest_addr), src_addr, frame_nbytes)
+            if use_mutable_display:
+                if self._is_using_c_framegrab() and _cgrabcallback is not None:
+                    _cgrabcallback.fast_memcpy(self._display_frame_buffer_addr, src_addr, frame_nbytes)
+                else:
+                    ctypes.memmove(ctypes.c_void_p(self._display_frame_buffer_addr), pRawData, frame_nbytes)
+                display_frame_data = self._display_frame_buffer
             else:
-                ctypes.memmove(dest_addr, pRawData, frame_nbytes)
-            display_frame_data = bytes(self._display_frame_buffer)
+                # Copy once from SDK buffer into immutable bytes for thread-safe handoff.
+                display_frame_data = ctypes.string_at(src_addr, frame_nbytes)
 
         mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
 
