@@ -19,7 +19,7 @@ import yaml
 from pathlib import Path
 
 from utils.simple_cam_mx import load_camera_config, load_save_root, run_camera_worker
-from core.experiment_discovery import get_experiment_list
+from core.experiment_discovery import get_experiment_list, resolve_experiment_config_file
 
 
 CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
@@ -1653,13 +1653,7 @@ class CameraGUI(QMainWindow):
 				self.config_display.setText("No experiment selected.\nSelect an experiment from the dropdown.")
 				return
 
-			exp_snake = re.sub(r'(?<!^)(?=[A-Z])', '_', exp_name.replace(' ', '_')).lower()
-			config_candidates = [
-				CONFIG_DIR / f"{exp_name.replace(' ', '_').lower()}_config.yaml",
-				CONFIG_DIR / f"{exp_snake}_config.yaml",
-				CONFIG_DIR / f"{exp_name}.yaml",
-			]
-			config_file = next((candidate for candidate in config_candidates if candidate.exists()), config_candidates[0])
+			config_file = resolve_experiment_config_file(exp_name)
 	        
 			try:
 				with open(config_file, 'r') as f:

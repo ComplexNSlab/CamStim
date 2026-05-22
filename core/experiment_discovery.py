@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 EXPERIMENT_TYPES_DIR = Path(__file__).resolve().parent.parent / "experiment_types"
+CONFIG_DIR = Path(__file__).resolve().parent.parent / "config_files"
 EXPERIMENT_NAME_OVERRIDES = {
     "TextureExperimentFB": "Texture FB",
     "TextureExperimentFBVGG": "Texture FB-VGG",
@@ -37,7 +38,7 @@ def discover_experiment_types():
             print(f"Skipping experiment module '{module_name}': {e}")
             continue
 
-        exp_class = getattr(module, "SpontaneousActivity", None) if module_name == "spontaneousActivity" else getattr(module, module_name, None)
+        exp_class = getattr(module, module_name, None)
         if exp_class is None:
             continue
 
@@ -55,3 +56,35 @@ def get_experiment_list():
     """
     exp_types = discover_experiment_types()
     return sorted(exp_types.keys())
+
+
+def resolve_experiment_config_file(exp_name, exp_type=None):
+    """Resolve the config file for an experiment display name and/or class."""
+    candidates = []
+
+    if exp_type is None:
+        exp_type = discover_experiment_types().get(exp_name)
+
+    display_stem = exp_name.replace(' ', '_')
+    candidates.append(CONFIG_DIR / f"{display_stem}_config.yaml")
+    candidates.append(CONFIG_DIR / f"{display_stem.lower()}_config.yaml")
+    candidates.append(CONFIG_DIR / f"{display_stem}.yaml")
+
+    if exp_type is not None:
+        module_stem = exp_type.__module__.split('.')[-1]
+        class_stem = exp_type.__name__
+        candidates.append(CONFIG_DIR / f"{module_stem}_config.yaml")
+        candidates.append(CONFIG_DIR / f"{class_stem}_config.yaml")
+        candidates.append(CONFIG_DIR / f"{module_stem}.yaml")
+        candidates.append(CONFIG_DIR / f"{class_stem}.yaml")
+
+    seen = set()
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        if candidate.is_file():
+            return candidate
+
+    return candidates[0]
