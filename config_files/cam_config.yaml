@@ -1,12 +1,17 @@
 # Whether to use the live speckle feature
-USE_LIVE_SPECKLE: true
+USE_LIVE_SPECKLE: false
 BUFFER_SIZE: 10
 
 # Debug option: run experiments without initializing the Teensy board.
 DEBUG_SKIP_TEENSY: false
 
+# Framegrab backend preference.
+# true: prefer C extension (cgrabcallback.fast_memcpy), fallback to Python if unavailable.
+# false: force Python fallback (ctypes.memmove).
+USE_CGRABCALLBACK: true
+
 # What exposure time to use (in ms, can be < 0)
-EXPOSURE_TIME: 15
+EXPOSURE_TIME: 12
 # Analog gain multiplier (real units, e.g. 2.5). Keep as low as possible.
 ANALOG_GAIN: 2.5
 

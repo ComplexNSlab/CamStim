@@ -3,7 +3,7 @@ import ctypes
 import sys
 import gc
 import numpy as np
-from core import mvsdk
+from core import mvsdk2024 as mvsdk
 import time
 import platform
 import queue
@@ -157,6 +157,7 @@ class App(object):
         self.session_callback_timing_count = 0
         self.session_callback_timing_total_s = 0.0
         self.session_callback_timing_max_s = 0.0
+        self._fps_reset_after_first_frame = False
         self.on_logic_analyzer_terminated = None
 
         self.exp_thread = None
@@ -180,6 +181,12 @@ class App(object):
         self.last_stats_time = None
         self.last_stats_frame_count = 0
         self.fps_samples = deque(maxlen=100)
+
+        use_cgrab_cfg = config.get('USE_CGRABCALLBACK', True)
+        if isinstance(use_cgrab_cfg, str):
+            self.use_cgrabcallback = use_cgrab_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            self.use_cgrabcallback = bool(use_cgrab_cfg)
 
         # self.check_and_fix_existing_experiment()
 
@@ -241,12 +248,30 @@ class App(object):
         })
 
     def _report_frame_grab_implementation(self):
-        if _cgrabcallback is not None:
+        self._set_framegrab_backend(self.use_cgrabcallback)
+
+    def _is_using_c_framegrab(self):
+        return bool(self.use_cgrabcallback and (_cgrabcallback is not None))
+
+    def _set_framegrab_backend(self, use_cgrab):
+        self.use_cgrabcallback = bool(use_cgrab)
+        using_c = self._is_using_c_framegrab()
+
+        if using_c:
             message = 'Frame grab implementation: C extension (cgrabcallback.fast_memcpy).'
+        elif self.use_cgrabcallback:
+            message = 'Frame grab implementation: Python fallback (C extension requested but unavailable).'
         else:
-            message = 'Frame grab implementation: Python fallback (ctypes.memmove).'
+            message = 'Frame grab implementation: Python fallback (ctypes.memmove, requested).'
 
         print(message)
+        self._publish_status({
+            'type': 'framegrab_backend',
+            'requested_c': bool(self.use_cgrabcallback),
+            'available_c': bool(_cgrabcallback is not None),
+            'using_c': bool(using_c),
+            'message': message,
+        })
         self._publish_status({'type': 'status', 'message': message})
 
     def _clear_pending_frames(self):
@@ -386,6 +411,8 @@ class App(object):
                 gain = float(payload)
                 applied_gain = self._apply_analog_gain_multiplier(gain)
                 self._publish_status({'type': 'gain', 'value': applied_gain})
+            elif name == 'set_framegrab_backend':
+                self._set_framegrab_backend(bool(payload))
             elif name == 'set_roi':
                 self._apply_roi(payload)
             elif name == 'reset_roi':
@@ -697,7 +724,7 @@ class App(object):
         ])
         frame_speed_options = self._get_frame_speed_options()
         resolution_modes, binning_support, binning_masks_raw = self._get_resolution_modes()
-
+        #mvsdk.CameraEnableFastResponse(self.hCamera) - not found on the current dylib
         lines = ['Strobe/trigger settings at camera load:']
         for item in report:
             if item['ok']:
@@ -1296,6 +1323,9 @@ class App(object):
         self.session_callback_timing_total_s = 0.0
         self.session_callback_timing_max_s = 0.0
 
+        # Mark FPS reset as pending for new experiment
+        self._fps_reset_after_first_frame = True
+
     def _save_initial_frame_tiff(self, frame_data):
         if self.session_preview_frames_saved >= 2:
             return
@@ -1318,6 +1348,13 @@ class App(object):
                 raise OSError(f"cv2.imwrite returned False for {frame_path}")
 
             self.session_preview_frames_saved += 1
+
+            # Reset FPS calculation after first frame is saved as TIFF
+            if self._fps_reset_after_first_frame and self.session_preview_frames_saved == 1:
+                self.fps_samples.clear()
+                self.last_stats_time = None
+                self.last_stats_frame_count = 0
+                self._fps_reset_after_first_frame = False
         except Exception as exc:
             print(f"Warning: failed to save frame preview TIFF: {exc}")
 
@@ -1655,7 +1692,7 @@ class App(object):
                     self._record_callback_timing(time.perf_counter() - callback_t0)
                 return
             nbytes = min(frame_nbytes, self.frame_bytes)
-            if _cgrabcallback is not None:
+            if self._is_using_c_framegrab():
                 # pRawData may be a ctypes pointer object on some SDK builds (common on Windows);
                 # cast to c_void_p to get a plain integer before passing to fast_memcpy.
                 src_addr = ctypes.cast(pRawData, ctypes.c_void_p).value
@@ -1665,17 +1702,33 @@ class App(object):
 
             # Reuse pooled bytes for display when possible (avoid a second SDK-buffer copy).
             if wants_display:
-                display_frame_data = bytes(self._frame_view_from_slot(frame_slot, nbytes))
+                # Use fast memcpy into a preallocated display buffer for display, matching the display-only path.
+                if not hasattr(self, '_display_frame_buffer') or self._display_frame_buffer is None or len(self._display_frame_buffer) != nbytes:
+                    self._display_frame_buffer = bytearray(nbytes)
+                dest_addr = (ctypes.c_char * nbytes).from_buffer(self._display_frame_buffer)
+                src_addr = self._frame_pool_addrs[frame_slot]
+                if self._is_using_c_framegrab() and _cgrabcallback is not None:
+                    _cgrabcallback.fast_memcpy(ctypes.addressof(dest_addr), src_addr, nbytes)
+                else:
+                    ctypes.memmove(dest_addr, ctypes.c_void_p(src_addr), nbytes)
+                display_frame_data = bytes(self._display_frame_buffer)
         elif wants_display:
-            # No save slot available (not saving): copy directly from SDK buffer for display.
-            display_frame_data = bytes((mvsdk.c_ubyte * frame_nbytes).from_address(pRawData))
+            # No save slot available (not saving): use fast memcpy into a preallocated display buffer.
+            if not hasattr(self, '_display_frame_buffer') or self._display_frame_buffer is None or len(self._display_frame_buffer) != frame_nbytes:
+                self._display_frame_buffer = bytearray(frame_nbytes)
+            dest_addr = (ctypes.c_char * frame_nbytes).from_buffer(self._display_frame_buffer)
+            src_addr = ctypes.cast(pRawData, ctypes.c_void_p).value
+            if self._is_using_c_framegrab() and _cgrabcallback is not None:
+                _cgrabcallback.fast_memcpy(ctypes.addressof(dest_addr), src_addr, frame_nbytes)
+            else:
+                ctypes.memmove(dest_addr, pRawData, frame_nbytes)
+            display_frame_data = bytes(self._display_frame_buffer)
 
         mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
 
         if not self.acquiring:
             self.acquiring = True
             self.t_start = time.time()
-
 
         if self.saving:
             frame_timestamp = time.time()
@@ -1686,8 +1739,7 @@ class App(object):
                 if timing_active:
                     self._record_callback_timing(time.perf_counter() - callback_t0)
                 return
-        # Stop addding to the display queue if the frame queue is getting too full
-        if wants_display and self.frame_queue.qsize() < 0.95 * self.frame_queue.maxsize and display_frame_data is not None:
+        if wants_display and display_frame_data is not None:
             self._put_display_frame(display_frame_data, self.frame_count)
         self.frame_count += 1
 

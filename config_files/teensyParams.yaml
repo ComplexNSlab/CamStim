@@ -30,9 +30,12 @@
 port: "/dev/cu.usbmodem185040201"
 BAUD: 115200 # leave this 
 
-F_LED: 50 # LED frequency in Hz
-E_LED: 18000 # Duration of LED pulse in microseconds
-O_CAM: 1000 # Delay from LED ON to TTL to Task Teensy (microseconds)
+# F_LED: 50 # LED frequency in Hz
+# E_LED: 18000 # Duration of LED pulse in microseconds
+# O_CAM: 1000 # Delay from LED ON to TTL to Task Teensy (microseconds)
+F_LED: 80 # LED frequency in Hz
+E_LED: 12400 # Duration of LED pulse in microseconds
+O_CAM: 200 # Delay from LED ON to TTL to Task Teensy (microseconds)
 # F_LED: 20 # LED frequency in Hz
 # E_LED: 28000 # Duration of LED pulse in microseconds
 # O_CAM: 1000 # Delay from LED ON to TTL to Task Teensy (microseconds)

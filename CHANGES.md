@@ -6,6 +6,9 @@
 		- C extension path: `cgrabcallback.fast_memcpy`
 		- Python fallback path: `ctypes.memmove`
 
+- Fixed GUI preview latency in the camera worker:
+	- Removed the redundant display-frame queue-depth gate so the worker always publishes the newest frame instead of holding back updates when the queue is already configured to keep only the latest item.
+
 - Added interactive ROI controls to the GUI (`camstim.py`):
 	- New `Image -> Select ROI` action (enabled only while camera is running).
 	- ROI drawing on the live preview via drag-rectangle interaction.

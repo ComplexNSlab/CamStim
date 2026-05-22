@@ -154,6 +154,11 @@ class CameraProcessClient:
 		self.mouse_id = None
 		self.on_logic_analyzer_terminated = None
 		self.on_experiment_finished = None
+		use_cgrab_cfg = config.get('USE_CGRABCALLBACK', True)
+		if isinstance(use_cgrab_cfg, str):
+			self.use_c_framegrab = use_cgrab_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+		else:
+			self.use_c_framegrab = bool(use_cgrab_cfg)
 
 	def start(self):
 		ctx = mp.get_context('spawn')
@@ -235,6 +240,9 @@ class CameraProcessClient:
 					self.latest_frame_data = None
 				self._ensure_display_buffers()
 				self.exp_status_queue.put(("status", f"ROI applied: {msg.get('width')}x{msg.get('height')} at ({msg.get('x')}, {msg.get('y')})."))
+			elif msg_type == 'framegrab_backend':
+				self.use_c_framegrab = bool(msg.get('using_c', self.use_c_framegrab))
+				self.exp_status_queue.put(("status", msg.get('message', 'Framegrab backend updated.')))
 			elif msg_type == 'status':
 				self.exp_status_queue.put(("status", msg.get('message', '')))
 			elif msg_type == 'trial':
@@ -287,6 +295,10 @@ class CameraProcessClient:
 
 	def set_roi(self, x, y, width, height):
 		return self._send_command('set_roi', {'x': x, 'y': y, 'width': width, 'height': height})
+
+	def set_framegrab_backend(self, use_c_backend):
+		self.use_c_framegrab = bool(use_c_backend)
+		return self._send_command('set_framegrab_backend', bool(use_c_backend))
 
 	def reset_roi(self):
 		return self._send_command('reset_roi')
@@ -464,9 +476,11 @@ class CameraGUI(QMainWindow):
 		self.last_display_frame = None
 		self.select_roi_action = None
 		self.reset_roi_action = None
+		self.framegrab_backend_cb = None
 		self.exp_status_timer = QTimer()
 		self.exp_status_timer.timeout.connect(self.check_experiment_status)
 		self.exp_status_timer.start(100)
+		self._last_experiment_display_time = 0.0
 		self.init_ui()
 		self.populate_experiment_controls()
 		self.setup_timer()
@@ -1138,6 +1152,8 @@ class CameraGUI(QMainWindow):
 			exposure_value = float(self.exposure_spin.value())
 			self.camera_app.exposure = exposure_value
 			self.camera_app.set_exposure(exposure_value)
+			if self.framegrab_backend_cb is not None:
+				self.camera_app.set_framegrab_backend(self.framegrab_backend_cb.isChecked())
 			self._sync_gain_spinner_with_camera()
 
 			self.load_and_display_camera_config()
@@ -1146,6 +1162,16 @@ class CameraGUI(QMainWindow):
 			self.update_status("Camera started successfully in continuous mode.")
 		except Exception as e:
 			self.update_status(f"Error starting camera: {str(e)}.")
+
+	def update_framegrab_backend(self, state):
+		use_c_backend = bool(state == Qt.CheckState.Checked.value)
+		self.config['USE_CGRABCALLBACK'] = use_c_backend
+		if self.camera_app:
+			self.camera_app.set_framegrab_backend(use_c_backend)
+		self.update_status(
+			f"Requested framegrab backend: {'C extension' if use_c_backend else 'Python fallback'}."
+		)
+
 	def _sync_gain_spinner_with_camera(self):
 		if not self.camera_app or not hasattr(self, 'gain_spin'):
 			return
@@ -1253,6 +1279,14 @@ class CameraGUI(QMainWindow):
 	def update_display(self):
 		if self.camera_app:
 			try:
+				# Limit to 10 fps during experiment (saving or hardware trigger enabled)
+				experiment_active = getattr(self.camera_app, 'saving', False) or self.hardware_trigger_enabled
+				if experiment_active:
+					now = time.time()
+					if now - self._last_experiment_display_time < 0.1:
+						return
+					self._last_experiment_display_time = now
+
 				frame_data = self.camera_app.get_frame_for_display()
 				if frame_data is None:
 					return
