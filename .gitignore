@@ -32,3 +32,5 @@ utils/build/
 # Jupyter
 .ipynb_checkpoints/
 notebooks/Untitled*.ipynb
+
+.github

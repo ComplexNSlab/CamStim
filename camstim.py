@@ -497,6 +497,14 @@ class CameraGUI(QMainWindow):
 		self.histogram_frame_ready.connect(self._on_histogram_frame_ready)
 		self.histogram_close_requested.connect(self._close_histogram_window)
 		self._last_experiment_display_time = 0.0
+		refresh_rate_cfg = self.config.get('DISPLAY_REFRESH_RATE', 10)
+		try:
+			self.display_refresh_rate = float(refresh_rate_cfg)
+		except (TypeError, ValueError):
+			self.display_refresh_rate = 10.0
+		if self.display_refresh_rate <= 0:
+			self.display_refresh_rate = 10.0
+		self.display_refresh_interval_s = 1.0 / self.display_refresh_rate
 		self.init_ui()
 		self.load_and_display_camera_config()
 		self.load_and_display_teensy_config()
@@ -1328,11 +1336,11 @@ class CameraGUI(QMainWindow):
 	def update_display(self):
 		if self.camera_app:
 			try:
-				# Limit to 10 fps during experiment (saving or hardware trigger enabled)
+				# Limit preview refresh during experiment (saving or hardware trigger enabled).
 				experiment_active = getattr(self.camera_app, 'saving', False) or self.hardware_trigger_enabled
 				if experiment_active:
 					now = time.time()
-					if now - self._last_experiment_display_time < 0.1:
+					if now - self._last_experiment_display_time < self.display_refresh_interval_s:
 						return
 					self._last_experiment_display_time = now
 

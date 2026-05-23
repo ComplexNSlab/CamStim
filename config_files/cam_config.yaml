@@ -12,6 +12,10 @@ USE_CGRABCALLBACK: true
 
 DISPLAY_MUTABLE_BUFFERS: true
 
+# GUI display refresh rate during active experiment preview (Hz).
+# Example: 10 means redraw at most every 0.1 seconds while saving/triggering.
+DISPLAY_REFRESH_RATE: 10
+
 # What exposure time to use (in ms, can be < 0)
 EXPOSURE_TIME: 12
 # Analog gain multiplier (real units, e.g. 2.5). Keep as low as possible.
