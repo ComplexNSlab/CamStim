@@ -1,3 +1,22 @@
+# 2026-05-23
+- Added sensor-temperature support through MindVision `CameraSpecialControl`:
+	- Added `CameraGetSensorTemperature(hCamera)` in `core/mvsdk2024.py`.
+	- Uses empirically identified control code `0x0014` and decodes a `float32` temperature in °C.
+
+- Added a temperature probe utility:
+	- New `utils/probe_special_control.py` sweeps undocumented control codes and reports plausible temperature hits.
+
+- Added live temperature to GUI status text:
+	- `camstim.py` now shows `Temp: xx.x°C` in `self.stats_label` when available.
+
+- Added per-frame temperature persistence in save metadata:
+	- `utils/simple_cam_mx.py` now attaches temperature samples to queued save frames.
+	- Saved metadata now includes `sensor_temperatures_c` aligned with saved frames/timestamps.
+	- Added `sensor_temperature_stats_c` summary (`count`, `min`, `max`, `mean`) when valid samples exist.
+
+- Improved camera worker shutdown robustness:
+	- `CameraProcessClient.stop()` now force-terminates the worker process if graceful join times out, preventing stale camera-handle leaks across restarts.
+
 # 2026-05-22
 - Simplified display-frame copy handling in `utils/simple_cam_mx.py`:
 	- Added optional mutable display mode controlled by `DISPLAY_MUTABLE_BUFFERS`.

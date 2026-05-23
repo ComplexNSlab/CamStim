@@ -150,6 +150,8 @@ class App(object):
         self.sys_clock_timestamps = []
         self.session_frame_timestamps = []
         self.session_sys_clock_timestamps = []
+        self.session_sensor_temperatures = []
+        self.latest_sensor_temperature = None
         self.t_start = None
         self.hCamera = None
         self.roi_x = 0
@@ -505,8 +507,8 @@ class App(object):
                 return None
             return self.latest_frame_data
 
-    def _enqueue_save_frame(self, frame_data, frame_index, camera_timestamp, system_timestamp):
-        queued_frame = (frame_data, frame_index, camera_timestamp, system_timestamp)
+    def _enqueue_save_frame(self, frame_data, frame_index, camera_timestamp, system_timestamp, sensor_temperature=None):
+        queued_frame = (frame_data, frame_index, camera_timestamp, system_timestamp, sensor_temperature)
         try:
             # Never block the camera callback thread; callback stalls can cause SDK-level drops.
             self.frame_queue.put_nowait(queued_frame)
@@ -752,7 +754,7 @@ class App(object):
         ])
         frame_speed_options = self._get_frame_speed_options()
         resolution_modes, binning_support, binning_masks_raw = self._get_resolution_modes()
-        #mvsdk.CameraEnableFastResponse(self.hCamera) - not found on the current dylib
+        #mvsdk.CameraEnableFastResponse(self.hCamera) # not found on the current dylib
         lines = ['Strobe/trigger settings at camera load:']
         for item in report:
             if item['ok']:
@@ -1237,6 +1239,7 @@ class App(object):
             'data_type': self.dtype if not self.bin_exp else 'uint16',
             'frame_timestamps': self.session_frame_timestamps,
             'sys_clock_timestamps': self.session_sys_clock_timestamps,
+            'sensor_temperatures_c': self.session_sensor_temperatures,
             'frame_exposure': self.exposure,
             'frame_gain': self.analog_gain,
             'binned_live': self.bin_exp,
@@ -1248,6 +1251,15 @@ class App(object):
                 'estimated_total_triggered_frames': estimated_total_triggered_frames,
             },
         }
+
+        valid_temps = [float(v) for v in self.session_sensor_temperatures if v is not None]
+        if valid_temps:
+            metadata['sensor_temperature_stats_c'] = {
+                'count': int(len(valid_temps)),
+                'min': float(min(valid_temps)),
+                'max': float(max(valid_temps)),
+                'mean': float(sum(valid_temps) / len(valid_temps)),
+            }
 
         if self.debug_callback_timing and self.session_callback_timing_count > 0:
             callback_mean_s = self.session_callback_timing_total_s / self.session_callback_timing_count
@@ -1352,6 +1364,7 @@ class App(object):
         self.session_frames_written = 0
         self.session_frame_timestamps = []
         self.session_sys_clock_timestamps = []
+        self.session_sensor_temperatures = []
         self.session_preview_frames_saved = 0
         self.session_callback_timing_count = 0
         self.session_callback_timing_total_s = 0.0
@@ -1456,6 +1469,7 @@ class App(object):
         write_batch = []
         ts_batch = []
         sys_ts_batch = []
+        temp_batch = []
 
         def flush_batch(force_flush=False):
             nonlocal last_flush_time
@@ -1468,6 +1482,7 @@ class App(object):
                 write_batch.clear()
                 ts_batch.clear()
                 sys_ts_batch.clear()
+                temp_batch.clear()
                 return
 
             n = len(write_batch)
@@ -1506,13 +1521,14 @@ class App(object):
                 self._close_save_file_handle()
                 for slot_idx, _ in write_batch:
                     self._release_frame_slot(slot_idx)
-                write_batch.clear(); ts_batch.clear(); sys_ts_batch.clear()
+                write_batch.clear(); ts_batch.clear(); sys_ts_batch.clear(); temp_batch.clear()
                 return
 
             self.frame_timestamps.extend(ts_batch)
             self.sys_clock_timestamps.extend(sys_ts_batch)
             self.session_frame_timestamps.extend(ts_batch)
             self.session_sys_clock_timestamps.extend(sys_ts_batch)
+            self.session_sensor_temperatures.extend(temp_batch)
             self.frames_written += n
             self.session_frames_written += n
 
@@ -1525,6 +1541,7 @@ class App(object):
             write_batch.clear()
             ts_batch.clear()
             sys_ts_batch.clear()
+            temp_batch.clear()
 
         while True:
             if self.saving:
@@ -1552,7 +1569,7 @@ class App(object):
 
                 # Process frames if available
                 try:
-                    frame_data, count, timestamp, sys_stamp = self.frame_queue.get(timeout=0.02)
+                    frame_data, count, timestamp, sys_stamp, sensor_temp = self.frame_queue.get(timeout=0.02)
                 except queue.Empty:
                     flush_batch(force_flush=True)
                     if self.quit and self.frame_queue.empty():
@@ -1564,6 +1581,7 @@ class App(object):
                 self._save_initial_frame_tiff(self._frame_view_from_slot(slot_idx, nbytes))
                 ts_batch.append(timestamp)
                 sys_ts_batch.append(sys_stamp)
+                temp_batch.append(None if sensor_temp is None else float(sensor_temp))
                 if len(write_batch) >= flush_every_n_frames:
                     flush_batch(force_flush=False)
 
@@ -1574,7 +1592,7 @@ class App(object):
             else:
                 while not self.frame_queue.empty():
                     try:
-                        frame_data, count, timestamp, sys_stamp = self.frame_queue.get_nowait()
+                        frame_data, count, timestamp, sys_stamp, sensor_temp = self.frame_queue.get_nowait()
                     except queue.Empty:
                         break
 
@@ -1583,6 +1601,7 @@ class App(object):
                     self._save_initial_frame_tiff(self._frame_view_from_slot(slot_idx, nbytes))
                     ts_batch.append(timestamp)
                     sys_ts_batch.append(sys_stamp)
+                    temp_batch.append(None if sensor_temp is None else float(sensor_temp))
                     if len(write_batch) >= flush_every_n_frames:
                         flush_batch(force_flush=False)
 
@@ -1695,6 +1714,13 @@ class App(object):
             self.last_stats_frame_count = self.frame_count
             average_fps = sum(self.fps_samples) / len(self.fps_samples) if self.fps_samples else 0
 
+            sensor_temp = None
+            if self.hCamera:
+                try:
+                    sensor_temp = mvsdk.CameraGetSensorTemperature(self.hCamera)
+                except Exception:
+                    pass
+            self.latest_sensor_temperature = sensor_temp
             self._publish_status({
                 'type': 'stats',
                 'frame_count': self.frame_count,
@@ -1702,6 +1728,7 @@ class App(object):
                 'save_queue_size': self.frame_queue.qsize(),
                 'display_queue_size': 0,
                 'average_fps': float(average_fps),
+                'sensor_temperature': sensor_temp,
             })
 
             # Print stats, reusing the same terminal line
@@ -1812,7 +1839,13 @@ class App(object):
         if self.saving:
             frame_timestamp = time.time()
             queued_ref = (frame_slot, min(frame_nbytes, self.frame_bytes))
-            if not self._enqueue_save_frame(queued_ref, self.frame_count, FrameHead.uiTimeStamp, frame_timestamp):
+            if not self._enqueue_save_frame(
+                queued_ref,
+                self.frame_count,
+                FrameHead.uiTimeStamp,
+                frame_timestamp,
+                self.latest_sensor_temperature,
+            ):
                 self._release_frame_slot(frame_slot)
                 self.dropped_save_frames += 1
                 if timing_active:

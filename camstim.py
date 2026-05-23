@@ -153,6 +153,7 @@ class CameraProcessClient:
 		self.save_queue_size = 0
 		self.display_queue_size = 0
 		self.average_fps = None
+		self.sensor_temperature = None
 		self.exp_status_queue = queue.Queue()
 		self.analog_gain = float(config.get('ANALOG_GAIN', 1.0))
 		self.analog_gain_step = 0.1
@@ -236,6 +237,8 @@ class CameraProcessClient:
 				self.display_queue_size = int(msg.get('display_queue_size', self.display_queue_size))
 				if 'average_fps' in msg:
 					self.average_fps = float(msg['average_fps'])
+				if 'sensor_temperature' in msg and msg['sensor_temperature'] is not None:
+					self.sensor_temperature = msg['sensor_temperature']
 			elif msg_type == 'trigger_mode':
 				self.hardware_trigger_enabled = msg.get('mode') == 2
 			elif msg_type == 'exposure':
@@ -455,6 +458,10 @@ class CameraProcessClient:
 		self._send_command('stop_camera')
 		if self.process is not None:
 			self.process.join(timeout=3.0)
+			if self.process.is_alive():
+				self.process.terminate()
+				self.process.join(timeout=2.0)
+			self.process = None
 
 class CameraGUI(QMainWindow):
 	histogram_frame_ready = pyqtSignal(object)
@@ -1516,7 +1523,9 @@ class CameraGUI(QMainWindow):
 					average_fps = float(worker_average_fps)
 
 				save_queue_size = getattr(self.camera_app, 'save_queue_size', 0)
-				stats_text = f"FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}"
+				sensor_temp = getattr(self.camera_app, 'sensor_temperature', None)
+				temp_str = f" | Temp: {sensor_temp:.1f}°C" if sensor_temp is not None else ""
+				stats_text = f"FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}{temp_str}"
 				self.stats_label.setText(stats_text)
 			except:
 				pass

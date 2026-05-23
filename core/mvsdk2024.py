@@ -1589,6 +1589,23 @@ def CameraSpecialControl(hCamera, dwCtrlCode, dwParam, lpData):
 	SetLastError(err_code)
 	return err_code
 
+# Control code 0x0014 was found empirically to return the sensor temperature
+# as a float32 in the output buffer (verified on HT-SUA134GM / PYTHON 1300).
+_CAMERA_CTRL_GET_SENSOR_TEMP = 0x0014
+
+def CameraGetSensorTemperature(hCamera):
+	"""Return the image sensor temperature in degrees Celsius (float32).
+	Returns None if the call fails."""
+	buf = (c_uint8 * 8)()
+	err_code = _sdk.CameraSpecialControl(hCamera, _CAMERA_CTRL_GET_SENSOR_TEMP, 0,
+	                                     cast(buf, c_void_p))
+	SetLastError(err_code)
+	if err_code != 0:
+		return None
+	import struct
+	temp, = struct.unpack_from('<f', bytes(buf))
+	return temp
+
 def CameraGetFrameStatistic(hCamera):
 	psFrameStatistic = tSdkFrameStatistic()
 	err_code = _sdk.CameraGetFrameStatistic(hCamera, byref(psFrameStatistic))
