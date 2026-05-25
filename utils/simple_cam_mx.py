@@ -15,6 +15,7 @@ import subprocess
 import shutil
 from collections import deque
 import cv2
+from core.experiment_discovery import discover_experiment_types
 try:
     from . import cgrabcallback as _cgrabcallback
 except ImportError:
@@ -163,6 +164,7 @@ class App(object):
         self.session_callback_timing_count = 0
         self.session_callback_timing_total_s = 0.0
         self.session_callback_timing_max_s = 0.0
+        self.session_callback_timing_samples_s = []
         self._fps_reset_after_first_frame = False
         self.on_logic_analyzer_terminated = None
 
@@ -1106,9 +1108,20 @@ class App(object):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         wf_script = os.path.join(script_dir, "wf_main.py")
         cmd = [sys.executable, "-u", wf_script, exp_name, experiment_id, mouse_id]
-        if self.debug_skip_teensy:
+        
+        # Check if this experiment should skip Teensy (either from config or experiment class attribute)
+        skip_teensy_enabled = self.debug_skip_teensy
+        if not skip_teensy_enabled:
+            try:
+                exp_types = discover_experiment_types()
+                exp_class = exp_types.get(exp_name)
+                skip_teensy_enabled = getattr(exp_class, 'skip_teensy', False)
+            except Exception:
+                pass
+        
+        if skip_teensy_enabled:
             cmd.append("--skip-teensy")
-            print("DEBUG_SKIP_TEENSY enabled: running experiment without Teensy.")
+            print("Teensy skipped: running experiment without Teensy.")
 
         self.stim_progress = subprocess.Popen(cmd,
             stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.PIPE, text=True,
@@ -1269,6 +1282,7 @@ class App(object):
                 'total_seconds': float(self.session_callback_timing_total_s),
                 'mean_ms': float(callback_mean_s * 1000.0),
                 'max_ms': float(self.session_callback_timing_max_s * 1000.0),
+                'samples_ms': [float(v * 1000.0) for v in self.session_callback_timing_samples_s],
             }
 
         np.save(os.path.join(self.save_dir, '{}.npy'.format(self.filename)), metadata)
@@ -1359,6 +1373,7 @@ class App(object):
         self.session_callback_timing_total_s += float(elapsed_s)
         if elapsed_s > self.session_callback_timing_max_s:
             self.session_callback_timing_max_s = float(elapsed_s)
+        self.session_callback_timing_samples_s.append(float(elapsed_s))
 
     def _reset_save_session_metadata(self):
         self.session_frames_written = 0
@@ -1369,6 +1384,7 @@ class App(object):
         self.session_callback_timing_count = 0
         self.session_callback_timing_total_s = 0.0
         self.session_callback_timing_max_s = 0.0
+        self.session_callback_timing_samples_s = []
 
         # Mark FPS reset as pending for new experiment
         self._fps_reset_after_first_frame = True

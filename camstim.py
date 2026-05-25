@@ -19,7 +19,7 @@ import yaml
 from pathlib import Path
 
 from utils.simple_cam_mx import load_camera_config, load_save_root, run_camera_worker
-from core.experiment_discovery import get_experiment_list, resolve_experiment_config_file
+from core.experiment_discovery import get_experiment_list, resolve_experiment_config_file, discover_experiment_types
 
 
 CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
@@ -1095,8 +1095,27 @@ class CameraGUI(QMainWindow):
 		self.exp_combo.blockSignals(False)
 		self.load_and_display_exp_config()
 
+	def _should_enable_experiment_button(self):
+		"""Check if experiment button should be enabled based on selected experiment and trigger mode."""
+		exp_name = self.exp_combo.currentText().strip()
+		if not exp_name:
+			return False
+		
+		# Check if this experiment type requires hardware trigger
+		exp_types = discover_experiment_types()
+		exp_class = exp_types.get(exp_name)
+		requires_hw_trigger = getattr(exp_class, 'requires_hardware_trigger', True)
+		
+		# Enable button if:
+		# 1. Experiment doesn't require hardware trigger (like Continuous), OR
+		# 2. Hardware trigger is enabled
+		return not requires_hw_trigger or self.hardware_trigger_enabled
+
 	def on_experiment_selection_changed(self, _text):
 		self.load_and_display_exp_config()
+		# Update button enablement when experiment selection changes
+		if self.camera_app:
+			self.exp_btn.setEnabled(self._should_enable_experiment_button())
 
 	def get_selected_experiment_params(self):
 		exp_name = self.exp_combo.currentText().strip()
@@ -1525,7 +1544,10 @@ class CameraGUI(QMainWindow):
 				save_queue_size = getattr(self.camera_app, 'save_queue_size', 0)
 				sensor_temp = getattr(self.camera_app, 'sensor_temperature', None)
 				temp_str = f" | Temp: {sensor_temp:.1f}°C" if sensor_temp is not None else ""
-				stats_text = f"FPS: {average_fps: .1f} | Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}{temp_str}"
+				stats_text = (
+					f"FPS: {average_fps: .1f}{temp_str}\n"
+					f"Frames: {self.camera_app.frame_count} | Saved: {self.camera_app.frames_written} | Save Queue: {save_queue_size}"
+				)
 				self.stats_label.setText(stats_text)
 			except:
 				pass
@@ -1548,7 +1570,8 @@ class CameraGUI(QMainWindow):
 					print("\n Switching to continuous mode.")
 
 					self.trigger_btn.setText("Enable Hardware Trigger")
-					self.exp_btn.setEnabled(False)
+					# Update button based on whether selected experiment needs hardware trigger
+					self.exp_btn.setEnabled(self._should_enable_experiment_button())
 					self.update_status("Continuous mode enabled.")
 			except Exception as e:
 				self.update_status(f"Error toggling trigger mode: {e}.")
@@ -1611,41 +1634,53 @@ class CameraGUI(QMainWindow):
 			self.current_exp_config = None
 
 	def start_experiment(self):
-		if self.camera_app and self.hardware_trigger_enabled:
-			params = self.get_selected_experiment_params()
-			if params is None:
-				return
+		if not self.camera_app:
+			self.update_status("Error: Camera app not initialized.")
+			return
 
-			exp_name, experiment_id, mouse_id = params
-			try:
-				# Ensure GUI-side Teensy is fully stopped and released before
-				# the experiment process (simple_cam_mx) initializes Teensy.
-				if self.teensy_controller is not None:
-					self.teensy_controller.stop_teensy()
-					if hasattr(self.teensy_controller, 'ser') and self.teensy_controller.ser and self.teensy_controller.ser.is_open:
-						self.teensy_controller.ser.close()
-					self.teensy_controller = None
-				self.teensy_active = False
-				self.teensy_toggle_btn.setText("Enable Teensy")
-			except Exception as e:
-				self.update_status(f"Error stopping Teensy before experiment start: {e}.")
-				return
+		# Check if the selected experiment requires hardware trigger
+		params = self.get_selected_experiment_params()
+		if params is None:
+			return
 
-			self.camera_app.set_saving(True)
-			started = self.camera_app.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
-			if not started:
-				self.camera_app.set_saving(False)
-				self.update_status('Error: Failed to start experiment subprocess.')
-				return
-			self.load_and_display_exp_config()
-			self.reset_display_average_on_next_frame = True
-			self.reset_fps_on_next_frame = True
-			self.exp_btn.setEnabled(False)
-			self.stop_exp_btn.setEnabled(True)
-			self.trigger_btn.setEnabled(False)
-			self.update_status(f"Experiment started: {exp_name}.")
-		else:
+		exp_name, experiment_id, mouse_id = params
+		
+		# Check if this experiment type requires hardware trigger
+		exp_types = discover_experiment_types()
+		exp_class = exp_types.get(exp_name)
+		requires_hw_trigger = getattr(exp_class, 'requires_hardware_trigger', True)
+		
+		if not self.hardware_trigger_enabled and requires_hw_trigger:
 			self.update_status("Error: Must enable hardware trigger mode first.")
+			return
+
+		try:
+			# Ensure GUI-side Teensy is fully stopped and released before
+			# the experiment process (simple_cam_mx) initializes Teensy.
+			if self.teensy_controller is not None:
+				self.teensy_controller.stop_teensy()
+				if hasattr(self.teensy_controller, 'ser') and self.teensy_controller.ser and self.teensy_controller.ser.is_open:
+					self.teensy_controller.ser.close()
+				self.teensy_controller = None
+			self.teensy_active = False
+			self.teensy_toggle_btn.setText("Enable Teensy")
+		except Exception as e:
+			self.update_status(f"Error stopping Teensy before experiment start: {e}.")
+			return
+
+		self.camera_app.set_saving(True)
+		started = self.camera_app.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
+		if not started:
+			self.camera_app.set_saving(False)
+			self.update_status('Error: Failed to start experiment subprocess.')
+			return
+		self.load_and_display_exp_config()
+		self.reset_display_average_on_next_frame = True
+		self.reset_fps_on_next_frame = True
+		self.exp_btn.setEnabled(False)
+		self.stop_exp_btn.setEnabled(True)
+		self.trigger_btn.setEnabled(False)
+		self.update_status(f"Experiment started: {exp_name}.")
 
 	def stop_experiment(self):
 		if self.camera_app:
