@@ -1,0 +1,39 @@
+#Experiment config file
+# Basic file for parameters of the experiment
+# All delays in seconds
+name: "VisualFieldMapping"
+
+n_repeats: 1
+
+# the delay before starting and after ending the experiment (black square comes on at half of this time)
+experiment_delay: 10
+# stim on length
+stim_length: 1
+
+# stim off length (iti)
+inter_trial_delay: 1
+
+#Parameters of visual stimuli
+
+# In degrees, relative to the center of the screen. [[x1, y1], [x2, y2], ...]
+grating_position: [[40, 15], [0, 15], [-40, 15], [40, -15], [0, -15], [-40, -15]] 
+# In deg, 0 is vertical, positive is clockwise. For example, [0, 90] means vertical and horizontal gratings.
+grating_orientations: [0]
+# Spatial frequency in cycles/degree (cpd) used for phase drift. 0.5 cpd is a good starting point for mouse V1.
+grating_sfs: [0.2]
+# Temporal frequencies in cycles/sec (Hz) explored like other stimulus combinations.
+grating_phase_temporal_frequencies: [2]
+# In degrees, the size of the grating stimulus. For circular mask, this is the diameter. For square mask, this is the side length.
+grating_sizes: [[20, 20]] 
+
+give_blanks: True
+
+# grating_mask options:
+# 1) 'gauss'    : Gaussian soft-edged aperture
+# 2) 'circle'   : hard-edged circular aperture
+# 3) 'raisedCos': raised-cosine soft-edged circular aperture
+# 4) 'none'     : no mask (full rectangular grating patch)
+grating_mask: 'gauss'
+
+
+trial_params_columns: ["trial_number", "clock_time", "position", "orientation", "sf", "size", "temporal_frequency", "stim_info_str"]

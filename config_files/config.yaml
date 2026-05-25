@@ -1,0 +1,7 @@
+# Previous Windows defaults:
+# SAVE_DIR: "C:\\Data"
+# SIGROK_EXE: "C:\\Program Files\\sigrok\\sigrok-cli\\sigrok-cli.exe"
+
+SAVE_DIR: "/home/orlandi/data/camstim"
+#SAVE_DIR: "/Users/orlandi/data"
+SIGROK_EXE: "sigrok-cli"

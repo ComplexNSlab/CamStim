@@ -1,0 +1,3 @@
+# Configuration for Continuous experiment
+name: continuous
+wait_time_sec: 18000

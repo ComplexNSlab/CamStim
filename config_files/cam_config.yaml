@@ -1,0 +1,52 @@
+# Whether to use the live speckle feature
+USE_LIVE_SPECKLE: false
+BUFFER_SIZE: 10
+
+# Debug option: run experiments without initializing the Teensy board.
+DEBUG_SKIP_TEENSY: false
+
+# Framegrab backend preference.
+# true: prefer C extension (cgrabcallback.fast_memcpy), fallback to Python if unavailable.
+# false: force Python fallback (ctypes.memmove).
+USE_CGRABCALLBACK: true
+
+DISPLAY_MUTABLE_BUFFERS: true
+
+# GUI display refresh rate during active experiment preview (Hz).
+# Example: 10 means redraw at most every 0.1 seconds while saving/triggering.
+DISPLAY_REFRESH_RATE: 10
+
+# What exposure time to use (in ms, can be < 0)
+EXPOSURE_TIME: 12
+# Analog gain multiplier (real units, e.g. 2.5). Keep as low as possible.
+ANALOG_GAIN: 2.5
+
+# Whether the data should be binned during the experiment
+# raw data is huge (2048, 2048) images
+BIN_EXP_LIVE: true
+# Software bin size (e.g., 4 means final image size will be 512, 512)
+BIN_SIZE: 16
+
+# Save pipeline settings for high-throughput acquisition
+# Number of frames buffered in RAM before disk writes catch up.
+# 2048x2048x8-bit ~= 4 MiB/frame, so 1000 frames ~= 4 GiB.
+SAVE_QUEUE_MAX_FRAMES: 1200
+# Frames grouped into one write batch. Larger batches reduce syscall overhead.
+SAVE_BATCH_FRAMES: 64
+# Upper bound on raw frame bytes per batch (helps avoid long periodic write stalls).
+SAVE_TARGET_BATCH_BYTES: 33554432
+# Preallocated callback frame slots for save path (2048x2048x8-bit ~= 4 MiB each).
+# 256 slots ~= 1 GiB preallocated.
+FRAME_POOL_FRAMES: 256
+# Disable Python GC during active acquisition to reduce callback jitter.
+# GC is restored automatically when the worker exits.
+DISABLE_GC_DURING_ACQUIRE: true
+# Debug: measure callback wall time during active recording and store summary in metadata.
+DEBUG_CALLBACK_TIMING: true
+
+# Apply horizontal mirror to each grabbed frame via CameraFlipFrameBuffer.
+# Set to true when the camera is mounted so the raw image is left-right flipped.
+CAMERA_MIRROR_HORIZONTAL: true
+# Flags passed to CameraFlipFrameBuffer.
+# 1 is commonly horizontal flip in many SDK builds.
+CAMERA_MIRROR_FLIP_FLAGS: 1
