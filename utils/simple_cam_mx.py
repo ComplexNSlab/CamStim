@@ -186,6 +186,10 @@ class App(object):
         self.latest_frame_lock = threading.Lock()
         self._windows_camera_thread_priority_boosted = False
         self._windows_callback_thread_priority_boosted = False
+        self._windows_camera_thread_priority_attempted = False
+        self._windows_callback_thread_priority_attempted = False
+        self._windows_thread_priority_kernel32 = None
+        self._windows_thread_priority_api_error = None
         self.last_stats_time = None
         self.last_stats_frame_count = 0
         self.fps_samples = deque(maxlen=100)
@@ -200,6 +204,7 @@ class App(object):
             self.use_mutable_display_buffers = use_mutable_display_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
         else:
             self.use_mutable_display_buffers = bool(use_mutable_display_cfg)
+        self.display_output_enabled = True
         self._display_frame_buffer = None
         self._display_frame_buffer_ptr = None
         self._display_frame_buffer_addr = None
@@ -440,6 +445,9 @@ class App(object):
             elif name == 'set_saving':
                 self.saving = bool(payload)
                 self._publish_status({'type': 'saving', 'value': self.saving})
+            elif name == 'set_display_output_enabled':
+                self.display_output_enabled = bool(payload)
+                self._publish_status({'type': 'display_output_enabled', 'value': self.display_output_enabled})
             elif name == 'preview_experiment':
                 exp_name, experiment_id, mouse_id = payload
                 self.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
@@ -467,33 +475,90 @@ class App(object):
             self._handle_command(command)
 
     def _boost_windows_camera_thread_priority(self):
-        if platform.system() != 'Windows' or self._windows_camera_thread_priority_boosted:
+        if (
+            platform.system() != 'Windows'
+            or self._windows_camera_thread_priority_boosted
+            or self._windows_camera_thread_priority_attempted
+        ):
             return
 
+        self._windows_camera_thread_priority_attempted = True
+
         try:
-            kernel32 = ctypes.windll.kernel32
+            kernel32 = self._get_windows_thread_priority_kernel32()
+            if kernel32 is None:
+                err_text = self._windows_thread_priority_api_error or 'kernel32 bindings unavailable'
+                print(f'Warning: could not raise Windows camera thread priority: {err_text}')
+                return
+
             thread_handle = kernel32.GetCurrentThread()
+            if not thread_handle:
+                err_code = ctypes.get_last_error()
+                raise ctypes.WinError(err_code)
+
             high_thread_priority = 2
             if not kernel32.SetThreadPriority(thread_handle, high_thread_priority):
                 raise ctypes.WinError(ctypes.get_last_error())
+
             self._windows_camera_thread_priority_boosted = True
             print('Windows camera thread priority raised to HIGH.')
         except Exception as e:
             print(f'Warning: could not raise Windows camera thread priority: {e}')
 
     def _boost_windows_callback_thread_priority(self):
-        if platform.system() != 'Windows' or self._windows_callback_thread_priority_boosted:
+        if (
+            platform.system() != 'Windows'
+            or self._windows_callback_thread_priority_boosted
+            or self._windows_callback_thread_priority_attempted
+        ):
             return
 
+        self._windows_callback_thread_priority_attempted = True
+
         try:
-            kernel32 = ctypes.windll.kernel32
+            kernel32 = self._get_windows_thread_priority_kernel32()
+            if kernel32 is None:
+                err_text = self._windows_thread_priority_api_error or 'kernel32 bindings unavailable'
+                print(f'Warning: could not raise Windows callback thread priority: {err_text}')
+                return
+
             thread_handle = kernel32.GetCurrentThread()
+            if not thread_handle:
+                err_code = ctypes.get_last_error()
+                raise ctypes.WinError(err_code)
+
             highest_thread_priority = 2
             if not kernel32.SetThreadPriority(thread_handle, highest_thread_priority):
                 raise ctypes.WinError(ctypes.get_last_error())
+
             self._windows_callback_thread_priority_boosted = True
         except Exception as e:
             print(f'Warning: could not raise Windows callback thread priority: {e}')
+
+    def _get_windows_thread_priority_kernel32(self):
+        if platform.system() != 'Windows':
+            return None
+
+        if self._windows_thread_priority_kernel32 is not None:
+            return self._windows_thread_priority_kernel32
+
+        try:
+            from ctypes import wintypes
+
+            # Use use_last_error=True and typed signatures so HANDLE values are correct on 64-bit Python.
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.GetCurrentThread.argtypes = []
+            kernel32.GetCurrentThread.restype = wintypes.HANDLE
+            kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+            kernel32.SetThreadPriority.restype = wintypes.BOOL
+
+            self._windows_thread_priority_kernel32 = kernel32
+            self._windows_thread_priority_api_error = None
+        except Exception as exc:
+            self._windows_thread_priority_kernel32 = None
+            self._windows_thread_priority_api_error = str(exc)
+
+        return self._windows_thread_priority_kernel32
 
     def _put_display_frame(self, frame_data, frame_index):
         with self.latest_frame_lock:
@@ -1795,7 +1860,7 @@ class App(object):
         frame_nbytes = int(FrameHead.uBytes)
         frame_slot = None
         display_frame_data = None
-        wants_display = self.frame_output_queue is not None
+        wants_display = self.frame_output_queue is not None and self.display_output_enabled
         use_mutable_display = (
             wants_display
             and self.use_mutable_display_buffers

@@ -1,3 +1,12 @@
+# 2026-05-25
+- Added a GUI-only `Live Display Updates` toggle in Image Processing (`camstim.py`):
+	- When disabled, the camera worker skips gathering `display_frame_data`, so no new preview frames are produced for the GUI.
+	- When enabled, live display resumes with the existing display-copy backend behavior.
+
+- Removed config wiring for the live-display toggle:
+	- Deleted `DISPLAY_OUTPUT_ENABLED` from `config_files/cam_config.yaml`.
+	- Client and worker now default display output to enabled at startup and rely on runtime GUI commands for changes.
+
 # 2026-05-23
 - Added sensor-temperature support through MindVision `CameraSpecialControl`:
 	- Added `CameraGetSensorTemperature(hCamera)` in `core/mvsdk2024.py`.
@@ -70,8 +79,8 @@
 
 # 2026-05-20 (3)
 - Renamed `baseExperiment` experiment type to `spontaneousActivity` for clarity:
-  - `experiment_types/baseExperiment.py` → `experiment_types/spontaneousActivity.py`; class renamed `SpontaneousActivity`.
-  - `config_files/baseExperiment.yaml` → `config_files/spontaneousActivity.yaml`; `EXPERIMENT_NAME` updated to match.
+	- `experiment_types/baseExperiment.py` → `experiment_types/SpontaneousActivity.py`; class renamed `SpontaneousActivity`.
+	- `config_files/baseExperiment.yaml` → `config_files/SpontaneousActivity_config.yaml`; `EXPERIMENT_NAME` updated to match.
   - `experiment_types/__init__.py` removed (no longer needed; experiment discovery is fully dynamic).
   - `core/experiment_discovery.py` patched to handle the new class/module naming so `SpontaneousActivity` is correctly discovered and listed in the GUI dropdown.
 

@@ -169,6 +169,7 @@ class CameraProcessClient:
 			self.use_c_framegrab = use_cgrab_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
 		else:
 			self.use_c_framegrab = bool(use_cgrab_cfg)
+		self.display_output_enabled = True
 
 	def start(self):
 		ctx = mp.get_context('spawn')
@@ -255,6 +256,8 @@ class CameraProcessClient:
 			elif msg_type == 'framegrab_backend':
 				self.use_c_framegrab = bool(msg.get('using_c', self.use_c_framegrab))
 				self.exp_status_queue.put(("status", msg.get('message', 'Framegrab backend updated.')))
+			elif msg_type == 'display_output_enabled':
+				self.display_output_enabled = bool(msg.get('value', self.display_output_enabled))
 			elif msg_type == 'status':
 				self.exp_status_queue.put(("status", msg.get('message', '')))
 			elif msg_type == 'trial':
@@ -271,6 +274,8 @@ class CameraProcessClient:
 				self.exp_status_queue.put(("status", str(msg)))
 
 	def get_frame_for_display(self):
+		if not self.display_output_enabled:
+			return None
 		self.poll_messages()
 		latest = None
 		if self.frame_queue is not None:
@@ -318,6 +323,13 @@ class CameraProcessClient:
 	def set_saving(self, enabled):
 		self.saving = bool(enabled)
 		return self._send_command('set_saving', bool(enabled))
+
+	def set_display_output_enabled(self, enabled):
+		self.display_output_enabled = bool(enabled)
+		if not self.display_output_enabled:
+			with self.latest_frame_lock:
+				self.latest_frame_data = None
+		return self._send_command('set_display_output_enabled', bool(enabled))
 
 	def toggle_background_removal(self):
 		if self.removeBackground:
@@ -1034,6 +1046,11 @@ class CameraGUI(QMainWindow):
 		self.highlight_pixels_cb.stateChanged.connect(self.toggle_special_pixel_highlight)
 		proc_layout.addWidget(self.highlight_pixels_cb, 2, 1)
 
+		self.display_output_cb = QCheckBox("Live Display Updates")
+		self.display_output_cb.setChecked(True)
+		self.display_output_cb.stateChanged.connect(self.toggle_display_output)
+		proc_layout.addWidget(self.display_output_cb, 3, 0)
+
 		proc_group.setLayout(proc_layout)
 		layout.addWidget(proc_group)
 
@@ -1237,6 +1254,8 @@ class CameraGUI(QMainWindow):
 			self.camera_app.set_exposure(exposure_value)
 			if self.framegrab_backend_cb is not None:
 				self.camera_app.set_framegrab_backend(self.framegrab_backend_cb.isChecked())
+			if hasattr(self, 'display_output_cb'):
+				self.camera_app.set_display_output_enabled(self.display_output_cb.isChecked())
 			self._sync_gain_spinner_with_camera()
 
 			self.load_and_display_camera_config()
@@ -1956,6 +1975,15 @@ class CameraGUI(QMainWindow):
 			self.update_status('Special pixel highlight enabled (0->blue, 255->red).')
 		else:
 			self.update_status('Special pixel highlight disabled.')
+
+	def toggle_display_output(self, state):
+		enabled = (state == Qt.CheckState.Checked.value)
+		if self.camera_app:
+			self.camera_app.set_display_output_enabled(enabled)
+		if enabled:
+			self.update_status('Live display updates enabled.')
+		else:
+			self.update_status('Live display updates disabled (screen refresh paused).')
 
 	def update_histogram(self):
 		hist_width = 512
