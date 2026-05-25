@@ -1254,6 +1254,12 @@ class CameraGUI(QMainWindow):
 			self.camera_app.set_exposure(exposure_value)
 			if self.framegrab_backend_cb is not None:
 				self.camera_app.set_framegrab_backend(self.framegrab_backend_cb.isChecked())
+			# Always force continuous mode at startup so preview does not depend on
+			# stale external-trigger state inside the camera SDK.
+			self.camera_app.set_trigger_mode(False)
+			self.hardware_trigger_enabled = False
+			self.trigger_btn.setText("Enable Hardware Trigger")
+			self.exp_btn.setEnabled(self._should_enable_experiment_button())
 			if hasattr(self, 'display_output_cb'):
 				self.camera_app.set_display_output_enabled(self.display_output_cb.isChecked())
 			self._sync_gain_spinner_with_camera()
