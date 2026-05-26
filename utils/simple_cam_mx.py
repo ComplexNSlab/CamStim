@@ -822,6 +822,8 @@ class App(object):
             ('ext_trig_delay_us', mvsdk.CameraGetExtTrigDelayTime),
             ('ext_trig_jitter_us', mvsdk.CameraGetExtTrigJitterTime),
             ('ext_trig_capability_mask', mvsdk.CameraGetExtTrigCapability),
+            ('media_type_current', mvsdk.CameraGetMediaType),
+            ('isp_out_format_current', mvsdk.CameraGetIspOutFormat),
         ]
 
         report = [self._probe_camera_setting(key, getter) for key, getter in probes]
@@ -832,11 +834,19 @@ class App(object):
         ])
         frame_speed_options = self._get_frame_speed_options()
         resolution_modes, binning_support, binning_masks_raw = self._get_resolution_modes()
+        media_type_options = self._get_media_type_options()
         #mvsdk.CameraEnableFastResponse(self.hCamera) # not found on the current dylib
         lines = ['Strobe/trigger settings at camera load:']
         for item in report:
             if item['ok']:
-                lines.append(f"  {item['key']}: {item['value']}")
+                value_text = item['value']
+                if item['key'] in ('media_type_current', 'isp_out_format_current'):
+                    try:
+                        value_int = int(item['value'])
+                        value_text = f"0x{value_int:08X} ({value_int})"
+                    except (TypeError, ValueError):
+                        value_text = item['value']
+                lines.append(f"  {item['key']}: {value_text}")
             else:
                 code = item['error_code']
                 msg = item['error_message'] or 'unknown error'
@@ -875,6 +885,16 @@ class App(object):
                 )
         else:
             lines.append('  resolution_modes: unavailable')
+
+        if media_type_options:
+            lines.append('  media_type_options:')
+            for option in media_type_options:
+                lines.append(
+                    f"    index={option['index']}: {option['description']} | "
+                    f"format={option['media_type_hex']} ({option['media_type']})"
+                )
+        else:
+            lines.append('  media_type_options: unavailable')
         print('\n'.join(lines))
 
         payload = {
@@ -884,6 +904,7 @@ class App(object):
             'binning_support': binning_support,
             'binning_masks_raw': binning_masks_raw,
             'resolution_modes': resolution_modes,
+            'media_type_options': media_type_options,
         }
         self._publish_status(payload)
 
@@ -968,6 +989,32 @@ class App(object):
                 })
             except Exception:
                 continue
+        return options
+
+    def _get_media_type_options(self):
+        if not self.hCamera:
+            return []
+
+        try:
+            cap = mvsdk.CameraGetCapability(self.hCamera)
+        except Exception:
+            return []
+
+        options = []
+        count = max(0, int(cap.iMediaTypeDesc))
+        for idx in range(count):
+            try:
+                desc = cap.pMediaTypeDesc[idx]
+                media_type = int(desc.iMediaType)
+                options.append({
+                    'index': int(desc.iIndex),
+                    'description': desc.GetDescription(),
+                    'media_type': media_type,
+                    'media_type_hex': f"0x{media_type:08X}",
+                })
+            except Exception:
+                continue
+
         return options
 
     def _apply_startup_strobe_settings(self):

@@ -1590,7 +1590,7 @@ def CameraSpecialControl(hCamera, dwCtrlCode, dwParam, lpData):
 	return err_code
 
 # Control code 0x0014 was found empirically to return the sensor temperature
-# as a float32 in the output buffer (verified on HT-SUA134GM / PYTHON 1300).
+# as a float32 in the output buffer (verified on HT-SUA134GM / PYTHON 1300 and HT-SUF401GM / CMV4000).
 _CAMERA_CTRL_GET_SENSOR_TEMP = 0x0014
 
 def CameraGetSensorTemperature(hCamera):
