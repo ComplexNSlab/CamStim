@@ -118,7 +118,9 @@ class App(object):
         self.mirror_enabled = False
         self.mirror_flip_flags = 1
         self._mirror_runtime_warning_emitted = False
-        self.save_queue_max_frames = int(config.get('SAVE_QUEUE_MAX_FRAMES', 2000))
+        self.frame_pool_frames = int(config.get('FRAME_POOL_FRAMES', 256))
+        # Keep queue comfortably above pool so pool is the primary capacity knob.
+        self.save_queue_max_frames = max(128, ((3 * self.frame_pool_frames) + 1) // 2)
         self.frame_queue = queue.Queue(maxsize=self.save_queue_max_frames)  # Buffer for save path
         self.save_thread = threading.Thread(target=self.save_frames)  # Thread for saving frames
         self.frame_count = 0  # To keep track of saved 
@@ -128,9 +130,13 @@ class App(object):
         self.save_batch_frames = int(config.get('SAVE_BATCH_FRAMES', 64))
         # Cap batch memory to avoid periodic large allocations that can stall writes.
         self.save_target_batch_bytes = int(config.get('SAVE_TARGET_BATCH_BYTES', 32 * 1024 * 1024))
-        self.frame_pool_frames = int(config.get('FRAME_POOL_FRAMES', 256))
         self.disable_gc_during_acquire = bool(config.get('DISABLE_GC_DURING_ACQUIRE', True))
         self.debug_callback_timing = bool(config.get('DEBUG_CALLBACK_TIMING', False))
+        debug_save_binning_timing_cfg = config.get('DEBUG_SAVE_BINNING_TIMING', False)
+        if isinstance(debug_save_binning_timing_cfg, str):
+            self.debug_save_binning_timing = debug_save_binning_timing_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            self.debug_save_binning_timing = bool(debug_save_binning_timing_cfg)
         self._gc_was_enabled = False
         self.frame_bytes = 0
         self._frame_pool = []
@@ -199,6 +205,11 @@ class App(object):
             self.use_cgrabcallback = use_cgrab_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
         else:
             self.use_cgrabcallback = bool(use_cgrab_cfg)
+        use_c_binning_cfg = config.get('USE_C_BINNING', True)
+        if isinstance(use_c_binning_cfg, str):
+            self.use_c_binning = use_c_binning_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            self.use_c_binning = bool(use_c_binning_cfg)
         use_mutable_display_cfg = config.get('DISPLAY_MUTABLE_BUFFERS', False)
         if isinstance(use_mutable_display_cfg, str):
             self.use_mutable_display_buffers = use_mutable_display_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
@@ -1547,13 +1558,49 @@ class App(object):
         flush_interval_s = 0.5
         flush_every_n_frames = max(1, self.save_batch_frames)
         last_reported_batch = None
+        reported_c_bin_backend = None
         write_batch = []
         ts_batch = []
         sys_ts_batch = []
         temp_batch = []
+        c_bin_output_buffer = None
+        c_bin_output_shape = None
+        c_bin_timing_count = 0
+        c_bin_timing_total_s = 0.0
+        np_bin_timing_count = 0
+        np_bin_timing_total_s = 0.0
+
+        def report_and_reset_binning_timing():
+            nonlocal c_bin_timing_count, c_bin_timing_total_s, np_bin_timing_count, np_bin_timing_total_s
+            if not self.debug_save_binning_timing:
+                return
+
+            if c_bin_timing_count > 0:
+                c_mean_ms = (c_bin_timing_total_s / c_bin_timing_count) * 1000.0
+                print(
+                    "Save binning timing (C): "
+                    f"batches={c_bin_timing_count}, "
+                    f"total={c_bin_timing_total_s:.6f}s, "
+                    f"mean={c_mean_ms:.3f}ms"
+                )
+            if np_bin_timing_count > 0:
+                np_mean_ms = (np_bin_timing_total_s / np_bin_timing_count) * 1000.0
+                print(
+                    "Save binning timing (NumPy): "
+                    f"batches={np_bin_timing_count}, "
+                    f"total={np_bin_timing_total_s:.6f}s, "
+                    f"mean={np_mean_ms:.3f}ms"
+                )
+
+            c_bin_timing_count = 0
+            c_bin_timing_total_s = 0.0
+            np_bin_timing_count = 0
+            np_bin_timing_total_s = 0.0
 
         def flush_batch(force_flush=False):
+            nonlocal c_bin_output_buffer, c_bin_output_shape
             nonlocal last_flush_time
+            nonlocal c_bin_timing_count, c_bin_timing_total_s, np_bin_timing_count, np_bin_timing_total_s
             if not write_batch:
                 return
 
@@ -1579,19 +1626,58 @@ class App(object):
                 raw = np.ascontiguousarray(raw[:, :, ::-1])
 
             if self.bin_exp:
-                bs = self.bin_size
-                data = raw.astype(np.uint16, copy=False)
-                if bs in (2, 4, 8, 16, 32, 64):
-                    for _ in range(bs.bit_length() - 1):
-                        data = (
-                            data[:, 0::2, 0::2]
-                            + data[:, 1::2, 0::2]
-                            + data[:, 0::2, 1::2]
-                            + data[:, 1::2, 1::2]
-                        )
+                bs = int(self.bin_size)
+                can_use_c_binning = (
+                    self.use_c_binning
+                    and self._is_using_c_framegrab()
+                    and _cgrabcallback is not None
+                    and hasattr(_cgrabcallback, 'bin_u8_batch_sum_pow2')
+                    and raw.dtype == np.uint8
+                    and bs > 1
+                    and (bs & (bs - 1)) == 0
+                    and (h // bs) > 0
+                    and (w // bs) > 0
+                )
+
+                if can_use_c_binning:
+                    bin_t0 = time.perf_counter() if self.debug_save_binning_timing else None
+                    out_h = h // bs
+                    out_w = w // bs
+                    out_shape = (n, out_h, out_w)
+                    if c_bin_output_buffer is None or c_bin_output_shape != out_shape:
+                        c_bin_output_buffer = np.empty(out_shape, dtype=np.uint16)
+                        c_bin_output_shape = out_shape
+
+                    src_addr = raw.__array_interface__['data'][0]
+                    dst_addr = c_bin_output_buffer.__array_interface__['data'][0]
+                    _cgrabcallback.bin_u8_batch_sum_pow2(src_addr, n, h, w, bs, dst_addr)
+                    if bin_t0 is not None:
+                        c_bin_timing_count += 1
+                        c_bin_timing_total_s += (time.perf_counter() - bin_t0)
+                    write_slice = c_bin_output_buffer
                 else:
-                    data = data.reshape(n, h // bs, bs, w // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
-                write_slice = data
+                    bin_t0 = time.perf_counter() if self.debug_save_binning_timing else None
+                    data = raw.astype(np.uint16, copy=False)
+                    if bs in (2, 4, 8, 16, 32, 64):
+                        for _ in range(bs.bit_length() - 1):
+                            data = (
+                                data[:, 0::2, 0::2]
+                                + data[:, 1::2, 0::2]
+                                + data[:, 0::2, 1::2]
+                                + data[:, 1::2, 1::2]
+                            )
+                    else:
+                        h_b = (h // bs) * bs
+                        w_b = (w // bs) * bs
+                        if h_b <= 0 or w_b <= 0:
+                            raise ValueError(f"Frame too small for BIN_SIZE={bs}: {h}x{w}")
+                        if h_b != h or w_b != w:
+                            data = data[:, :h_b, :w_b]
+                        data = data.reshape(n, h_b // bs, bs, w_b // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
+                    if bin_t0 is not None:
+                        np_bin_timing_count += 1
+                        np_bin_timing_total_s += (time.perf_counter() - bin_t0)
+                    write_slice = data
             else:
                 write_slice = raw  # contiguous, no extra copy
 
@@ -1631,7 +1717,20 @@ class App(object):
                     continue
 
                 if hasattr(self, 'width') and hasattr(self, 'height'):
-                    frame_bytes = max(1, int(self.width) * int(self.height))
+                    h = int(self.height)
+                    w = int(self.width)
+                    raw_itemsize = np.dtype(self.dtype).itemsize
+                    frame_bytes = max(1, h * w * raw_itemsize)
+
+                    if self.bin_exp and int(self.bin_size) > 1:
+                        bs = int(self.bin_size)
+                        h_b = (h // bs) * bs
+                        w_b = (w // bs) * bs
+                        if h_b > 0 and w_b > 0:
+                            binned_h = h_b // bs
+                            binned_w = w_b // bs
+                            frame_bytes = max(1, binned_h * binned_w * np.dtype(np.uint16).itemsize)
+
                     max_frames_by_bytes = max(1, self.save_target_batch_bytes // frame_bytes)
                     effective_batch = max(1, min(self.save_batch_frames, max_frames_by_bytes))
                     if effective_batch != flush_every_n_frames:
@@ -1639,6 +1738,20 @@ class App(object):
                     if last_reported_batch != flush_every_n_frames:
                         print(f"Using effective save batch size: {flush_every_n_frames} frame(s) (~{flush_every_n_frames * frame_bytes / (1024*1024):.1f} MiB raw)")
                         last_reported_batch = flush_every_n_frames
+
+                    if self.bin_exp and int(self.bin_size) > 1:
+                        using_c_bin = (
+                            self.use_c_binning
+                            and self._is_using_c_framegrab()
+                            and _cgrabcallback is not None
+                            and hasattr(_cgrabcallback, 'bin_u8_batch_sum_pow2')
+                            and np.dtype(self.dtype) == np.uint8
+                            and (int(self.bin_size) & (int(self.bin_size) - 1)) == 0
+                        )
+                        backend_label = 'C extension' if using_c_bin else 'NumPy fallback'
+                        if reported_c_bin_backend != backend_label:
+                            print(f"Binning backend: {backend_label}")
+                            reported_c_bin_backend = backend_label
 
                 if self.save_file_handle is None:
                     file_path = os.path.join(self.save_dir, self.filename + '.bin')
@@ -1688,6 +1801,7 @@ class App(object):
 
                 flush_batch(force_flush=True)
                 if self.save_file_handle is not None and self.frame_queue.empty():
+                    report_and_reset_binning_timing()
                     self._finalize_save_session()
                 if self.quit:
                     break
@@ -1695,6 +1809,7 @@ class App(object):
 
         if self.save_file_handle is not None:
             flush_batch(force_flush=True)
+            report_and_reset_binning_timing()
             self._finalize_save_session()
 
     def print_camera_stats(self):
@@ -1844,7 +1959,7 @@ class App(object):
 
         self._boost_windows_callback_thread_priority()
 
-        current_time = time.time()
+        #current_time = time.time()
         FrameHead = pFrameHead[0]
 
         if self.mirror_enabled:

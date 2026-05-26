@@ -1,3 +1,31 @@
+# 2026-05-26
+- Added native C-based save-path binning in `utils/cgrabcallback.c`:
+	- New `bin_u8_batch_sum_pow2(src_addr, n, in_h, in_w, bin_size, dst_addr)` API for uint8 batch sum-binning into uint16 output.
+	- Runs with the GIL released to reduce Python-thread contention during heavy binning work.
+
+- Integrated selectable C binning backend into `utils/simple_cam_mx.py` save pipeline:
+	- Save worker now uses the native C binning path for compatible cases (uint8 + power-of-two `BIN_SIZE`) and falls back to the existing NumPy path otherwise.
+	- Added reusable C-output buffer handling to avoid repeated allocations.
+	- Added startup/status logging of active binning backend (`C extension` vs `NumPy fallback`).
+
+- Added save-path binning timing diagnostics in `utils/simple_cam_mx.py`:
+	- New config flag `DEBUG_SAVE_BINNING_TIMING`.
+	- Reports per-session aggregate binning timing for both C and NumPy paths (`batches`, `total`, `mean_ms`).
+
+- Added explicit binning-backend config control:
+	- New `USE_C_BINNING` option in `config_files/cam_config.yaml`.
+	- Allows forcing NumPy binning even when the C extension is available.
+	- Observed in-session benchmark: C-based save binning was approximately 4x faster than NumPy fallback on current workload.
+
+- Simplified buffer-capacity tuning by making queue size derived from pool size:
+	- Removed `SAVE_QUEUE_MAX_FRAMES` from `config_files/cam_config.yaml`.
+	- `utils/simple_cam_mx.py` now auto-derives queue capacity as `ceil(1.5 * FRAME_POOL_FRAMES)` (with a minimum floor), making `FRAME_POOL_FRAMES` the primary buffering knob.
+
+- Updated high-throughput defaults in `config_files/cam_config.yaml` for current testing:
+	- `FRAME_POOL_FRAMES: 1536`
+	- `USE_C_BINNING: true`
+	- `DEBUG_SAVE_BINNING_TIMING: true`
+
 # 2026-05-25
 - Added a GUI-only `Live Display Updates` toggle in Image Processing (`camstim.py`):
 	- When disabled, the camera worker skips gathering `display_frame_data`, so no new preview frames are produced for the GUI.

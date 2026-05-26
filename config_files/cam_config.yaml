@@ -10,7 +10,14 @@ DEBUG_SKIP_TEENSY: false
 # false: force Python fallback (ctypes.memmove).
 USE_CGRABCALLBACK: true
 
+# Binning backend preference for save pipeline.
+# true: use native C binning when available (uint8 input + power-of-two BIN_SIZE), fallback to NumPy otherwise.
+# false: force NumPy binning even when C extension is available.
+USE_C_BINNING: true
+
 DISPLAY_MUTABLE_BUFFERS: true
+
+DEBUG_SAVE_BINNING_TIMING: true
 
 # GUI display refresh rate during active experiment preview (Hz).
 # Example: 10 means redraw at most every 0.1 seconds while saving/triggering.
@@ -28,16 +35,15 @@ BIN_EXP_LIVE: true
 BIN_SIZE: 16
 
 # Save pipeline settings for high-throughput acquisition
-# Number of frames buffered in RAM before disk writes catch up.
-# 2048x2048x8-bit ~= 4 MiB/frame, so 1000 frames ~= 4 GiB.
-SAVE_QUEUE_MAX_FRAMES: 1200
+# Save queue capacity is auto-derived as ceil(1.5 * FRAME_POOL_FRAMES).
+# Configure FRAME_POOL_FRAMES as the primary buffering knob.
 # Frames grouped into one write batch. Larger batches reduce syscall overhead.
 SAVE_BATCH_FRAMES: 64
 # Upper bound on raw frame bytes per batch (helps avoid long periodic write stalls).
 SAVE_TARGET_BATCH_BYTES: 33554432
 # Preallocated callback frame slots for save path (2048x2048x8-bit ~= 4 MiB each).
 # 256 slots ~= 1 GiB preallocated.
-FRAME_POOL_FRAMES: 256
+FRAME_POOL_FRAMES: 1536
 # Disable Python GC during active acquisition to reduce callback jitter.
 # GC is restored automatically when the worker exits.
 DISABLE_GC_DURING_ACQUIRE: true
