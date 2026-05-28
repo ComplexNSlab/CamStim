@@ -453,13 +453,13 @@ class CameraProcessClient:
 			self.maxI = self.minI + 1.0
 		return self.normalizeImage
 
-	def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None, save_outputs=False):
+	def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None, preview=False, save_outputs=False):
 		self.exp_name = exp_name
 		self.experiment_id = experiment_id
 		self.mouse_id = mouse_id
-		if self.hardware_trigger_enabled:
-			return self._send_command('start_experiment', (exp_name, experiment_id, mouse_id))
-		return self._send_command('preview_experiment', (exp_name, experiment_id, mouse_id, bool(save_outputs)))
+		if preview:
+			return self._send_command('preview_experiment', (exp_name, experiment_id, mouse_id, bool(save_outputs)))
+		return self._send_command('start_experiment', (exp_name, experiment_id, mouse_id))
 
 	def stop_stim(self):
 		if self.hardware_trigger_enabled:
@@ -1726,6 +1726,7 @@ class CameraGUI(QMainWindow):
 				exp_name=exp_name,
 				experiment_id=experiment_id,
 				mouse_id=mouse_id,
+				preview=True,
 				save_outputs=save_outputs,
 			)
 		else:

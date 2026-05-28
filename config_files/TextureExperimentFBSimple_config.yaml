@@ -20,7 +20,7 @@ inter_trial_delay: 0.5
 
 # Visual stimulus parameters
 image_position: [0, 0]
-image_size: [100, 100]
+image_size: [80, 80]
 image_mask: None
 image_mask_sd: 0
 

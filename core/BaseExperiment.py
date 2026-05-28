@@ -178,6 +178,10 @@ class BaseExperiment(ABC):
                                             waitBlanking=True, #True " "
                                             useFBO=True) #True " "
 
+        self.warper = None
+        self.using_spherical_warp = False
+        self.warp_eyepoint = (0.5, 0.5)
+
 
         if self.monitor_settings['use_spherical_warp']:
             self.warper = Warper(self.window,
@@ -187,6 +191,8 @@ class BaseExperiment(ABC):
                     eyepoint = (0.5, 0.5),
                     flipHorizontal = False,
                     flipVertical = False)
+
+            self.using_spherical_warp = True
 
             print("Using spherical warping!")
 
@@ -201,9 +207,97 @@ class BaseExperiment(ABC):
         self.square_color_off = self.monitor_settings['square_color_off']
         self.square_color_on = self.monitor_settings['square_color_on']
 
+        square_position = list(self.square_position)
+        square_size = list(self.square_size)
+
+        compensate_square = bool(self.monitor_settings.get('compensate_photodiode_for_warp', True))
+        if self.using_spherical_warp and compensate_square:
+            square_position, square_size = self._get_compensated_photodiode_geometry(square_position, square_size)
+            print(
+                "Compensating photodiode square for spherical warp: "
+                "target_pos={} target_size={} -> prewarp_pos={} prewarp_size={}".format(
+                    self.square_position,
+                    self.square_size,
+                    [round(float(v), 2) for v in square_position],
+                    [round(float(v), 2) for v in square_size],
+                )
+            )
+
         # Since 2020 psychopy argument 'color' was deprecated.
-        self.photodiode_square = psychopy.visual.Rect(win=self.window, pos=self.square_position, width=self.square_size[0], height=self.square_size[1], 
+        self.photodiode_square = psychopy.visual.Rect(win=self.window, pos=square_position, width=square_size[0], height=square_size[1], 
                                                       units='pix', fillColor=self.square_color_off, lineColor=self.square_color_off)
+
+    def _get_compensated_photodiode_geometry(self, target_pos_pix, target_size_pix):
+        target_pos = np.asarray(target_pos_pix, dtype=np.float64)
+        target_size = np.asarray(target_size_pix, dtype=np.float64)
+
+        center_pre = self._map_spherical_post_pix_to_pre_pix(target_pos)
+
+        half_width = max(float(target_size[0]) / 2.0, 1.0)
+        half_height = max(float(target_size[1]) / 2.0, 1.0)
+
+        left_pre = self._map_spherical_post_pix_to_pre_pix(target_pos + np.array([-half_width, 0.0]))
+        right_pre = self._map_spherical_post_pix_to_pre_pix(target_pos + np.array([half_width, 0.0]))
+        bottom_pre = self._map_spherical_post_pix_to_pre_pix(target_pos + np.array([0.0, -half_height]))
+        top_pre = self._map_spherical_post_pix_to_pre_pix(target_pos + np.array([0.0, half_height]))
+
+        compensated_width = max(1.0, abs(float(right_pre[0] - left_pre[0])))
+        compensated_height = max(1.0, abs(float(top_pre[1] - bottom_pre[1])))
+
+        return center_pre.tolist(), [compensated_width, compensated_height]
+
+    def _map_spherical_post_pix_to_pre_pix(self, post_pos_pix):
+        width_px, height_px = [float(v) for v in self.window.size]
+
+        x_post_pix = float(post_pos_pix[0])
+        y_post_pix = float(post_pos_pix[1])
+
+        # Convert PsychoPy pixel-centered coordinates to normalized device coordinates.
+        x_ndc = x_post_pix / (width_px / 2.0)
+        y_ndc = y_post_pix / (height_px / 2.0)
+
+        mon_width_cm = float(self.monitor_settings['monitor_width_cm'])
+        mon_height_cm = mon_width_cm * (height_px / width_px)
+        dist_cm = float(self.monitor_settings['viewing_distance_cm'])
+
+        x_eye_cm = float(self.warp_eyepoint[0]) * mon_width_cm
+        y_eye_cm = float(self.warp_eyepoint[1]) * mon_height_cm
+
+        x_cm = ((x_ndc + 1.0) * 0.5 * mon_width_cm) - x_eye_cm
+        y_cm = ((y_ndc + 1.0) * 0.5 * mon_height_cm) - y_eye_cm
+
+        r = np.sqrt((x_cm * x_cm) + (y_cm * y_cm) + (dist_cm * dist_cm))
+
+        tx = (dist_cm * (1.0 + (x_cm / r))) - dist_cm
+        ty = (dist_cm * (1.0 + (y_cm / r))) - dist_cm
+
+        azimuth = np.arctan(x_cm / dist_cm)
+        altitude = np.arcsin(y_cm / r)
+
+        eps = np.finfo(np.float32).eps
+        if azimuth == 0.0:
+            azimuth = eps
+        if altitude == 0.0:
+            altitude = eps
+
+        central_angle = np.arccos(np.cos(altitude) * np.cos(abs(azimuth)))
+        arc_length = central_angle * dist_cm
+        theta = np.arctan2(ty, tx)
+
+        tx = arc_length * np.cos(theta)
+        ty = arc_length * np.sin(theta)
+
+        u = (tx / mon_width_cm) + 0.5
+        v = (ty / mon_height_cm) + 0.5
+
+        x_pre_pix = (u - 0.5) * width_px
+        y_pre_pix = (v - 0.5) * height_px
+
+        # Keep compensated coordinates within the drawable framebuffer bounds.
+        x_pre_pix = float(np.clip(x_pre_pix, -width_px / 2.0, width_px / 2.0))
+        y_pre_pix = float(np.clip(y_pre_pix, -height_px / 2.0, height_px / 2.0))
+
+        return np.array([x_pre_pix, y_pre_pix], dtype=np.float64)
 
 
     def create_save_directories(self, save_settings_config_filename):

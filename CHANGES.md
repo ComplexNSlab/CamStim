@@ -23,6 +23,16 @@
 
 - Fixed `config_files/config.yaml`: switched `SAVE_DIR` to macOS local path `/Users/orlandi/data`.
 
+- Fixed experiment start routing regression in `camstim.py`:
+	- `CameraProcessClient.get_exp_params(...)` now routes by explicit `preview` flag instead of `hardware_trigger_enabled`.
+	- Real experiment starts always send `start_experiment`, preventing accidental preview/no-save execution paths.
+	- Preview calls now explicitly pass `preview=True`.
+
+- Added spherical-warp compensation for the photodiode square in `core/BaseExperiment.py`:
+	- When spherical warping is enabled, the photodiode square position and size are remapped to pre-warp coordinates so the final warped footprint stays close to the configured target area.
+	- Added optional monitor setting `compensate_photodiode_for_warp` (default behavior is enabled when omitted).
+	- Logs target vs compensated photodiode geometry at startup for validation.
+
 # 2026-05-26
 - Added native C-based save-path binning in `utils/cgrabcallback.c`:
 	- New `bin_u8_batch_sum_pow2(src_addr, n, in_h, in_w, bin_size, dst_addr)` API for uint8 batch sum-binning into uint16 output.

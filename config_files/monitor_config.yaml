@@ -37,6 +37,7 @@ ind_freq: 1.
 #square_size: [200, 200] should work without spherical correction with the 24" monitor (RIG 2B) - PLEASE CHECK
 square_size: [200, 200]
 #square_position: [0, 0] # find a nicer way to specify, but this is basically -(resolution/2) for left corner
+#square_position: [-500 , -200]
 square_position: [-960 , -540]
 #square_position: [-960 , -540] # find a nicer way to specify, but this is basically -(resolution/2) for left corner
 
