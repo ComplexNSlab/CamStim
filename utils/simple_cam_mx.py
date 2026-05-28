@@ -460,8 +460,18 @@ class App(object):
                 self.display_output_enabled = bool(payload)
                 self._publish_status({'type': 'display_output_enabled', 'value': self.display_output_enabled})
             elif name == 'preview_experiment':
-                exp_name, experiment_id, mouse_id = payload
-                self.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
+                if len(payload) >= 4:
+                    exp_name, experiment_id, mouse_id, save_outputs = payload
+                else:
+                    exp_name, experiment_id, mouse_id = payload
+                    save_outputs = False
+                self.get_exp_params(
+                    exp_name=exp_name,
+                    experiment_id=experiment_id,
+                    mouse_id=mouse_id,
+                    preview=True,
+                    save_outputs=save_outputs,
+                )
             elif name == 'start_experiment':
                 exp_name, experiment_id, mouse_id = payload
                 self.saving = True
@@ -1076,7 +1086,12 @@ class App(object):
         self._publish_status({'type': 'trial', 'current': current, 'total': total, 'message': message})
         print(message)
 
-    def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None):
+    def _normalize_preview_identity(self, experiment_id, mouse_id):
+        experiment_id = (experiment_id or '').strip() or 'preview'
+        mouse_id = (mouse_id or '').strip() or 'preview'
+        return experiment_id, mouse_id
+
+    def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None, preview=False, save_outputs=False):
         if hasattr(self, 'exp_thread') and self.exp_thread and self.exp_thread.is_alive():
             print('\nExperiment selection already in progress.')
             return False
@@ -1088,6 +1103,9 @@ class App(object):
         exp_name = (exp_name or '').strip()
         experiment_id = (experiment_id or '').strip()
         mouse_id = (mouse_id or '').strip()
+        if preview:
+            experiment_id, mouse_id = self._normalize_preview_identity(experiment_id, mouse_id)
+
         if not exp_name or not experiment_id or not mouse_id:
             return False
 
@@ -1096,25 +1114,38 @@ class App(object):
         self.mouse_id = mouse_id
         self.filename = f"{mouse_id}_{experiment_id}"
 
-        self.exp_thread = threading.Thread(target=self.run_exp, args=(exp_name, experiment_id, mouse_id), daemon=True)
+        self.exp_thread = threading.Thread(
+            target=self.run_exp,
+            args=(exp_name, experiment_id, mouse_id, preview, bool(save_outputs)),
+            daemon=True,
+        )
         self.exp_thread.start()
         return True
 
-    def run_exp(self, exp_name, experiment_id, mouse_id):
+    def run_exp(self, exp_name, experiment_id, mouse_id, preview=False, save_outputs=False):
         try:
             self.exp_name = exp_name
             self.experiment_id = experiment_id
             self.mouse_id = mouse_id
             self.filename = f"{mouse_id}_{experiment_id}"
-            self._prepare_save_directory(mouse_id, experiment_id)
+            if preview and not save_outputs:
+                self.experiment_status_callback("Preview mode active: file and data outputs are disabled.")
+            elif preview and save_outputs:
+                self.experiment_status_callback("Preview mode active: experiment files will be saved.")
 
-            if self.debug_skip_teensy:
-                self.experiment_status_callback("DEBUG_SKIP_TEENSY enabled: skipping logic analyzer.")
-            else:
-                self.start_logic_analyzer(experiment_id, mouse_id, self.filename)
+            if save_outputs:
+                self._prepare_save_directory(mouse_id, experiment_id)
+
+            if not preview:
+                if self.debug_skip_teensy:
+                    self.experiment_status_callback("DEBUG_SKIP_TEENSY enabled: skipping logic analyzer.")
+                else:
+                    self.start_logic_analyzer(experiment_id, mouse_id, self.filename)
             self.start_stim(exp_name, experiment_id, mouse_id,
                                 self.experiment_status_callback,
-                                self.experiment_trial_callback)
+                                self.experiment_trial_callback,
+                                preview=preview,
+                                save_outputs=save_outputs)
 
         except Exception as e:
             print(f'\nError in experiment selection: {e}.')
@@ -1216,7 +1247,7 @@ class App(object):
             for line in self.logic_progress.stdout:
                 print(f"{line.strip()}")
 
-    def start_stim(self, exp_name, experiment_id, mouse_id, status_callback=None, trial_callback=None):
+    def start_stim(self, exp_name, experiment_id, mouse_id, status_callback=None, trial_callback=None, preview=False, save_outputs=False):
         if getattr(self, 'stim_progress', None):
             print("Experiment currently running. Stopping...")
             if hasattr(self.stim_progress, 'terminate'):
@@ -1231,6 +1262,10 @@ class App(object):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         wf_script = os.path.join(script_dir, "wf_main.py")
         cmd = [sys.executable, "-u", wf_script, exp_name, experiment_id, mouse_id]
+        if preview:
+            cmd.append("--preview")
+        if preview and save_outputs:
+            cmd.append("--save-preview")
         
         # Check if this experiment should skip Teensy (either from config or experiment class attribute)
         skip_teensy_enabled = self.debug_skip_teensy

@@ -13,6 +13,7 @@ import time
 from collections import deque
 import threading
 import re
+import subprocess
 from core.TeensyController import TeensyController
 import cv2
 import yaml
@@ -24,6 +25,7 @@ from core.experiment_discovery import get_experiment_list, resolve_experiment_co
 
 CONFIG_DIR = Path(__file__).resolve().parent / 'config_files'
 VERSION_FILE = Path(__file__).resolve().parent / 'VERSION'
+REPO_ROOT = Path(__file__).resolve().parent
 
 
 def load_app_version(default='0.0.0'):
@@ -451,13 +453,13 @@ class CameraProcessClient:
 			self.maxI = self.minI + 1.0
 		return self.normalizeImage
 
-	def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None):
+	def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None, save_outputs=False):
 		self.exp_name = exp_name
 		self.experiment_id = experiment_id
 		self.mouse_id = mouse_id
 		if self.hardware_trigger_enabled:
 			return self._send_command('start_experiment', (exp_name, experiment_id, mouse_id))
-		return self._send_command('preview_experiment', (exp_name, experiment_id, mouse_id))
+		return self._send_command('preview_experiment', (exp_name, experiment_id, mouse_id, bool(save_outputs)))
 
 	def stop_stim(self):
 		if self.hardware_trigger_enabled:
@@ -490,6 +492,8 @@ class CameraGUI(QMainWindow):
 		self.hardware_trigger_enabled = False
 		self.preview_mode = False
 		self.preview_exp_thread = None
+		self.preview_process = None
+		self.preview_status_queue = queue.Queue()
 		self.current_exp_config = None
 		self.current_cam_config = None
 		self.current_teensy_config = None
@@ -553,6 +557,20 @@ class CameraGUI(QMainWindow):
 					self.update_status(msg[3])
 				elif msg[0] in ("logic_analyzer_terminated", "experiment_finished"):
 					self._schedule_auto_stop()
+
+		while True:
+			try:
+				msg = self.preview_status_queue.get_nowait()
+			except queue.Empty:
+				break
+
+			if not msg:
+				continue
+
+			if msg[0] == 'status':
+				self.update_status(msg[1])
+			elif msg[0] == 'finished':
+				self._finish_preview_without_camera()
 
 	def init_ui(self):
 		self.setWindowTitle(f'camstim {self.app_version}')
@@ -1128,13 +1146,80 @@ class CameraGUI(QMainWindow):
 		# 2. Hardware trigger is enabled
 		return not requires_hw_trigger or self.hardware_trigger_enabled
 
+	def _should_enable_preview_button(self):
+		if self.preview_mode:
+			return False
+		return bool(self.exp_combo.currentText().strip())
+
 	def on_experiment_selection_changed(self, _text):
 		self.load_and_display_exp_config()
 		# Update button enablement when experiment selection changes
+		self.preview_btn.setEnabled(self._should_enable_preview_button())
 		if self.camera_app:
 			self.exp_btn.setEnabled(self._should_enable_experiment_button())
 
-	def get_selected_experiment_params(self):
+	def _track_preview_process_output(self, process):
+		for line in process.stdout:
+			line = line.strip()
+			if line:
+				self.preview_status_queue.put(('status', line))
+
+		if process.poll() not in (0, None):
+			self.preview_status_queue.put(('status', f'Preview subprocess exited with code {process.returncode}.'))
+
+		self.preview_status_queue.put(('finished',))
+
+	def _finish_preview_without_camera(self):
+		self.preview_mode = False
+		self.preview_process = None
+		self.preview_btn.setEnabled(self._should_enable_preview_button())
+		self.stop_preview_btn.setEnabled(False)
+		self.config_display.setText("Experiment stopped. \n\nStart/preview experiment to load configuration.")
+		self.current_exp_config = None
+
+	def _start_preview_without_camera(self, exp_name, experiment_id, mouse_id, save_outputs=False):
+		if self.preview_process is not None and self.preview_process.poll() is None:
+			self.update_status('Error: Experiment preview is already running.')
+			return False
+
+		skip_teensy_enabled = bool(self.config.get('DEBUG_SKIP_TEENSY', False))
+		try:
+			exp_types = discover_experiment_types()
+			exp_class = exp_types.get(exp_name)
+			skip_teensy_enabled = skip_teensy_enabled or getattr(exp_class, 'skip_teensy', False)
+		except Exception:
+			pass
+
+		wf_script = REPO_ROOT / 'utils' / 'wf_main.py'
+		cmd = [sys.executable, '-u', str(wf_script), exp_name, experiment_id, mouse_id]
+		cmd.append('--preview')
+		if save_outputs:
+			cmd.append('--save-preview')
+		if skip_teensy_enabled:
+			cmd.append('--skip-teensy')
+
+		self.preview_process = subprocess.Popen(
+			cmd,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.STDOUT,
+			stdin=subprocess.PIPE,
+			text=True,
+			cwd=str(REPO_ROOT),
+		)
+		threading.Thread(target=self._track_preview_process_output, args=(self.preview_process,), daemon=True).start()
+		return True
+
+	def _preview_should_save_outputs(self):
+		experiment_id = self.experiment_id_input.text().strip()
+		mouse_id = self.mouse_id_input.text().strip()
+		return bool(experiment_id and mouse_id)
+
+	def _normalize_preview_identity(self, experiment_id, mouse_id):
+		experiment_id = (experiment_id or '').strip() or 'preview'
+		mouse_id = (mouse_id or '').strip() or 'preview'
+		return experiment_id, mouse_id
+
+	def get_selected_experiment_params(self, allow_empty_ids=False):
 		exp_name = self.exp_combo.currentText().strip()
 		experiment_id = self.experiment_id_input.text().strip()
 		mouse_id = self.mouse_id_input.text().strip()
@@ -1142,6 +1227,10 @@ class CameraGUI(QMainWindow):
 		if not exp_name:
 			self.update_status("Error: Select an experiment from the dropdown.")
 			return None
+
+		if allow_empty_ids:
+			experiment_id, mouse_id = self._normalize_preview_identity(experiment_id, mouse_id)
+			return exp_name, experiment_id, mouse_id
 
 		if not experiment_id:
 			self.update_status("Error: Enter an experiment ID.")
@@ -1243,7 +1332,7 @@ class CameraGUI(QMainWindow):
 			self.teensy_active = False
 			self.teensy_toggle_btn.setText("Enable Teensy")
 			self.exp_btn.setEnabled(False)
-			self.preview_btn.setEnabled(True)
+			self.preview_btn.setEnabled(self._should_enable_preview_button())
 			self.populate_experiment_controls(force_refresh=False)
 			if selected_experiment_before_start and selected_experiment_before_start in (self.experiment_list_cache or []):
 				self.exp_combo.setCurrentText(selected_experiment_before_start)
@@ -1374,8 +1463,8 @@ class CameraGUI(QMainWindow):
 		self.teensy_toggle_btn.setText("Enable Teensy")
 		self.hardware_trigger_enabled = False
 		self.exp_btn.setEnabled(False)
-		self.preview_btn.setEnabled(False)
-		self.exp_combo.setEnabled(False)
+		self.exp_combo.setEnabled(bool(self.experiment_list_cache))
+		self.preview_btn.setEnabled(self._should_enable_preview_button())
 		if hasattr(self, 'gain_spin'):
 			self.gain_spin.setEnabled(False)
 		self.video_label.setText(f"camstim {self.app_version}\n\nCamera Stopped.")
@@ -1624,19 +1713,30 @@ class CameraGUI(QMainWindow):
 			self.update_status(f"Error toggling Teensy: {e}.")
 
 	def preview_experiment(self):
-		if not self.camera_app:
-			self.update_status('Error: Camera must be started first.')
-			return
-
-		params = self.get_selected_experiment_params()
+		params = self.get_selected_experiment_params(allow_empty_ids=True)
 		if params is None:
 			return
 
 		exp_name, experiment_id, mouse_id = params
+		save_outputs = self._preview_should_save_outputs()
 
 		self.preview_mode = True
-		started = self.camera_app.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
+		if self.camera_app:
+			started = self.camera_app.get_exp_params(
+				exp_name=exp_name,
+				experiment_id=experiment_id,
+				mouse_id=mouse_id,
+				save_outputs=save_outputs,
+			)
+		else:
+			started = self._start_preview_without_camera(
+				exp_name=exp_name,
+				experiment_id=experiment_id,
+				mouse_id=mouse_id,
+				save_outputs=save_outputs,
+			)
 		if not started:
+			self.preview_mode = False
 			self.update_status('Error: Failed to start experiment preview subprocess.')
 			return
 		self.load_and_display_exp_config()
@@ -1648,15 +1748,36 @@ class CameraGUI(QMainWindow):
 		self.update_status(f'Starting experiment preview: {exp_name}.')
 
 	def stop_preview(self):
+		self.preview_mode = False
 		if self.camera_app:
-			self.preview_mode = False
 			self.camera_app.stop_stim()
-			self.preview_btn.setEnabled(True)
+			self.preview_btn.setEnabled(self._should_enable_preview_button())
 			self.stop_preview_btn.setEnabled(False)
 			self.trigger_btn.setEnabled(True)
 			self.update_status("Preview stopped.")
 			self.config_display.setText("Experiment stopped. \n\nStart/preview experiment to load configuration.")
 			self.current_exp_config = None
+			return
+
+		if self.preview_process is not None:
+			try:
+				if self.preview_process.poll() is None:
+					self.preview_process.stdin.write("STOP\n")
+					self.preview_process.stdin.flush()
+					self.preview_process.terminate()
+					self.preview_process.wait(timeout=2.0)
+			except (OSError, subprocess.TimeoutExpired) as e:
+				self.update_status(f"Error stopping preview: {e}.")
+				if self.preview_process.poll() is None:
+					self.preview_process.kill()
+			finally:
+				self.preview_process = None
+
+		self.preview_btn.setEnabled(self._should_enable_preview_button())
+		self.stop_preview_btn.setEnabled(False)
+		self.update_status("Preview stopped.")
+		self.config_display.setText("Experiment stopped. \n\nStart/preview experiment to load configuration.")
+		self.current_exp_config = None
 
 	def start_experiment(self):
 		if not self.camera_app:

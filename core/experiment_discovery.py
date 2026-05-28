@@ -9,6 +9,7 @@ EXPERIMENT_TYPES_DIR = Path(__file__).resolve().parent.parent / "experiment_type
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config_files"
 EXPERIMENT_NAME_OVERRIDES = {
     "TextureExperimentFB": "Texture FB",
+    "TextureExperimentFBSimple": "Texture FB Simple",
     "TextureExperimentFBVGG": "Texture FB-VGG",
     "TextureExperimentFBVGGMultiTime": "Texture FB-VGGMultiTime",
 }

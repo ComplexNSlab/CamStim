@@ -1,0 +1,27 @@
+# Experiment config file
+# All delays in seconds
+name: "TextureExperimentFBSimple"
+
+# Folder that contains TIFF images (.tif, .tiff)
+images_folder: "image_data/passive_short"
+
+# Kept for future compatibility; currently unused in this experiment
+vignette_filename: ""
+
+give_blanks: True
+
+# Number of repeats per image and per blank condition
+n_stims_per_condition: 10
+
+# Timing
+experiment_delay: 2
+image_on_period: 0.25
+inter_trial_delay: 0.5
+
+# Visual stimulus parameters
+image_position: [0, 0]
+image_size: [100, 100]
+image_mask: None
+image_mask_sd: 0
+
+trial_params_columns: ["trial_number", "clock_time", "index", "image_name", "stim_info"]

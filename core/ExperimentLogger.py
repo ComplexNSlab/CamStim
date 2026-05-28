@@ -9,8 +9,10 @@ import os
 
 
 class ExperimentLogger():
-    def __init__(self, filename, experiment_id, mouse_id, log_dir, experiment_settings_filenames):
+    def __init__(self, filename, experiment_id, mouse_id, log_dir, experiment_settings_filenames, preview=False, save_outputs=None):
         self.filename = filename
+        self.preview = bool(preview)
+        self.save_outputs = (not self.preview) if save_outputs is None else bool(save_outputs)
         self.log = {}
 
         #self.log = h5py.File(filename, 'w')
@@ -30,17 +32,18 @@ class ExperimentLogger():
         self.trial_params_columns = None
 
         # for each of the settings filenames we make a copy of them to always have them available.
-        for filename in experiment_settings_filenames:
-            src = os.path.abspath(filename)
-            new_filename = os.path.join(log_dir, os.path.basename(filename))
-            dst = os.path.abspath(new_filename)
+        if self.save_outputs and log_dir:
+            for filename in experiment_settings_filenames:
+                src = os.path.abspath(filename)
+                new_filename = os.path.join(log_dir, os.path.basename(filename))
+                dst = os.path.abspath(new_filename)
 
-            # Avoid shutil.SameFileError when a settings file is already in log_dir.
-            if src == dst:
-                continue
+                # Avoid shutil.SameFileError when a settings file is already in log_dir.
+                if src == dst:
+                    continue
 
-            shutil.copyfile(src, dst)
-        print("Copied experiment settings.")
+                shutil.copyfile(src, dst)
+            print("Copied experiment settings.")
 
 
 
@@ -85,6 +88,10 @@ class ExperimentLogger():
 
 
     def save_log(self, ni_log=np.zeros([10, 10])):
+        if not self.save_outputs or not self.filename:
+            print("Preview mode active: experiment log not written.")
+            return
+
         #self.log.create_dataset("trial_params", data=self.trial_params)
         self.log['trial_params'] = self.trial_params
 

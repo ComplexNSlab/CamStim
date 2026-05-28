@@ -13,10 +13,12 @@ import numpy as np
 from psychopy.visual.windowwarp import Warper
 
 class BaseExperiment(ABC):
-    def __init__(self, experiment_id, mouse_id, daq, monitor_config_filename, save_settings_config_filename, exp_config_filename, debug):
+    def __init__(self, experiment_id, mouse_id, daq, monitor_config_filename, save_settings_config_filename, exp_config_filename, debug, preview=False, save_outputs=None):
         self.experiment_id = experiment_id
         self.mouse_id = mouse_id
         self.debug = debug
+        self.preview = bool(preview)
+        self.save_outputs = (not self.preview) if save_outputs is None else bool(save_outputs)
 
         self.status_callback = None
         self.trial_callback = None
@@ -45,7 +47,8 @@ class BaseExperiment(ABC):
         self.experiment_log_filename = None
         self.ni_log_filename = None
         self.data_log_dir = None
-        self.create_save_directories(save_settings_config_filename)
+        if self.save_outputs:
+            self.create_save_directories(save_settings_config_filename)
 
         self.experiment_settings_filenames = [
             self.resolve_config_path(monitor_config_filename),
@@ -54,7 +57,15 @@ class BaseExperiment(ABC):
         ]
 
         # experiment trial params logger
-        self.exp_log = ExperimentLogger(self.experiment_log_filename, self.experiment_id, self.mouse_id, self.data_log_dir, self.experiment_settings_filenames) 
+        self.exp_log = ExperimentLogger(
+            self.experiment_log_filename,
+            self.experiment_id,
+            self.mouse_id,
+            self.data_log_dir,
+            self.experiment_settings_filenames,
+            preview=self.preview,
+            save_outputs=self.save_outputs,
+        )
         self.daq.ni_log_filename = self.ni_log_filename
 
         self.create_photodiode_square()
@@ -213,11 +224,11 @@ class BaseExperiment(ABC):
         self.ni_log_filename = os.path.join(self.data_log_dir, "{}_ni_log.npy".format(self.experiment_id))
 
 
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
-        else:
+        if os.path.exists(self.save_dir):
             if not self.debug:
                 raise Exception("Experiment ID: {} already exists make new ID...".format(self.experiment_id))
+
+        os.makedirs(self.save_dir, exist_ok=True)
 
 
 
@@ -225,12 +236,18 @@ class BaseExperiment(ABC):
         if self.daq is None:
             raise Exception("Please set the daq object, it has not been set.")
 
+        if self.preview:
+            return
+
         if platform == "win32" and not self.debug:
             self.acquisition_running = True
             self.daq.start_everything()
 
 
     def stop_data_acquisition(self,):
+        if self.preview:
+            return
+
         if platform == "win32" and not self.debug:
             self.daq.stop_everything()
             self.acquisition_running = False

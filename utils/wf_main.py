@@ -22,7 +22,7 @@ stop_flag = False
 bool_DEBUG = True
 
 exp_types = discover_experiment_types()
-def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False):
+def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False, preview=False, save_outputs=None):
     data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
     teensy_board = None
     if not skip_teensy:
@@ -38,7 +38,17 @@ def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False):
 
     config_file = str(resolve_experiment_config_file(exp_name, exp_type))
 
-    exp = exp_type(experiment_id, mouse_id, data_aq, str(CONFIG_DIR / "monitor_config.yaml"), str(CONFIG_DIR / "config.yaml"), config_file, debug=bool_DEBUG)
+    exp = exp_type(
+        experiment_id,
+        mouse_id,
+        data_aq,
+        str(CONFIG_DIR / "monitor_config.yaml"),
+        str(CONFIG_DIR / "config.yaml"),
+        config_file,
+        debug=bool_DEBUG,
+        preview=preview,
+        save_outputs=save_outputs,
+    )
 
     exp.load_experiment_config()
     exp.start_data_acquisition()
@@ -87,8 +97,11 @@ def listen_for_stop(teensy_board, exp):
 
 if __name__ == "__main__":
     try:
-        args = [arg for arg in sys.argv[1:] if arg != "--skip-teensy"]
-        skip_teensy = (len(args) != len(sys.argv[1:]))
+        raw_args = sys.argv[1:]
+        preview = ('--preview' in raw_args)
+        save_preview = ('--save-preview' in raw_args)
+        skip_teensy = ('--skip-teensy' in raw_args)
+        args = [arg for arg in raw_args if arg not in ('--skip-teensy', '--preview', '--save-preview')]
 
         if len(args) < 3:
             print("\nError in receiving experiment inputs.")
@@ -98,7 +111,20 @@ if __name__ == "__main__":
         exp_name = args[0]
         experiment_id = args[1]
         mouse_id = args[2]
-        teensy_board, current_exp = execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=skip_teensy)
+        if preview:
+            if save_preview:
+                print("\nPreview mode active: experiment files will be saved.")
+            else:
+                print("\nPreview mode active: file and data outputs are disabled.")
+
+        teensy_board, current_exp = execute_exp(
+            exp_name,
+            experiment_id,
+            mouse_id,
+            skip_teensy=skip_teensy,
+            preview=preview,
+            save_outputs=(not preview) or save_preview,
+        )
 
         while not stop_flag:
             sleep(0.1)

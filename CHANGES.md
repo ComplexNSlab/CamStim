@@ -1,3 +1,28 @@
+# 2026-05-28
+
+- Added camera-less experiment preview mode (`camstim.py`, `utils/wf_main.py`, `utils/simple_cam_mx.py`):
+	- Preview can be launched without starting the camera.
+	- Mouse ID and experiment ID fields are optional during preview.
+	- If both IDs are entered, preview behaves like a real run and saves files; otherwise no files are created.
+	- Added `--preview` and `--save-preview` CLI flags to `wf_main.py`.
+	- `save_outputs` flag threaded through GUI → worker → subprocess.
+
+- Added `save_outputs` gating to `core/BaseExperiment.py` and `core/ExperimentLogger.py`:
+	- `create_save_directories` is skipped when `save_outputs=False`.
+	- `ExperimentLogger` skips config copy and log write when `save_outputs=False`.
+	- Fixed `create_save_directories` to use `os.makedirs(exist_ok=True)`.
+	- Applied same `save_outputs` pattern to `experiment_types/Continuous.py` and `experiment_types/SpontaneousActivity.py`.
+
+- Added new experiment type `TextureExperimentFBSimple` (`experiment_types/TextureExperimentFBSimple.py`):
+	- Loads all TIFF images from a folder automatically.
+	- Single on-period per trial (no `image_repeat_times`, no `image_off_period`).
+	- Single `np.random.permutation` randomization over all stimuli and blanks.
+	- `stim_info` and `image_name` are identical (image filename stem, or `'blank'`).
+	- Added `config_files/TextureExperimentFBSimple_config.yaml`.
+	- Registered display name in `core/experiment_discovery.py`.
+
+- Fixed `config_files/config.yaml`: switched `SAVE_DIR` to macOS local path `/Users/orlandi/data`.
+
 # 2026-05-26
 - Added native C-based save-path binning in `utils/cgrabcallback.c`:
 	- New `bin_u8_batch_sum_pow2(src_addr, n, in_h, in_w, bin_size, dst_addr)` API for uint8 batch sum-binning into uint16 output.

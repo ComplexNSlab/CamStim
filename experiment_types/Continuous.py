@@ -20,11 +20,15 @@ class Continuous:
         save_settings_config_filename,
         exp_config_filename,
         debug,
+        preview=False,
+        save_outputs=None,
     ):
         self.experiment_id = experiment_id
         self.mouse_id = mouse_id
         self.daq = daq
         self.debug = debug
+        self.preview = bool(preview)
+        self.save_outputs = (not self.preview) if save_outputs is None else bool(save_outputs)
 
         self.status_callback = None
         self.trial_callback = None
@@ -43,7 +47,8 @@ class Continuous:
         self.data_log_dir = None
         self.experiment_log_filename = None
         self.ni_log_filename = None
-        self._create_save_directories()
+        if self.save_outputs:
+            self._create_save_directories()
 
         self.experiment_settings_filenames = [
             self.monitor_config_filename,
@@ -56,6 +61,8 @@ class Continuous:
             self.mouse_id,
             self.data_log_dir,
             self.experiment_settings_filenames,
+            preview=self.preview,
+            save_outputs=self.save_outputs,
         )
         self.daq.ni_log_filename = self.ni_log_filename
         self.exp_log.log['daq_sampling_rate'] = self.daq.sampling_rate
@@ -118,6 +125,9 @@ class Continuous:
     def start_data_acquisition(self):
         if self.daq is None:
             raise Exception('Please set the daq object, it has not been set.')
+
+        if self.preview:
+            return
 
         if os.sys.platform == 'win32' and not self.debug:
             self.acquisition_running = True

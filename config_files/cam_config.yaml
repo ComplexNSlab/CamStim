@@ -3,7 +3,7 @@ USE_LIVE_SPECKLE: false
 BUFFER_SIZE: 10
 
 # Debug option: run experiments without initializing the Teensy board.
-DEBUG_SKIP_TEENSY: false
+DEBUG_SKIP_TEENSY: true
 
 # Framegrab backend preference.
 # true: prefer C extension (cgrabcallback.fast_memcpy), fallback to Python if unavailable.

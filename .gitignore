@@ -10,6 +10,7 @@ Camera/
 *.npy
 *.h5
 *.hdf5
+imagedata/
 
 # OS
 .DS_Store
