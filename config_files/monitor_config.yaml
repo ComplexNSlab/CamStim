@@ -6,6 +6,7 @@ monitor_name: 'FED_IIYAMA_23'
 #monitor_width_cm: 52.2
 
 use_spherical_warp: True
+compensate_photodiode_for_warp: True
 
 monitor_width_pixels: 1920
 monitor_height_pixels: 1080

@@ -475,7 +475,7 @@ class App(object):
             elif name == 'start_experiment':
                 exp_name, experiment_id, mouse_id = payload
                 self.saving = True
-                self.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
+                self.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id, save_outputs=True)
             elif name == 'stop_preview':
                 self.stop_stim()
             elif name == 'stop_experiment':

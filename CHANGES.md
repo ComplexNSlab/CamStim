@@ -1,3 +1,11 @@
+# 2026-05-29
+
+- Fixed camera data not being saved during real experiments (`utils/simple_cam_mx.py`):
+	- `start_experiment` command handler was calling `get_exp_params(...)` without `save_outputs=True`.
+	- `_prepare_save_directory` was never called, so `save_dir_ready` remained `False`.
+	- The save worker loop waited indefinitely for a ready save directory while frames accumulated in the queue unwritten.
+	- Fixed by passing `save_outputs=True` explicitly when handling the `start_experiment` command.
+
 # 2026-05-28
 
 - Added camera-less experiment preview mode (`camstim.py`, `utils/wf_main.py`, `utils/simple_cam_mx.py`):
