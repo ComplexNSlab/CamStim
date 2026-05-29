@@ -5,3 +5,5 @@
 #SAVE_DIR: "/home/orlandi/data/camstim"
 SAVE_DIR: "/Users/orlandi/data"
 SIGROK_EXE: "sigrok-cli"
+
+USE_MOVEMENT_SENSOR: true

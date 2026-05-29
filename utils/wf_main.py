@@ -1,5 +1,7 @@
 import sys
 import threading
+import subprocess
+import yaml
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -18,13 +20,93 @@ from core.experiment_discovery import discover_experiment_types, resolve_experim
 
 current_exp = None
 teensy_board = None
+movement_sensor_process = None
 stop_flag = False
 bool_DEBUG = True
 
 exp_types = discover_experiment_types()
+
+
+def _as_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
+
+
+def _load_yaml(path):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f) or {}
+
+
+def _start_movement_sensor(experiment_id, mouse_id, exp, preview=False):
+    if preview:
+        return None
+
+    config = _load_yaml(CONFIG_DIR / 'config.yaml')
+    if not _as_bool(config.get('USE_MOVEMENT_SENSOR', False)):
+        return None
+
+    movement_cfg = _load_yaml(CONFIG_DIR / 'movementSensor.yaml')
+    sensor_port = movement_cfg.get('MOVEMENT_SENSOR_PORT', movement_cfg.get('port'))
+    plot_flag = '1' if _as_bool(movement_cfg.get('PLOT', False)) else '0'
+    if not sensor_port:
+        print('\nMovement sensor enabled but no port found in config_files/movementSensor.yaml.')
+        return None
+
+    output_dir = Path(getattr(exp, 'save_dir', '') or REPO_ROOT)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_csv = output_dir / f'{mouse_id}_{experiment_id}_movement.csv'
+
+    cmd = [
+        sys.executable,
+        str((REPO_ROOT / 'utils' / 'mpulogger.py').resolve()),
+        '--plot', plot_flag,
+        '--file', str(output_csv),
+        '--port', str(sensor_port),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdin=subprocess.PIPE,
+        text=True,
+    )
+    print(f'\nMovement sensor started on {sensor_port}, saving to {output_csv}.')
+    return proc
+
+
+def _stop_movement_sensor(proc):
+    if proc is None:
+        return
+
+    try:
+        if proc.poll() is None and proc.stdin is not None:
+            proc.stdin.write('STOP\n')
+            proc.stdin.flush()
+
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+        print('\nMovement sensor stopped.')
+    except Exception as e:
+        print(f'\nError stopping movement sensor: {e}')
+    finally:
+        try:
+            if proc.stdin is not None and not proc.stdin.closed:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+
 def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False, preview=False, save_outputs=None):
     data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
     teensy_board = None
+    movement_proc = None
     if not skip_teensy:
         teensy_board = TeensyController(experiment_id, bool_DEBUG, str(CONFIG_DIR / "teensyParams.yaml"))
         print("\nTeensy started.")
@@ -55,23 +137,29 @@ def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False, preview=Fa
     if teensy_board:
         teensy_board.start_teensy()
 
+    # Movement sensor should run independently from Teensy debug mode.
+    movement_proc = _start_movement_sensor(experiment_id, mouse_id, exp, preview=preview)
+
     print("\nSTARTING experiment...")
 
-    threading.Thread(target=listen_for_stop, args=(teensy_board, exp), daemon=True).start()
+    threading.Thread(target=listen_for_stop, args=(teensy_board, exp, movement_proc), daemon=True).start()
 
     exp.run_experiment()
     global stop_flag
     stop_flag = True
 
-    return teensy_board, exp
+    return teensy_board, exp, movement_proc
 
 
-def listen_for_stop(teensy_board, exp):
+def listen_for_stop(teensy_board, exp, movement_proc):
     global stop_flag
     for line in sys.stdin:
         if line.strip().upper() == "STOP":
             print("\nReceived STOP command via subprocess.", flush=True)
             stop_flag = True
+
+            # Stop movement sensor first so it exits before Teensy is stopped.
+            _stop_movement_sensor(movement_proc)
 
             # Stop Teensy if available
             if teensy_board:
@@ -96,6 +184,9 @@ def listen_for_stop(teensy_board, exp):
 
 
 if __name__ == "__main__":
+    current_exp = None
+    teensy_board = None
+    movement_sensor_process = None
     try:
         raw_args = sys.argv[1:]
         preview = ('--preview' in raw_args)
@@ -117,7 +208,7 @@ if __name__ == "__main__":
             else:
                 print("\nPreview mode active: file and data outputs are disabled.")
 
-        teensy_board, current_exp = execute_exp(
+        teensy_board, current_exp, movement_sensor_process = execute_exp(
             exp_name,
             experiment_id,
             mouse_id,
@@ -129,6 +220,7 @@ if __name__ == "__main__":
         while not stop_flag:
             sleep(0.1)
 
+        _stop_movement_sensor(movement_sensor_process)
         if teensy_board:
             teensy_board.stop_teensy()
             print("\nTeensy stopped.")
@@ -141,15 +233,17 @@ if __name__ == "__main__":
     
     except KeyboardInterrupt:
         print("\nReceived CTRL-C event")
-        if current_exp.experiment_running:
+        _stop_movement_sensor(movement_sensor_process)
+        if current_exp and current_exp.experiment_running:
             # We need to run the stopping functions.
             pass
-        if current_exp.acquisition_running:
+        if current_exp and current_exp.acquisition_running:
             current_exp.stop_data_acquisition()
-        try:
-            teensy_board.stop_teensy()
-        finally:
-            print("\nTeensy stopped.")
+        if teensy_board:
+            try:
+                teensy_board.stop_teensy()
+            finally:
+                print("\nTeensy stopped.")
 
     finally:
         print("\nExperiment routine completed. Thanks!")

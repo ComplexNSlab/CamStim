@@ -25,6 +25,16 @@
 	- Reworked normalization controls to Auto/Disable buttons and moved histogram/FRC to explicit action buttons.
 	- Updated histogram display behavior and interaction flow for the current standalone-window implementation.
 
+- Added movement sensor lifecycle integration (`utils/wf_main.py`, `utils/mpulogger.py`):
+	- New `USE_MOVEMENT_SENSOR` gate in `config_files/config.yaml` now controls optional movement logger startup during experiments.
+	- Movement sensor serial port is read from `config_files/movementSensor.yaml` and output is saved as `{mouse_id}_{experiment_id}_movement.csv` in the experiment save directory.
+	- Movement logger now supports graceful shutdown via `STOP` stdin command and signal handling.
+	- Experiment shutdown order now stops the movement logger before Teensy shutdown.
+
+- Improved movement logger plotting stability (`utils/mpulogger.py`):
+	- Fixed plot-mode freeze on close by decoupling serial/CSV logging from the matplotlib UI loop.
+	- Closing the plot window now cleanly exits plotting while headless CSV logging continues until STOP/signal.
+
 # Version [0.2.2]
 
 # 2026-05-29
