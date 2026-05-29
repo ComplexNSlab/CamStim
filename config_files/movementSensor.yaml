@@ -2,3 +2,5 @@
 port: "/dev/tty.usbserial-A50285BI"
 # Enable live plotting in mpulogger (true/false).
 PLOT: true
+# Plot time window in seconds.
+WINDOW_SECONDS: 60

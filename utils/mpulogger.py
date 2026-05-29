@@ -23,9 +23,32 @@ from pathlib import Path
 import serial
 
 
+class OnlineZScore:
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, x: float) -> float:
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n
+        delta2 = x - self.mean
+        self.m2 += delta * delta2
+
+        if self.n < 2:
+            return 0.0
+
+        variance = self.m2 / (self.n - 1)
+        if variance <= 1e-12:
+            return 0.0
+        return (x - self.mean) / (variance ** 0.5)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument('--plot', type=int, default=0, help='Enable plotting (1=yes, 0=no)')
+    parser.add_argument('--window-seconds', type=float, default=30.0, help='Plot window length in seconds')
     parser.add_argument('--file', type=str, default=None, help='Output csv file path (default timestamped name)')
     parser.add_argument('--port', type=str, default='/dev/tty.usbserial-A50285BI', help='Sensor serial port')
     parser.add_argument('--baud', type=int, default=115200, help='Serial baud rate')
@@ -93,27 +116,33 @@ def _logger_loop(
         writer.writerow([t, x, y, z, gx, gy, gz, t_sensor])
         csv_file.flush()
         with buffer_lock:
-            sample_buffer.append((x, y, z, t_sensor))
+            sample_buffer.append((t, x, y, z, t_sensor))
 
-def run_plot(stop_event: threading.Event, sample_buffer: deque, buffer_lock: threading.Lock) -> None:
+def run_plot(stop_event: threading.Event, sample_buffer: deque, buffer_lock: threading.Lock, window_seconds: float) -> None:
     import matplotlib
 
     matplotlib.use('TkAgg')
     import matplotlib.pyplot as plt
 
-    x_data, y_data, z_data, t_data = [], [], [], []
-    max_points = 100
+    time_data, x_data, y_data, z_data, t_data = [], [], [], [], []
+    window_seconds = float(max(1.0, window_seconds))
     plot_closed_event = threading.Event()
+
+    z_x = OnlineZScore()
+    z_y = OnlineZScore()
+    z_z = OnlineZScore()
+    offsets = (0.0, 4.0, 8.0, 12.0)
 
     fig, ax = plt.subplots()
 
-    line_x, = ax.plot([], [], label='X')
-    line_y, = ax.plot([], [], label='Y')
-    line_z, = ax.plot([], [], label='Z')
-    line_t, = ax.plot([], [], label='T')
+    line_x, = ax.plot([], [], label='X (z + 0)')
+    line_y, = ax.plot([], [], label='Y (z + 4)')
+    line_z, = ax.plot([], [], label='Z (z + 8)')
+    line_t, = ax.plot([], [], label='T (raw + 12)')
 
-    ax.set_ylim(-20000, 20000)
-    ax.set_xlim(0, max_points)
+    ax.set_ylim(-8, 24)
+    ax.set_xlim(0, window_seconds)
+    ax.set_xlabel('Time (s)')
     ax.legend()
     ax.grid()
 
@@ -128,24 +157,46 @@ def run_plot(stop_event: threading.Event, sample_buffer: deque, buffer_lock: thr
     while not stop_event.is_set() and not plot_closed_event.is_set() and plt.fignum_exists(fig.number):
         with buffer_lock:
             while sample_buffer:
-                x, y, z, t_sensor = sample_buffer.popleft()
-                x_data.append(x)
-                y_data.append(y)
-                z_data.append(z)
-                t_data.append(t_sensor * 10000)
+                t_real, x, y, z, t_sensor = sample_buffer.popleft()
+                time_data.append(float(t_real))
+                x_data.append(z_x.update(float(x)) + offsets[0])
+                y_data.append(z_y.update(float(y)) + offsets[1])
+                z_data.append(z_z.update(float(z)) + offsets[2])
+                t_data.append(float(t_sensor) + offsets[3])
 
-        x_data[:] = x_data[-max_points:]
-        y_data[:] = y_data[-max_points:]
-        z_data[:] = z_data[-max_points:]
-        t_data[:] = t_data[-max_points:]
+        if time_data:
+            latest_t = time_data[-1]
+            keep_from = latest_t - window_seconds
+            keep_idx = 0
+            for i, t_val in enumerate(time_data):
+                if t_val >= keep_from:
+                    keep_idx = i
+                    break
 
-        line_x.set_data(range(len(x_data)), x_data)
-        line_y.set_data(range(len(y_data)), y_data)
-        line_z.set_data(range(len(z_data)), z_data)
-        line_t.set_data(range(len(t_data)), t_data)
-        fig.canvas.draw_idle()
-        fig.canvas.flush_events()
-        plt.pause(0.05)
+            time_data[:] = time_data[keep_idx:]
+            x_data[:] = x_data[keep_idx:]
+            y_data[:] = y_data[keep_idx:]
+            z_data[:] = z_data[keep_idx:]
+            t_data[:] = t_data[keep_idx:]
+
+            x_axis = [tv - latest_t for tv in time_data]
+            line_x.set_data(x_axis, x_data)
+            line_y.set_data(x_axis, y_data)
+            line_z.set_data(x_axis, z_data)
+            line_t.set_data(x_axis, t_data)
+            ax.set_xlim(-window_seconds, 0)
+
+        # Keep close handling conservative: pause() processes GUI events and repaint
+        # without explicit flush_events calls that can race during window teardown.
+        try:
+            if not plt.fignum_exists(fig.number):
+                break
+            plt.pause(0.05)
+        except Exception:
+            # If backend teardown races with redraw, exit plotting cleanly and
+            # continue headless logging.
+            plot_closed_event.set()
+            break
 
     if plt.fignum_exists(fig.number):
         plt.close(fig)
@@ -183,7 +234,7 @@ def main() -> int:
 
     try:
         if args.plot:
-            run_plot(stop_event, sample_buffer, buffer_lock)
+            run_plot(stop_event, sample_buffer, buffer_lock, args.window_seconds)
             # If the plot window was closed manually, continue logging without UI
             # until STOP/signal is received.
             if not stop_event.is_set():

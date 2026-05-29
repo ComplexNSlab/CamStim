@@ -5,11 +5,20 @@ const int MPU = 0x68; // MPU6050 I2C address
 int16_t AccX, AccY, AccZ;
 int16_t GyroX, GyroY, GyroZ;
 
-unsigned long lastTime = 0;
+const uint8_t TICK_PIN = 2;
+const unsigned long TICK_PERIOD_MS = 1000;
+const unsigned long TICK_HIGH_MS = 100;
+
+unsigned long lastPulseStartMs = 0;
+unsigned long pulseHighStartMs = 0;
+bool pulseActive = false;
 
 void setup() {
   Wire.begin();
   Serial.begin(115200);
+
+  pinMode(TICK_PIN, OUTPUT);
+  digitalWrite(TICK_PIN, LOW);
 
   // Wake up MPU-6050
   Wire.beginTransmission(MPU);
@@ -19,18 +28,23 @@ void setup() {
 }
 
 void loop() {
-  
- unsigned long now = millis();
- int tickValue = 0;
- 
-  if (now - lastTime >= 1000) {  // 1 second
-    lastTime = now;
+  unsigned long now = millis();
 
-    digitalWrite(2, HIGH);   // pulse pin
-    delay(10);
-    digitalWrite(2, LOW);
-    tickValue = 1;
+  // Start a new pulse every second (non-blocking).
+  if (!pulseActive && (now - lastPulseStartMs >= TICK_PERIOD_MS)) {
+    lastPulseStartMs = now;
+    pulseHighStartMs = now;
+    pulseActive = true;
+    digitalWrite(TICK_PIN, HIGH);
   }
+
+  // End pulse after 100 ms, keeping loop free for continuous logging.
+  if (pulseActive && (now - pulseHighStartMs >= TICK_HIGH_MS)) {
+    pulseActive = false;
+    digitalWrite(TICK_PIN, LOW);
+  }
+
+  int tickValue = pulseActive ? 1 : 0;
 
   Wire.beginTransmission(MPU);
   Wire.write(0x3B);

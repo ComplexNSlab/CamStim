@@ -1250,8 +1250,6 @@ class App(object):
     def start_stim(self, exp_name, experiment_id, mouse_id, status_callback=None, trial_callback=None, preview=False, save_outputs=False):
         if getattr(self, 'stim_progress', None):
             print("Experiment currently running. Stopping...")
-            if hasattr(self.stim_progress, 'terminate'):
-                self.stim_progress.terminate()
             self.stop_stim()
 
         print(f"\nStarting {exp_name} with exp. ID {experiment_id} and mouse {mouse_id}...")
@@ -1295,11 +1293,28 @@ class App(object):
                 print("Stopping stim via subprocess...")
                 try:
                     if self.stim_progress.poll() is None:
-                        self.stim_progress.stdin.write("STOP\n")
-                        self.stim_progress.stdin.flush()
-                        self.stim_progress.terminate()
-                        self.stim_progress.wait(timeout=2.0)
-                        print("\nStim stopped.")
+                        # Ask wf_main to stop gracefully so it can tear down
+                        # children (notably mpulogger) before process exit.
+                        try:
+                            if self.stim_progress.stdin is not None and not self.stim_progress.stdin.closed:
+                                self.stim_progress.stdin.write("STOP\n")
+                                self.stim_progress.stdin.flush()
+                        except Exception as write_error:
+                            print(f"\nFailed to send STOP to stim process: {write_error}.")
+
+                        try:
+                            self.stim_progress.wait(timeout=5.0)
+                            print("\nStim stopped gracefully.")
+                        except subprocess.TimeoutExpired:
+                            print("\nStim process did not exit after STOP; forcing terminate...")
+                            self.stim_progress.terminate()
+                            try:
+                                self.stim_progress.wait(timeout=2.0)
+                            except subprocess.TimeoutExpired:
+                                print("\nStim process still running; forcing kill...")
+                                self.stim_progress.kill()
+                                self.stim_progress.wait(timeout=2.0)
+                            print("\nStim terminated.")
                     else:
                         print("\nStim process already finished.")
                 except (OSError, subprocess.TimeoutExpired) as e:

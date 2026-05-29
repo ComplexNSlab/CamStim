@@ -35,6 +35,22 @@
 	- Fixed plot-mode freeze on close by decoupling serial/CSV logging from the matplotlib UI loop.
 	- Closing the plot window now cleanly exits plotting while headless CSV logging continues until STOP/signal.
 
+- Hardened experiment-stop shutdown path for movement logging (`utils/simple_cam_mx.py`):
+	- Stopping an experiment now sends `STOP` to `wf_main.py` and waits for graceful exit before any forced terminate/kill fallback.
+	- Removed eager pre-termination of an existing experiment process during restart, preventing premature teardown of child cleanup.
+
+- Added configurable movement plot window duration (`config_files/movementSensor.yaml`, `utils/wf_main.py`, `utils/mpulogger.py`):
+	- New `WINDOW_SECONDS` setting in `config_files/movementSensor.yaml`.
+	- `wf_main.py` forwards the setting to `mpulogger.py` via `--window-seconds`.
+
+- Refined live movement plotting behavior (`utils/mpulogger.py`):
+	- Plot now uses real-time x-axis in seconds over a sliding window.
+	- X/Y/Z are plotted as online z-scores with vertical offsets; T remains raw with its own offset.
+
+- Updated Arduino-side movement tick signaling (`utils/mpu6050plot/mpu6050plot.ino`):
+	- Replaced blocking pulse timing with non-blocking `millis()` scheduling.
+	- Pin 2 now emits a 100 ms HIGH pulse every 1 second without delaying sensor logging.
+
 # Version [0.2.2]
 
 # 2026-05-29

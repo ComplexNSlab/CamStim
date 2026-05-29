@@ -49,6 +49,7 @@ def _start_movement_sensor(experiment_id, mouse_id, exp, preview=False):
     movement_cfg = _load_yaml(CONFIG_DIR / 'movementSensor.yaml')
     sensor_port = movement_cfg.get('MOVEMENT_SENSOR_PORT', movement_cfg.get('port'))
     plot_flag = '1' if _as_bool(movement_cfg.get('PLOT', False)) else '0'
+    window_seconds = movement_cfg.get('WINDOW_SECONDS', 30)
     if not sensor_port:
         print('\nMovement sensor enabled but no port found in config_files/movementSensor.yaml.')
         return None
@@ -61,6 +62,7 @@ def _start_movement_sensor(experiment_id, mouse_id, exp, preview=False):
         sys.executable,
         str((REPO_ROOT / 'utils' / 'mpulogger.py').resolve()),
         '--plot', plot_flag,
+        '--window-seconds', str(window_seconds),
         '--file', str(output_csv),
         '--port', str(sensor_port),
     ]
