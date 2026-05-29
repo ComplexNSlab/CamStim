@@ -7,31 +7,6 @@ name: "RetinotopyFB"
 # the delay before starting and after ending the experiment (black square comes on at half of this time)
 experiment_delay: 8
 
-
-DisplaySequence:
-  ds_log_dir: C:\\Data\retinotopy
-  ds_backupdir: null
-  ds_identifier: TEST
-  ds_display_iter: 1.0
-  ds_mouse_id: MOUSE
-  ds_user_id: USER
-  ds_psychopy_mon: testMonitor
-  ds_is_by_index: false
-  ds_is_interpolate: false
-  ds_is_triggered: false
-  ds_is_save_sequence: false
-  ds_trigger_event: negative_edge
-  ds_trigger_NI_dev: Dev1
-  ds_trigger_NI_port: 1
-  ds_trigger_NI_line: 0
-  ds_is_sync_pulse: false
-  ds_sync_pulse_NI_dev: Dev1
-  ds_sync_pulse_NI_port: 1
-  ds_sync_pulse_NI_line: 1
-  ds_display_screen: 1
-  ds_initial_background_color: 0.0
-  ds_color_weights: [1.0, 1.0, 1.0]
-
 generic_stimulus_parameters:
   pre_gap_dur: 2.0
   post_gap_dur: 3.0

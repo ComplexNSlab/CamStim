@@ -1,4 +1,24 @@
 
+# Version [0.2.4]
+
+# 2026-05-29
+
+- Updated Retinotopy experiment runtime path (`experiment_types/RetinotopyExperiment.py`):
+	- Fixed monitor/indicator setup to use `WarpedVisualStim.MonitorSetup.Monitor` and `Indicator` directly.
+	- Added robust stop integration (`stop_experiment`) and status/progress updates compatible with current subprocess control.
+	- Retinotopy stimulus is now displayed at full monitor pixel size instead of downsampled frame size.
+
+- Removed unused legacy retinotopy config block (`config_files/RetinotopyExperiment_config.yaml`):
+	- Deleted obsolete `DisplaySequence`/`ds_*` options that are not used by the current Retinotopy experiment implementation.
+
+- Improved compatibility with modern NumPy for vendored `WarpedVisualStim`:
+	- Added alias compatibility shim in `external/WarpedVisualStim/WarpedVisualStim/__init__.py`.
+	- Replaced deprecated `np.bool` usage with `np.bool_` in `external/WarpedVisualStim/WarpedVisualStim/StimulusRoutines.py`.
+	- Updated alias checks to avoid `FutureWarning`.
+
+- Hardened teardown safety in `core/BaseExperiment.py`:
+	- Guarded `__del__` window close to avoid cleanup errors when experiment initialization fails early.
+
 # Version [0.2.3]
 
 # 2026-05-29

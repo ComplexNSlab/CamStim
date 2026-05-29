@@ -95,7 +95,11 @@ class BaseExperiment(ABC):
             print(message)
 
     def __del__(self):
-        self.window.close()
+        try:
+            if getattr(self, 'window', None) is not None:
+                self.window.close()
+        except Exception:
+            pass
 
     @staticmethod
     def resolve_config_path(config_filename):

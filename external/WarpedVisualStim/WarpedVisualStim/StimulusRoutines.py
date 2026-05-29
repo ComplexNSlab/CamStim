@@ -3994,7 +3994,7 @@ class KSstim(Stim):
                 sweep_table.append(('H', step_y[j], step_y[j] + sweep_width))
                 del temp
 
-        return sweeps.astype(np.bool), sweep_table
+        return sweeps.astype(np.bool_), sweep_table
 
     def generate_frames(self):
         """
