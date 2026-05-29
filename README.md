@@ -56,6 +56,7 @@ camstim/
    ```bash
    conda install -c conda-forge opencv gtk3 gstreamer pyqt qt-main pyqt6
    pip install 'setuptools<70'
+   pip install setproctitle frc
    pip install --upgrade psychopy tifffile h5py scikit-image
    ```
    

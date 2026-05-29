@@ -1,11 +1,16 @@
 import sys
+import os
 import numpy as np
 import multiprocessing as mp
 import queue
+try:
+	from setproctitle import setproctitle as _setproctitle
+except ImportError:
+	_setproctitle = None
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
 							QWidget, QPushButton, QLabel, QDoubleSpinBox,
 							QGridLayout,
-							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit,
+							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit, QSizePolicy,
 							QFileDialog, QInputDialog, QMessageBox)
 from PyQt6.QtCore import QTimer, Qt, QRect, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QAction, QPainter, QPen, QColor
@@ -14,6 +19,7 @@ from collections import deque
 import threading
 import re
 import subprocess
+import tempfile
 from core.TeensyController import TeensyController
 import cv2
 import yaml
@@ -115,6 +121,108 @@ class RoiSelectableLabel(QLabel):
 		painter.setPen(QPen(QColor(255, 64, 64), 2, Qt.PenStyle.SolidLine))
 		painter.drawRect(QRect(self._drag_start, self._drag_current).normalized())
 
+class HistogramWindow(QWidget):
+	closed = pyqtSignal()
+
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self.setWindowTitle('Live Histogram')
+		self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+		self.setWindowFlag(Qt.WindowType.Window, True)
+
+	def closeEvent(self, event):
+		self.closed.emit()
+		event.accept()
+
+
+class HistogramLabel(QLabel):
+	limitsChanged = pyqtSignal(float, float)
+
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self._limit_min = 0.0
+		self._limit_max = 255.0
+		self._data_min = 0.0
+		self._data_max = 255.0
+		self._drag_target = None
+		self._drag_margin_px = 8
+		self.setMouseTracking(True)
+
+	def set_histogram_limits(self, limit_min, limit_max, data_min=0.0, data_max=255.0):
+		self._limit_min = float(limit_min)
+		self._limit_max = float(limit_max)
+		self._data_min = float(data_min)
+		self._data_max = float(data_max)
+		if self._data_max <= self._data_min:
+			self._data_max = self._data_min + 1.0
+
+	def _x_to_value(self, x_pos):
+		width = max(1, self.width() - 1)
+		fraction = min(max(float(x_pos) / float(width), 0.0), 1.0)
+		return self._data_min + fraction * (self._data_max - self._data_min)
+
+	def _value_to_x(self, value):
+		width = max(1, self.width() - 1)
+		fraction = (float(value) - self._data_min) / (self._data_max - self._data_min)
+		fraction = min(max(fraction, 0.0), 1.0)
+		return int(round(fraction * width))
+
+	def _pick_drag_target(self, x_pos):
+		min_x = self._value_to_x(self._limit_min)
+		max_x = self._value_to_x(self._limit_max)
+		min_dist = abs(x_pos - min_x)
+		max_dist = abs(x_pos - max_x)
+		if min_dist <= self._drag_margin_px or max_dist <= self._drag_margin_px:
+			return 'min' if min_dist <= max_dist else 'max'
+		return None
+
+	def _update_cursor_for_x(self, x_pos):
+		if self._drag_target is not None or self._pick_drag_target(x_pos) is not None:
+			self.setCursor(Qt.CursorShape.SizeHorCursor)
+		else:
+			self.unsetCursor()
+
+	def _emit_limits_for_x(self, x_pos):
+		new_value = self._x_to_value(x_pos)
+		if self._drag_target == 'min':
+			new_min = min(new_value, self._limit_max - 1.0)
+			new_min = max(new_min, self._data_min)
+			self._limit_min = new_min
+		elif self._drag_target == 'max':
+			new_max = max(new_value, self._limit_min + 1.0)
+			new_max = min(new_max, self._data_max)
+			self._limit_max = new_max
+		self.limitsChanged.emit(self._limit_min, self._limit_max)
+		self.update()
+
+	def mousePressEvent(self, event):
+		if event.button() == Qt.MouseButton.LeftButton:
+			self._drag_target = self._pick_drag_target(int(event.position().x()))
+			if self._drag_target is not None:
+				self.setCursor(Qt.CursorShape.SizeHorCursor)
+				self._emit_limits_for_x(int(event.position().x()))
+				return
+		super().mousePressEvent(event)
+
+	def mouseMoveEvent(self, event):
+		if self._drag_target is not None:
+			self._emit_limits_for_x(int(event.position().x()))
+			return
+		self._update_cursor_for_x(int(event.position().x()))
+		super().mouseMoveEvent(event)
+
+	def mouseReleaseEvent(self, event):
+		if self._drag_target is not None and event.button() == Qt.MouseButton.LeftButton:
+			self._emit_limits_for_x(int(event.position().x()))
+			self._drag_target = None
+			self._update_cursor_for_x(int(event.position().x()))
+			return
+		super().mouseReleaseEvent(event)
+
+	def leaveEvent(self, event):
+		if self._drag_target is None:
+			self.unsetCursor()
+		super().leaveEvent(event)
 
 class CameraProcessClient:
 	def __init__(self, config):
@@ -421,11 +529,7 @@ class CameraProcessClient:
 		self.histogram_open = not self.histogram_open
 		return self.histogram_open
 
-	def adjust_dynamic_range(self):
-		if self.normalizeImage:
-			self.normalizeImage = False
-			return self.normalizeImage
-
+	def enable_normalize(self):
 		self.normalizeImage = True
 		self.autoI *= 2
 		if self.autoI > 49:
@@ -452,6 +556,13 @@ class CameraProcessClient:
 		if self.maxI <= self.minI:
 			self.maxI = self.minI + 1.0
 		return self.normalizeImage
+
+	def adjust_dynamic_range(self):
+		if self.normalizeImage:
+			self.normalizeImage = False
+			return self.normalizeImage
+
+		return self.enable_normalize()
 
 	def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None, preview=False, save_outputs=False):
 		self.exp_name = exp_name
@@ -506,6 +617,7 @@ class CameraGUI(QMainWindow):
 		self.histogram_thread = None
 		self.histogram_window = None
 		self.histogram_label = None
+		self.histogram_info_label = None
 		self.last_stats_time = None
 		self.last_stats_frame_count = 0
 		self.fps_samples = deque(maxlen=100)
@@ -965,10 +1077,10 @@ class CameraGUI(QMainWindow):
 		exp_layout.addWidget(QLabel("Exposure (ms):"))
 		self.exposure_spin = QDoubleSpinBox()
 		self.exposure_spin.setRange(0.1, 1000)
+		self.exposure_spin.setFixedWidth(90)
 		self.exposure_spin.setValue(self.config['EXPOSURE_TIME'])
 		self.exposure_spin.valueChanged.connect(self.update_exposure)
 		exp_layout.addWidget(self.exposure_spin)
-		settings_layout.addLayout(exp_layout)
 
 		gain_layout = QHBoxLayout()
 		gain_layout.addWidget(QLabel("Gain:"))
@@ -976,12 +1088,19 @@ class CameraGUI(QMainWindow):
 		self.gain_spin.setRange(0.1, 100.0)
 		self.gain_spin.setDecimals(3)
 		self.gain_spin.setSingleStep(0.1)
+		self.gain_spin.setFixedWidth(90)
 		self.gain_spin.setKeyboardTracking(False)
 		self.gain_spin.setValue(float(self.config['ANALOG_GAIN']))
 		self.gain_spin.setEnabled(False)
 		self.gain_spin.valueChanged.connect(self.update_gain)
 		gain_layout.addWidget(self.gain_spin)
-		settings_layout.addLayout(gain_layout)
+
+		camera_row_layout = QHBoxLayout()
+		camera_row_layout.addLayout(exp_layout)
+		camera_row_layout.addSpacing(12)
+		camera_row_layout.addLayout(gain_layout)
+		camera_row_layout.addStretch()
+		settings_layout.addLayout(camera_row_layout)
 
 		settings_group.setLayout(settings_layout)
 		layout.addWidget(settings_group)
@@ -1039,35 +1158,43 @@ class CameraGUI(QMainWindow):
 		proc_group = QGroupBox("Image Processing")
 		proc_layout = QGridLayout()
 
-		self.normalize_cb = QCheckBox("Normalize Image")
-		self.normalize_cb.stateChanged.connect(self.toggle_normalize)
-		proc_layout.addWidget(self.normalize_cb, 0, 0)
+		self.autonorm_btn = QPushButton("Auto Norm")
+		self.autonorm_btn.clicked.connect(self.apply_auto_norm)
+		proc_layout.addWidget(self.autonorm_btn, 0, 0)
+
+		self.disablenorm_btn = QPushButton("Disable Norm")
+		self.disablenorm_btn.clicked.connect(self.disable_norm)
+		proc_layout.addWidget(self.disablenorm_btn, 0, 1)
+
+		self.histogram_btn = QPushButton("Show Histogram")
+		self.histogram_btn.clicked.connect(self.toggle_histogram)
+		proc_layout.addWidget(self.histogram_btn, 1, 0)
+
+		self.frc_btn = QPushButton("Fourier Ring Correlation")
+		self.frc_btn.clicked.connect(self.show_fourier_ring_correlation)
+		proc_layout.addWidget(self.frc_btn, 1, 1)
 
 		self.background_cb = QCheckBox("Remove Background")
 		self.background_cb.stateChanged.connect(self.toggle_background)
-		proc_layout.addWidget(self.background_cb, 1, 0)
+		proc_layout.addWidget(self.background_cb, 2, 0)
 
 		self.speckle_cb = QCheckBox("Live Speckle")
 		self.speckle_cb.stateChanged.connect(self.toggle_speckle)
-		proc_layout.addWidget(self.speckle_cb, 2, 0)
+		proc_layout.addWidget(self.speckle_cb, 3, 0)
 
 		self.dfof_cb = QCheckBox("Enable dFoF")
 		self.dfof_cb.stateChanged.connect(self.toggle_dfof)
-		proc_layout.addWidget(self.dfof_cb, 0, 1)
-
-		self.histogram_cb = QCheckBox("Show Histogram")
-		self.histogram_cb.stateChanged.connect(self.toggle_histogram)
-		proc_layout.addWidget(self.histogram_cb, 1, 1)
+		proc_layout.addWidget(self.dfof_cb, 2, 1)
 
 		self.highlight_pixels_cb = QCheckBox("Highlight 0/255 Pixels")
 		self.highlight_pixels_cb.setChecked(True)
 		self.highlight_pixels_cb.stateChanged.connect(self.toggle_special_pixel_highlight)
-		proc_layout.addWidget(self.highlight_pixels_cb, 2, 1)
+		proc_layout.addWidget(self.highlight_pixels_cb, 3, 1)
 
 		self.display_output_cb = QCheckBox("Live Display Updates")
 		self.display_output_cb.setChecked(True)
 		self.display_output_cb.stateChanged.connect(self.toggle_display_output)
-		proc_layout.addWidget(self.display_output_cb, 3, 0)
+		proc_layout.addWidget(self.display_output_cb, 4, 0)
 
 		proc_group.setLayout(proc_layout)
 		layout.addWidget(proc_group)
@@ -1320,6 +1447,7 @@ class CameraGUI(QMainWindow):
 
 			self.timer.start(30)
 			self.stats_timer.start(100)
+			self._update_autonorm_button_text()
 
 			self.start_btn.setEnabled(False)
 			self.stop_btn.setEnabled(True)
@@ -1460,6 +1588,7 @@ class CameraGUI(QMainWindow):
 			self.reset_roi_action.setEnabled(False)
 		self.trigger_btn.setEnabled(False)
 		self.teensy_toggle_btn.setEnabled(False)
+		self._update_autonorm_button_text()
 		self.teensy_toggle_btn.setText("Enable Teensy")
 		self.hardware_trigger_enabled = False
 		self.exp_btn.setEnabled(False)
@@ -1538,13 +1667,17 @@ class CameraGUI(QMainWindow):
 				frame = frame.reshape(h // bs, bs, w // bs, bs).sum(axis=(1, 3))
 			frame /= (bs * bs)
 
-		display_frame = self.process_frame_for_display(frame)
-		return display_frame
+		frame = self._prepare_display_frame(frame)
+		return self.process_frame_for_display(frame)
 
-	def process_frame_for_display(self, frame):
+	def _prepare_display_frame(self, frame):
 		if self.camera_app.dtype == 'uint16':
 			frame = frame.astype(np.float32)
+		else:
+			frame = frame.astype(np.float32, copy=False)
+		return frame
 
+	def process_frame_for_display(self, frame):
 		if self.camera_app.live_speck and hasattr(self.camera_app, 'enable_live_speckle') and self.camera_app.enable_live_speckle:
 			frame = self.camera_app.std_filter_frame(frame)
 			if hasattr(self.camera_app, 'circular_buffer'):
@@ -1567,24 +1700,24 @@ class CameraGUI(QMainWindow):
 			frame = frame - bg_ref
 			frame = np.clip(frame, 0, 255)
 
-		if self.camera_app.normalizeImage:
-			clipped = np.clip(frame, self.camera_app.minI, self.camera_app.maxI)
-			frame = ((clipped - self.camera_app.minI) / (self.camera_app.maxI - self.camera_app.minI)) * 255
+		limit_min = float(getattr(self.camera_app, 'minI', 0.0))
+		limit_max = float(getattr(self.camera_app, 'maxI', 255.0))
+		if limit_max <= limit_min:
+			limit_max = limit_min + 1.0
+		clipped = np.clip(frame, limit_min, limit_max)
+		frame = ((clipped - limit_min) / (limit_max - limit_min)) * 255
 
 		if self.camera_app.dFoF_open and self.camera_app.F0 is not None:
 			f0_ref = self._align_reference_to_frame(self.camera_app.F0, frame.shape, avoid_zero=True)
 			dfof = (frame.astype(np.float32) - f0_ref) / f0_ref
 			dfof = np.nan_to_num(dfof, nan=0.0)
 
-			if self.camera_app.normalizeImage:
-				clipped = np.clip(dfof, self.camera_app.minI, self.camera_app.maxI)
-				frame = ((clipped - self.camera_app.minI) / (self.camera_app.maxI - self.camera_app.minI)) * 255
-			else:
-				fmin, fmax = dfof.min(), dfof.max()
-				if fmax > fmin:
-					frame = ((dfof - fmin) / (fmax - fmin)) * 255
-				else:
-					frame = np.zeros_like(dfof)
+			limit_min = float(getattr(self.camera_app, 'minI', 0.0))
+			limit_max = float(getattr(self.camera_app, 'maxI', 255.0))
+			if limit_max <= limit_min:
+				limit_max = limit_min + 1.0
+			clipped = np.clip(dfof, limit_min, limit_max)
+			frame = ((clipped - limit_min) / (limit_max - limit_min)) * 255
 
 		if hasattr(self.camera_app, 'height') and hasattr(self.camera_app, 'width'):
 			frame = cv2.resize(frame, (self.camera_app.width//2, self.camera_app.height//2), interpolation=cv2.INTER_NEAREST)
@@ -2025,16 +2158,28 @@ class CameraGUI(QMainWindow):
 			except Exception as e:
 				self.update_status(f'Error setting gain: {e}.')
 
-	def toggle_normalize(self, state):
+	def apply_auto_norm(self):
 		if self.camera_app:
-			if state == Qt.CheckState.Checked.value:
-				self.camera_app.adjust_dynamic_range()
-				self.update_status(f"Normalization enabled [{self.camera_app.minI:.3f}, {self.camera_app.maxI:.3f}].")
+			self.camera_app.enable_normalize()
+			self._update_autonorm_button_text()
+			self.update_status(f"Auto norm applied [{self.camera_app.minI:.3f}, {self.camera_app.maxI:.3f}].")
 
-			else:
-				if self.camera_app.normalizeImage:
-					self.camera_app.adjust_dynamic_range()
-				self.update_status('Normalization disabled.')
+	def disable_norm(self):
+		if self.camera_app:
+			self.camera_app.normalizeImage = False
+			self.camera_app.minI = 0.0
+			self.camera_app.maxI = 255.0
+			if self.histogram_label is not None:
+				self.histogram_label.set_histogram_limits(0.0, 255.0, 0.0, 255.0)
+				self.histogram_label.update()
+			self._update_autonorm_button_text()
+			self.update_status('Normalization disabled.')
+
+	def _update_autonorm_button_text(self):
+		if self.camera_app:
+			self.autonorm_btn.setText(f"Auto Norm ({self.camera_app.autoI:.2f})")
+		else:
+			self.autonorm_btn.setText("Auto Norm")
 
 	def toggle_background(self, state):
 		if self.camera_app:
@@ -2079,23 +2224,132 @@ class CameraGUI(QMainWindow):
 				self.camera_app.dFoF_open = False
 				self.update_status('dFoF disabled.')
 
-	def toggle_histogram(self, state):
+	def toggle_histogram(self):
 		if not self.camera_app:
 			return
 
-		if state == Qt.CheckState.Checked.value:
-			if self.histogram_open:
-				return
+		if self.histogram_open:
+			self._stop_histogram()
+		else:
 			self.histogram_open = True
 			self.histogram_thread_running = True
+			self.histogram_btn.setText("Hide Histogram")
 			self.histogram_thread = threading.Thread(target=self.update_histogram, daemon=True)
 			self.histogram_thread.start()
-			self.update_status('Histogram enabled.')
-		else:
-			self.histogram_open = False
-			self.histogram_thread_running = False
-			self._close_histogram_window()
-			self.update_status('Histogram disabled.')
+
+	def _stop_histogram(self):
+		self.histogram_open = False
+		self.histogram_thread_running = False
+		self.histogram_btn.setText("Show Histogram")
+		self._close_histogram_window()
+
+	def _on_histogram_window_closed(self):
+		"""Called from the histogram window's closeEvent — does NOT call .close() again."""
+		self.histogram_open = False
+		self.histogram_thread_running = False
+		self.histogram_btn.setText("Show Histogram")
+		self.histogram_window = None
+		self.histogram_label = None
+		self.histogram_info_label = None
+
+	def _capture_two_consecutive_display_frames(self, timeout_s=5.0):
+		if self.camera_app is None:
+			return None
+
+		frames = []
+		last_frame_data = None
+		deadline = time.time() + float(max(0.5, timeout_s))
+
+		while len(frames) < 2 and time.time() < deadline:
+			frame_data = self.camera_app.get_frame_for_display()
+			if frame_data is None:
+				QApplication.processEvents()
+				time.sleep(0.005)
+				continue
+
+			# Skip duplicates so we collect consecutive displayed frames after the button press.
+			if last_frame_data is not None and frame_data == last_frame_data:
+				QApplication.processEvents()
+				time.sleep(0.005)
+				continue
+
+			display_frame = self._frame_data_to_display_frame(frame_data)
+			if display_frame is None:
+				QApplication.processEvents()
+				time.sleep(0.005)
+				continue
+
+			frames.append(display_frame.astype(np.float32, copy=True))
+			last_frame_data = frame_data
+			QApplication.processEvents()
+			time.sleep(0.005)
+
+		return frames if len(frames) == 2 else None
+
+	def show_fourier_ring_correlation(self):
+		if self.camera_app is None:
+			self.update_status("Error: Camera must be running for Fourier Ring Correlation.")
+			return
+		self.update_status("Starting Fourier Ring Correlation: capturing two consecutive frames...")
+
+		frames = self._capture_two_consecutive_display_frames(timeout_s=5.0)
+		if not frames:
+			self.update_status("Error: Could not capture two consecutive frames for FRC.")
+			return
+
+		img1, img2 = frames
+
+		try:
+			with tempfile.NamedTemporaryFile(suffix="_frc_img1.npy", delete=False) as f1:
+				img1_path = f1.name
+			with tempfile.NamedTemporaryFile(suffix="_frc_img2.npy", delete=False) as f2:
+				img2_path = f2.name
+
+			np.save(img1_path, np.asarray(img1, dtype=np.float32))
+			np.save(img2_path, np.asarray(img2, dtype=np.float32))
+
+			# Use the same interpreter that launched camstim.
+			python_exec = sys.executable
+
+			env = os.environ.copy()
+			env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+			log_path = str(Path(tempfile.gettempdir()) / f"camstim_frc_worker_{int(time.time() * 1000)}.log")
+			log_file = open(log_path, 'w', encoding='utf-8')
+			worker_script = str((REPO_ROOT / 'utils' / 'frc_worker.py').resolve())
+			if not Path(worker_script).exists():
+				raise RuntimeError(f"FRC worker script not found: {worker_script}")
+
+			proc = subprocess.Popen(
+				[python_exec, worker_script, img1_path, img2_path],
+				env=env,
+				cwd=str(REPO_ROOT),
+				stdout=log_file,
+				stderr=subprocess.STDOUT,
+			)
+			log_file.close()
+
+			# Detect immediate startup failures.
+			time.sleep(0.05)
+			exit_code = proc.poll()
+			if exit_code is not None and exit_code != 0:
+				raise RuntimeError(f"FRC worker exited immediately with code {exit_code}. See log: {log_path}")
+
+			self.update_status(
+				f"Launched Fourier Ring Correlation worker (PID {proc.pid}) using {python_exec}."
+			)
+		except Exception as e:
+			try:
+				if 'log_file' in locals() and not log_file.closed:
+					log_file.close()
+			except Exception:
+				pass
+			for p in (locals().get('img1_path'), locals().get('img2_path')):
+				if p:
+					try:
+						os.remove(p)
+					except OSError:
+						pass
+			self.update_status(f"Error computing Fourier Ring Correlation: {e}.")
 
 	def toggle_special_pixel_highlight(self, state):
 		self.highlight_special_pixels = (state == Qt.CheckState.Checked.value)
@@ -2137,31 +2391,24 @@ class CameraGUI(QMainWindow):
 					if hasattr(self.camera_app, 'height') and hasattr(self.camera_app, 'width') and self.camera_app.height and self.camera_app.width:
 						frame = frame.reshape((self.camera_app.height, self.camera_app.width))
 
-					if self.camera_app.dFoF_open and self.camera_app.F0 is not None:
-						dfof = (frame.astype(np.float32) - self.camera_app.F0) / self.camera_app.F0
-						dfof = np.nan_to_num(dfof, nan=0.0)
+					if getattr(self.camera_app, 'software_mirror_horizontal', False):
+						frame = cv2.flip(frame, 1)
 
-						if self.camera_app.normalizeImage:
-							clipped = np.clip(dfof, self.camera_app.minI, self.camera_app.maxI)
-							display_frame = ((clipped - self.camera_app.minI) / (self.camera_app.maxI - self.camera_app.minI)) * 255
+					if self.camera_app.bin_exp:
+						bs = self.camera_app.bin_size
+						frame = frame.astype(np.float32)
+						if bs in (2, 4, 8, 16):
+							for _ in range(bs.bit_length() - 1):
+								frame = (frame[0::2, 0::2] + frame[1::2, 0::2] + frame[0::2, 1::2] + frame[1::2, 1::2])
 						else:
-							fmin, fmax = dfof.min(), dfof.max()
-							if fmax > fmin:
-								display_frame = ((dfof - fmin) / (fmax - fmin)) * 255
-							else:
-								display_frame = np.zeros_like(dfof)
+							h, w = frame.shape
+							frame = frame.reshape(h // bs, bs, w // bs, bs).sum(axis=(1, 3))
+						frame /= (bs * bs)
 
-						display_frame = display_frame.astype(np.uint8)
-					else:
-						if self.camera_app.normalizeImage:
-							clipped = np.clip(frame, self.camera_app.minI, self.camera_app.maxI)
-							display_frame = ((clipped - self.camera_app.minI) / (self.camera_app.maxI - self.camera_app.minI)) * 255
-							display_frame = display_frame.astype(np.uint8)
-						else:
-							display_frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+					history_frame = np.ascontiguousarray(frame.copy())
 
-					# Use all displayed pixels so saturation statistics are exact.
-					history_arr = display_frame.ravel()
+					# Use the pre-display frame so histogram values are independent of the color scale.
+					history_arr = history_frame.ravel()
 
 					# Keep full 8-bit domain on x-axis; adapt bin count to observed data spread.
 					if history_arr.size > 1:
@@ -2192,16 +2439,21 @@ class CameraGUI(QMainWindow):
 							x2 = x1
 						cv2.rectangle(hist_image, (x1, hist_height - intensity), (x2, hist_height), (255, 255, 255), -1)
 
-					if self.camera_app.normalizeImage:
-						x_scale = (hist_width - 1) / 255.0
-						min_x = int(np.clip(self.camera_app.minI, 0, 255) * x_scale)
-						max_x = int(np.clip(self.camera_app.maxI, 0, 255) * x_scale)
-						cv2.line(hist_image, (min_x, 0), (min_x, hist_height), (0, 0, 255), 2)
-						cv2.line(hist_image, (max_x, 0), (max_x, hist_height), (255, 0, 0), 2)
+					line_min = float(getattr(self.camera_app, 'minI', 0.0))
+					line_max = float(getattr(self.camera_app, 'maxI', 255.0))
+					if line_max <= line_min:
+						line_max = line_min + 1.0
+					x_scale = (hist_width - 1) / 255.0
+					min_x = int(np.clip(line_min, 0, 255) * x_scale)
+					max_x = int(np.clip(line_max, 0, 255) * x_scale)
+					cv2.line(hist_image, (min_x, 0), (min_x, hist_height), (0, 0, 255), 2)
+					cv2.line(hist_image, (max_x, 0), (max_x, hist_height), (255, 0, 0), 2)
 
-					cv2.putText(hist_image, f'Frame {self.camera_app.frame_count}', (hist_width // 2 - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-					cv2.putText(hist_image, f'Bins {bin_count} | Range 0-255', (10, hist_height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-					self.histogram_frame_ready.emit(hist_image.copy())
+					hist_info = (
+						f"Frame {self.camera_app.frame_count} | Bins {bin_count} | Range 0-255 | "
+						f"Limits min={line_min:.2f}, max={line_max:.2f}"
+					)
+					self.histogram_frame_ready.emit({'image': hist_image.copy(), 'info': hist_info})
 					last_draw_time = now
 					last_frame_count = self.camera_app.frame_count
 				except Exception as e:
@@ -2211,16 +2463,26 @@ class CameraGUI(QMainWindow):
 
 		self.histogram_close_requested.emit()
 
-	def _on_histogram_frame_ready(self, hist_image):
+	def _on_histogram_frame_ready(self, payload):
+		if payload is None:
+			return
+		hist_image = payload.get('image') if isinstance(payload, dict) else payload
+		hist_info = payload.get('info', '') if isinstance(payload, dict) else ''
 		if hist_image is None:
 			return
 		if self.histogram_window is None:
-			self.histogram_window = QWidget(self)
-			self.histogram_window.setWindowTitle('Live Histogram')
+			self.histogram_window = HistogramWindow()
+			self.histogram_window.closed.connect(self._on_histogram_window_closed)
 			layout = QVBoxLayout()
-			self.histogram_label = QLabel()
+			self.histogram_label = HistogramLabel()
+			self.histogram_label.limitsChanged.connect(self._update_histogram_limits)
 			self.histogram_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-			layout.addWidget(self.histogram_label)
+			self.histogram_label.setScaledContents(True)
+			self.histogram_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+			layout.addWidget(self.histogram_label, 1)
+			self.histogram_info_label = QLabel()
+			self.histogram_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+			layout.addWidget(self.histogram_info_label)
 			self.histogram_window.setLayout(layout)
 			self.histogram_window.resize(560, 460)
 
@@ -2231,13 +2493,28 @@ class CameraGUI(QMainWindow):
 		h, w, ch = rgb.shape
 		q_img = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
 		pixmap = QPixmap.fromImage(q_img.copy())
+		line_min = float(getattr(self.camera_app, 'minI', 0.0))
+		line_max = float(getattr(self.camera_app, 'maxI', 255.0))
+		if line_max <= line_min:
+			line_max = line_min + 1.0
+		if self.histogram_label is not None:
+			self.histogram_label.set_histogram_limits(line_min, line_max, 0.0, 255.0)
 		self.histogram_label.setPixmap(pixmap)
+		if self.histogram_info_label is not None:
+			self.histogram_info_label.setText(hist_info)
+
+	def _update_histogram_limits(self, min_value, max_value):
+		if not self.camera_app:
+			return
+		self.camera_app.minI = float(min_value)
+		self.camera_app.maxI = float(max_value)
 
 	def _close_histogram_window(self):
 		if self.histogram_window is not None:
 			self.histogram_window.close()
 		self.histogram_window = None
 		self.histogram_label = None
+		self.histogram_info_label = None
 
 	def update_trigger_mode(self, index):
 		if self.camera_app:
@@ -2261,6 +2538,8 @@ class CameraGUI(QMainWindow):
 		super().closeEvent(event)
 
 def main():
+	if _setproctitle is not None:
+		_setproctitle('camstim')
 	app = QApplication(sys.argv)
 	window = CameraGUI()
 	window.show()

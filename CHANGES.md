@@ -1,3 +1,32 @@
+
+# Version [0.2.3]
+
+# 2026-05-29
+
+- Reworked Fourier Ring Correlation execution to use a standalone worker script:
+	- GUI FRC button now launches `utils/frc_worker.py` in a separate process instead of running FRC inside `camstim.py`.
+	- This isolates matplotlib/FRC runtime from the Qt GUI path and preserves reliable interactive plotting behavior.
+
+- Simplified GUI FRC subprocess launch logic in `camstim.py`:
+	- Uses `sys.executable` directly for worker launch.
+	- Removed the extra dependency preflight probe to reduce launch complexity.
+
+- Expanded worker analysis in `utils/frc_worker.py`:
+	- Computes and plots both `frc.two_frc(img1, img2)` and `frc.one_frc(img1)`.
+	- Both plots include threshold and resolution marker when an intersection is found.
+
+- Updated setup documentation in `README.md`:
+	- Added explicit install step for `setproctitle` and `frc` in the Python dependency list.
+
+- Added utility logger script `utils/mpulogger.py`:
+	- CLI tool for serial MPU logging to CSV, with optional live matplotlib plotting mode.
+
+- Polished GUI image-processing controls and histogram UX in `camstim.py`:
+	- Reworked normalization controls to Auto/Disable buttons and moved histogram/FRC to explicit action buttons.
+	- Updated histogram display behavior and interaction flow for the current standalone-window implementation.
+
+# Version [0.2.2]
+
 # 2026-05-29
 
 - Fixed camera data not being saved during real experiments (`utils/simple_cam_mx.py`):
