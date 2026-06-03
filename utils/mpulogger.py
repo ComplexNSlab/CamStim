@@ -84,13 +84,48 @@ def _start_stdin_listener(stop_event: threading.Event) -> threading.Thread:
 def _parse_sensor_line(line: str):
     # Accept whitespace/comma/mixed formatting by extracting signed integers.
     nums = re.findall(r'-?\d+', line.replace('\x00', ''))
+    if len(nums) >= 13:
+        try:
+            ax1, ay1, az1, gx1, gy1, gz1, ax2, ay2, az2, gx2, gy2, gz2, t_sensor = map(int, nums[:13])
+        except ValueError:
+            return None
+        return {
+            'ax1': ax1,
+            'ay1': ay1,
+            'az1': az1,
+            'gx1': gx1,
+            'gy1': gy1,
+            'gz1': gz1,
+            'ax2': ax2,
+            'ay2': ay2,
+            'az2': az2,
+            'gx2': gx2,
+            'gy2': gy2,
+            'gz2': gz2,
+            't_sensor': t_sensor,
+        }
+
     if len(nums) < 7:
         return None
     try:
-        x, y, z, gx, gy, gz, t_sensor = map(int, nums[:7])
+        ax1, ay1, az1, gx1, gy1, gz1, t_sensor = map(int, nums[:7])
     except ValueError:
         return None
-    return x, y, z, gx, gy, gz, t_sensor
+    return {
+        'ax1': ax1,
+        'ay1': ay1,
+        'az1': az1,
+        'gx1': gx1,
+        'gy1': gy1,
+        'gz1': gz1,
+        'ax2': None,
+        'ay2': None,
+        'az2': None,
+        'gx2': None,
+        'gy2': None,
+        'gz2': None,
+        't_sensor': t_sensor,
+    }
 
 
 def _logger_loop(
@@ -111,12 +146,25 @@ def _logger_loop(
         if parsed is None:
             continue
 
-        x, y, z, gx, gy, gz, t_sensor = parsed
+        ax1 = parsed['ax1']
+        ay1 = parsed['ay1']
+        az1 = parsed['az1']
+        gx1 = parsed['gx1']
+        gy1 = parsed['gy1']
+        gz1 = parsed['gz1']
+        ax2 = parsed['ax2']
+        ay2 = parsed['ay2']
+        az2 = parsed['az2']
+        gx2 = parsed['gx2']
+        gy2 = parsed['gy2']
+        gz2 = parsed['gz2']
+        t_sensor = parsed['t_sensor']
         t = datetime.now().timestamp()
-        writer.writerow([t, x, y, z, gx, gy, gz, t_sensor])
+        writer.writerow([t, ax1, ay1, az1, gx1, gy1, gz1, ax2, ay2, az2, gx2, gy2, gz2, t_sensor])
         csv_file.flush()
         with buffer_lock:
-            sample_buffer.append((t, x, y, z, t_sensor))
+            # Keep live plot behavior on MPU1 for continuity with previous UI.
+            sample_buffer.append((t, ax1, ay1, az1, t_sensor))
 
 def run_plot(stop_event: threading.Event, sample_buffer: deque, buffer_lock: threading.Lock, window_seconds: float) -> None:
     import matplotlib
@@ -216,7 +264,12 @@ def main() -> int:
 
     csv_file = output_file.open('w', newline='')
     writer = csv.writer(csv_file)
-    writer.writerow(['time', 'ax', 'ay', 'az', 'gx', 'gy', 'gz', 't'])
+    writer.writerow([
+        'time',
+        'ax1', 'ay1', 'az1', 'gx1', 'gy1', 'gz1',
+        'ax2', 'ay2', 'az2', 'gx2', 'gy2', 'gz2',
+        't',
+    ])
     csv_file.flush()
 
     sample_buffer = deque(maxlen=4096)

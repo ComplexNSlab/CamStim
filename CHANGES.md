@@ -32,6 +32,11 @@
 	- Removed live speckle worker setup/state from `utils/simple_cam_mx.py`.
 	- Removed `USE_LIVE_SPECKLE` and `BUFFER_SIZE` from `config_files/cam_config.yaml`.
 
+- Added dual-MPU movement sensor logging support (`utils/mpu6050plot/mpu6050plot.ino`, `utils/mpulogger.py`):
+	- Arduino sketch now reads both MPU6050 addresses (`0x68` and `0x69`) each cycle and emits a combined serial record.
+	- `mpulogger.py` now parses/writes both sensor streams (`ax1..gz1`, `ax2..gz2`) into CSV with shared tick time.
+	- Logger remains backward compatible with legacy single-MPU serial lines by leaving MPU2 fields empty.
+
 # Version [0.2.4]
 
 # 2026-05-29
