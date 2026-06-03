@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
 							QWidget, QPushButton, QLabel, QDoubleSpinBox,
 							QGridLayout,
 							QGroupBox, QTextEdit, QCheckBox, QComboBox, QLineEdit, QSizePolicy,
-							QFileDialog, QInputDialog, QMessageBox)
+							QFileDialog, QInputDialog, QMessageBox, QSplitter)
 from PyQt6.QtCore import QTimer, Qt, QRect, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QAction, QPainter, QPen, QColor
 import time
@@ -24,6 +24,10 @@ from core.TeensyController import TeensyController
 import cv2
 import yaml
 from pathlib import Path
+try:
+	import matplotlib.pyplot as plt
+except Exception:
+	plt = None
 
 from utils.simple_cam_mx import load_camera_config, load_save_root, run_camera_worker
 from core.experiment_discovery import get_experiment_list, resolve_experiment_config_file, discover_experiment_types
@@ -241,8 +245,6 @@ class CameraProcessClient:
 		self.bin_size = int(config.get('BIN_SIZE', 1))
 		self.vmin = 0
 		self.vmax = 30
-		self.live_speck = bool(config.get('USE_LIVE_SPECKLE', False))
-		self.enable_live_speckle = False
 		self.removeBackground = False
 		self.saving = False
 		self.hardware_trigger_enabled = False
@@ -253,10 +255,6 @@ class CameraProcessClient:
 		self.maxI = 255
 		self.autoI = 0.05
 		self.backgroundImg = None
-		self.buffer_size = int(config.get('BUFFER_SIZE', 50))
-		self.circular_buffer = None
-		self.current_buffer_item = 0
-		self.buffer_loop_reached = False
 		self.histogram_open = False
 		self.frame_count = 0
 		self.frames_written = 0
@@ -274,6 +272,7 @@ class CameraProcessClient:
 		self.mouse_id = None
 		self.on_logic_analyzer_terminated = None
 		self.on_experiment_finished = None
+		self.active_save_filename = None
 		use_cgrab_cfg = config.get('USE_CGRABCALLBACK', True)
 		if isinstance(use_cgrab_cfg, str):
 			self.use_c_framegrab = use_cgrab_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
@@ -289,7 +288,7 @@ class CameraProcessClient:
 		self.process = ctx.Process(
 			target=run_camera_worker,
 			args=(self.config, self.frame_queue, self.command_queue, self.status_queue),
-			daemon=True,
+			daemon=False,
 		)
 		self.process.start()
 		self._wait_for_ready()
@@ -306,17 +305,15 @@ class CameraProcessClient:
 	def _send_command(self, name, payload=None):
 		if self.command_queue is None:
 			return False
-		self.command_queue.put({'name': name, 'payload': payload})
-		return True
-
-	def _ensure_display_buffers(self):
-		if not self.width or not self.height:
-			return
-		target_shape = (self.buffer_size, self.height // self.bin_size, self.width // self.bin_size)
-		if self.circular_buffer is None or tuple(self.circular_buffer.shape) != target_shape:
-			self.circular_buffer = np.zeros(target_shape, dtype=np.float32)
-			self.current_buffer_item = 0
-			self.buffer_loop_reached = False
+		if self.process is None or not self.process.is_alive():
+			self.exp_status_queue.put(("status", "Error: camera worker process is not running."))
+			return False
+		try:
+			self.command_queue.put_nowait({'name': name, 'payload': payload})
+			return True
+		except Exception as e:
+			self.exp_status_queue.put(("status", f"Error sending command '{name}': {e}"))
+			return False
 
 	def poll_messages(self):
 		if self.status_queue is None:
@@ -340,7 +337,6 @@ class CameraProcessClient:
 				self.analog_gain_min = float(msg.get('analog_gain_min', self.analog_gain_min))
 				self.analog_gain_max = float(msg.get('analog_gain_max', self.analog_gain_max))
 				self.analog_gain = float(msg.get('analog_gain', self.analog_gain))
-				self._ensure_display_buffers()
 			elif msg_type == 'stats':
 				self.frame_count = int(msg.get('frame_count', self.frame_count))
 				self.frames_written = int(msg.get('frames_written', self.frames_written))
@@ -361,7 +357,6 @@ class CameraProcessClient:
 				self.height = int(msg.get('height', self.height or 0)) or self.height
 				with self.latest_frame_lock:
 					self.latest_frame_data = None
-				self._ensure_display_buffers()
 				self.exp_status_queue.put(("status", f"ROI applied: {msg.get('width')}x{msg.get('height')} at ({msg.get('x')}, {msg.get('y')})."))
 			elif msg_type == 'framegrab_backend':
 				self.use_c_framegrab = bool(msg.get('using_c', self.use_c_framegrab))
@@ -370,6 +365,10 @@ class CameraProcessClient:
 				self.display_output_enabled = bool(msg.get('value', self.display_output_enabled))
 			elif msg_type == 'status':
 				self.exp_status_queue.put(("status", msg.get('message', '')))
+			elif msg_type == 'saving_file':
+				filename = msg.get('filename')
+				if filename:
+					self.active_save_filename = str(filename)
 			elif msg_type == 'trial':
 				self.exp_status_queue.put(("trial", msg.get('current', 0), msg.get('total', 0), msg.get('message', '')))
 			elif msg_type == 'logic_analyzer_terminated':
@@ -462,17 +461,6 @@ class CameraProcessClient:
 		self.backgroundImg = cv2.filter2D(frame, -1, kernel)
 		self.removeBackground = True
 		return self.removeBackground
-
-	def toggle_speckle(self):
-		self.enable_live_speckle = not self.enable_live_speckle
-		return self.enable_live_speckle
-
-	def std_filter_frame(self, frame):
-		bs = int(self.bin_size)
-		if bs <= 1:
-			return frame.astype(np.float32)
-		h, w = frame.shape
-		return frame.reshape((h // bs, bs, w // bs, bs)).std(axis=(1, 3), dtype=np.float32)
 
 	def toggle_dFoF(self):
 		if self.dFoF_open:
@@ -596,6 +584,7 @@ class CameraGUI(QMainWindow):
 		super().__init__()
 		self.app_version = load_app_version()
 		self.config = load_camera_config(str(CONFIG_DIR / 'cam_config.yaml'))
+		self.plot_experiment_qc = self._load_plot_experiment_qc_flag()
 		self.display_target_size = None
 		self.camera_app = None
 		self.teensy_controller = None
@@ -623,6 +612,7 @@ class CameraGUI(QMainWindow):
 		self.fps_samples = deque(maxlen=100)
 		self.experiment_list_cache = None
 		self.last_display_frame = None
+		self.frc_result_windows = []
 		self.select_roi_action = None
 		self.reset_roi_action = None
 		self.framegrab_backend_cb = None
@@ -632,6 +622,7 @@ class CameraGUI(QMainWindow):
 		self.histogram_frame_ready.connect(self._on_histogram_frame_ready)
 		self.histogram_close_requested.connect(self._close_histogram_window)
 		self._last_experiment_display_time = 0.0
+		self._last_plotted_metadata_key = None
 		refresh_rate_cfg = self.config.get('DISPLAY_REFRESH_RATE', 10)
 		try:
 			self.display_refresh_rate = float(refresh_rate_cfg)
@@ -647,6 +638,19 @@ class CameraGUI(QMainWindow):
 		self.load_and_display_exp_config()
 		self.setup_timer()
 
+	def _load_plot_experiment_qc_flag(self):
+		cfg_path = CONFIG_DIR / 'config.yaml'
+		try:
+			with open(cfg_path, 'r', encoding='utf-8') as file:
+				cfg = yaml.safe_load(file) or {}
+		except Exception:
+			return False
+
+		value = cfg.get('PLOT_EXPERIMENT_QC', False)
+		if isinstance(value, str):
+			return value.strip().lower() in ('1', 'true', 'yes', 'on')
+		return bool(value)
+
 	def _schedule_auto_stop(self):
 		if self._auto_stop_pending:
 			return
@@ -660,16 +664,21 @@ class CameraGUI(QMainWindow):
 			self.display_target_size = self.video_label.size()
 
 	def check_experiment_status(self):
+		self._drain_preview_status_queue()
 		if self.camera_app and hasattr(self.camera_app, 'get_exp_status'):
 			messages = self.camera_app.get_exp_status()
 			for msg in messages:
 				if msg[0] == "status":
+					status_text = str(msg[1])
+					if self.plot_experiment_qc and status_text.startswith("Timestamp gap summary:"):
+						self._plot_latest_experiment_metadata()
 					self.update_status(msg[1])
 				elif msg[0] == "trial":
 					self.update_status(msg[3])
 				elif msg[0] in ("logic_analyzer_terminated", "experiment_finished"):
 					self._schedule_auto_stop()
 
+	def _drain_preview_status_queue(self):
 		while True:
 			try:
 				msg = self.preview_status_queue.get_nowait()
@@ -681,8 +690,119 @@ class CameraGUI(QMainWindow):
 
 			if msg[0] == 'status':
 				self.update_status(msg[1])
+			elif msg[0] == 'frc_saved_figures':
+				self._show_frc_saved_figures(msg[1])
 			elif msg[0] == 'finished':
 				self._finish_preview_without_camera()
+
+	def _show_frc_saved_figures(self, image_paths):
+		valid_paths = [Path(p) for p in (image_paths or []) if Path(p).is_file()]
+		if not valid_paths:
+			self.update_status('FRC completed, but no saved figure files were found.')
+			return
+
+		viewer = QWidget(self, Qt.WindowType.Window)
+		viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+		viewer.setWindowTitle('FRC Results')
+
+		layout = QVBoxLayout()
+		viewer.setLayout(layout)
+
+		for image_path in valid_paths:
+			label_title = QLabel(image_path.name)
+			layout.addWidget(label_title)
+
+			image_label = QLabel()
+			image_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+			pixmap = QPixmap(str(image_path))
+			if pixmap.isNull():
+				image_label.setText(f'Could not load image: {image_path}')
+			else:
+				if pixmap.width() > 900:
+					pixmap = pixmap.scaledToWidth(900, Qt.TransformationMode.SmoothTransformation)
+				image_label.setPixmap(pixmap)
+			layout.addWidget(image_label)
+
+		viewer.resize(980, 780)
+		viewer.show()
+		self.frc_result_windows.append(viewer)
+
+	def _plot_latest_experiment_metadata(self):
+		if self.camera_app is None:
+			return
+		if plt is None:
+			self.update_status('Metadata plot skipped: matplotlib is not available in this environment.')
+			return
+
+		mouse_id = (getattr(self.camera_app, 'mouse_id', None) or '').strip()
+		experiment_id = (getattr(self.camera_app, 'experiment_id', None) or '').strip()
+		exp_name = (getattr(self.camera_app, 'exp_name', None) or '').strip()
+		filename = (getattr(self.camera_app, 'active_save_filename', None) or '').strip()
+
+		if not mouse_id or not experiment_id:
+			return
+		if not filename:
+			filename = f"{mouse_id}_{experiment_id}"
+
+		plot_key = (mouse_id, experiment_id, filename)
+		if self._last_plotted_metadata_key == plot_key:
+			return
+
+		try:
+			save_root = load_save_root()
+		except Exception as exc:
+			self.update_status(f'Could not resolve save directory for metadata plot: {exc}.')
+			return
+
+		meta_path = Path(save_root) / mouse_id / experiment_id / f"{filename}.npy"
+		if not meta_path.is_file():
+			self.update_status(f'Metadata plot skipped: metadata file not found ({meta_path}).')
+			return
+
+		try:
+			metadata = np.load(str(meta_path), allow_pickle=True).item()
+			if not isinstance(metadata, dict):
+				raise ValueError('metadata payload is not a dict')
+		except Exception as exc:
+			self.update_status(f'Failed to load metadata for plotting ({meta_path}): {exc}.')
+			return
+
+		sys_clock_timestamps = np.asarray(metadata.get('sys_clock_timestamps', []), dtype=np.float64)
+		frame_timestamps = np.asarray(metadata.get('frame_timestamps', []), dtype=np.float64)
+		temp = np.asarray(metadata.get('sensor_temperatures_c', []), dtype=np.float64)
+		callback_timing = metadata.get('callback_timing', {}) if isinstance(metadata.get('callback_timing', {}), dict) else {}
+		tsamps = np.asarray(callback_timing.get('samples_ms', []), dtype=np.float64)
+
+		title_text = f"{mouse_id}_{exp_name or experiment_id}"
+		fig, axes = plt.subplots(2, 2, num=f"Experiment Summary - {title_text}")
+
+		axes[0, 0].plot(np.diff(sys_clock_timestamps), '.-')
+		axes[0, 0].set_xlabel('frame')
+		axes[0, 0].set_ylabel('sys clock timestamp diff')
+
+		axes[0, 1].plot(np.diff(frame_timestamps), '.-')
+		axes[0, 1].set_xlabel('frame')
+		axes[0, 1].set_ylabel('frame timestamps diff')
+
+		axes[1, 0].plot(temp, '.-')
+		axes[1, 0].set_xlabel('frame')
+		axes[1, 0].set_ylabel('Temperature (c)')
+
+		axes[1, 1].plot(tsamps, '.-')
+		axes[1, 1].set_xlabel('frame')
+		axes[1, 1].set_ylabel('framegrabber time (ms)')
+
+		fig.suptitle(title_text)
+		fig.tight_layout()
+		plt.show(block=False)
+		try:
+			fig.canvas.draw_idle()
+			plt.pause(0.001)
+		except Exception:
+			pass
+
+		self._last_plotted_metadata_key = plot_key
+		self.update_status(f'Opened metadata summary plot from {meta_path}.')
 
 	def init_ui(self):
 		self.setWindowTitle(f'camstim {self.app_version}')
@@ -695,12 +815,58 @@ class CameraGUI(QMainWindow):
 		main_layout = QHBoxLayout()
 		central_widget.setLayout(main_layout)
 
-		left_panel = self.create_display_panel()
-		main_layout.addWidget(left_panel, 2)
+		self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+		self.main_splitter.setChildrenCollapsible(False)
+		self._splitter_adjust_guard = False
+		self._main_splitter_last_sizes = []
 
-		right_panel = self.create_control_panel()
-		right_panel.setFixedWidth(420)
-		main_layout.addWidget(right_panel, 1)
+		left_panel = self.create_display_panel()
+		self.main_splitter.addWidget(left_panel)
+
+		controls_panel = self.create_control_panel()
+		controls_panel.setMinimumWidth(420)
+		self.main_splitter.addWidget(controls_panel)
+
+		status_panel = self.create_status_panel()
+		status_panel.setMinimumWidth(320)
+		self.main_splitter.addWidget(status_panel)
+
+		# Column 1 and 3 are flexible; column 2 keeps at least its current width.
+		self.main_splitter.setStretchFactor(0, 2)
+		self.main_splitter.setStretchFactor(1, 0)
+		self.main_splitter.setStretchFactor(2, 1)
+		self.main_splitter.setSizes([900, 420, 540])
+		self._main_splitter_last_sizes = self.main_splitter.sizes()
+		self.main_splitter.splitterMoved.connect(self._on_main_splitter_moved)
+
+		main_layout.addWidget(self.main_splitter)
+
+	def _on_main_splitter_moved(self, pos, index):
+		if self._splitter_adjust_guard or not hasattr(self, 'main_splitter'):
+			return
+
+		sizes = self.main_splitter.sizes()
+		if len(sizes) != 3:
+			self._main_splitter_last_sizes = sizes
+			return
+
+		# When dragging handle between column 2 and 3, keep column 2 width stable
+		# and let column 1 absorb the delta so column 3 resize affects column 1.
+		if index == 2 and len(self._main_splitter_last_sizes) == 3:
+			prev_col2 = self._main_splitter_last_sizes[1]
+			delta_col2 = sizes[1] - prev_col2
+			if delta_col2 != 0:
+				new_col1 = max(200, sizes[0] + delta_col2)
+				new_col2 = max(420, prev_col2)
+				new_col3 = max(220, sizes[2])
+				self._splitter_adjust_guard = True
+				try:
+					self.main_splitter.setSizes([new_col1, new_col2, new_col3])
+				finally:
+					self._splitter_adjust_guard = False
+				sizes = self.main_splitter.sizes()
+
+		self._main_splitter_last_sizes = sizes
 
 	def _create_menu_bar(self):
 		menu_bar = self.menuBar()
@@ -1178,10 +1344,6 @@ class CameraGUI(QMainWindow):
 		self.background_cb.stateChanged.connect(self.toggle_background)
 		proc_layout.addWidget(self.background_cb, 2, 0)
 
-		self.speckle_cb = QCheckBox("Live Speckle")
-		self.speckle_cb.stateChanged.connect(self.toggle_speckle)
-		proc_layout.addWidget(self.speckle_cb, 3, 0)
-
 		self.dfof_cb = QCheckBox("Enable dFoF")
 		self.dfof_cb.stateChanged.connect(self.toggle_dfof)
 		proc_layout.addWidget(self.dfof_cb, 2, 1)
@@ -1189,23 +1351,33 @@ class CameraGUI(QMainWindow):
 		self.highlight_pixels_cb = QCheckBox("Highlight 0/255 Pixels")
 		self.highlight_pixels_cb.setChecked(True)
 		self.highlight_pixels_cb.stateChanged.connect(self.toggle_special_pixel_highlight)
-		proc_layout.addWidget(self.highlight_pixels_cb, 3, 1)
+		proc_layout.addWidget(self.highlight_pixels_cb, 3, 0)
 
 		self.display_output_cb = QCheckBox("Live Display Updates")
 		self.display_output_cb.setChecked(True)
 		self.display_output_cb.stateChanged.connect(self.toggle_display_output)
-		proc_layout.addWidget(self.display_output_cb, 4, 0)
+		proc_layout.addWidget(self.display_output_cb, 3, 1)
 
 		proc_group.setLayout(proc_layout)
 		layout.addWidget(proc_group)
 
-		# Status
+		layout.addStretch()
+
+		return panel
+
+	def create_status_panel(self):
+		panel = QWidget()
+		layout = QVBoxLayout()
+		panel.setLayout(layout)
+		panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
 		status_group = QGroupBox("Status")
 		status_layout = QVBoxLayout()
+		status_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
 		self.status_text = QTextEdit()
-		self.status_text.setMaximumHeight(200)
 		self.status_text.setReadOnly(True)
+		self.status_text.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 		status_layout.addWidget(self.status_text)
 
 		self.stats_label = QLabel(f"FPS: 0 | Frames: 0 | Saved: 0 | Save Queue: 0")
@@ -1214,9 +1386,6 @@ class CameraGUI(QMainWindow):
 		status_group.setLayout(status_layout)
 		layout.addWidget(status_group)
 		self.statusBar().showMessage(f"camstim {self.app_version}")
-
-		layout.addStretch()
-
 		return panel
 
 	def populate_experiment_controls(self, force_refresh=False):
@@ -1295,6 +1464,88 @@ class CameraGUI(QMainWindow):
 			self.preview_status_queue.put(('status', f'Preview subprocess exited with code {process.returncode}.'))
 
 		self.preview_status_queue.put(('finished',))
+
+	def _track_frc_worker(self, process, log_path):
+		process.wait()
+		all_lines = []
+		log_tail = []
+		try:
+			with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
+				all_lines = [line.strip() for line in fh.readlines() if line.strip()]
+				log_tail = all_lines[-20:]
+		except OSError:
+			all_lines = []
+			log_tail = []
+
+		if process.returncode == 0:
+			saved_paths = [line for line in all_lines if line.startswith('/') and line.lower().endswith('.png')]
+			if saved_paths:
+				self.preview_status_queue.put(('status', f'FRC completed. Figure saved to {saved_paths[0]}'))
+				self.preview_status_queue.put(('frc_saved_figures', saved_paths))
+			else:
+				self.preview_status_queue.put(('status', 'FRC completed.'))
+			return
+
+		msg = f'FRC worker exited with code {process.returncode}. See log: {log_path}'
+		if log_tail:
+			msg = f"{msg} | Last log line: {log_tail[-1]}"
+		self.preview_status_queue.put(('status', msg))
+
+	def _plot_frc_numpy(self, img1, img2):
+		if plt is None:
+			raise RuntimeError('matplotlib is not available in this environment')
+
+		try:
+			import frc
+		except Exception as exc:
+			raise RuntimeError(f'frc module import failed: {exc}')
+
+		img1_proc = frc.util.square_image(np.array(img1), add_padding=False)
+		img2_proc = frc.util.square_image(np.array(img2), add_padding=False)
+		img1_proc = frc.util.apply_tukey(img1_proc)
+		img2_proc = frc.util.apply_tukey(img2_proc)
+
+		two_frc_curve = frc.two_frc(img1_proc, img2_proc)
+		one_frc_curve = frc.one_frc(img1_proc)
+		img_size = int(img1_proc.shape[0])
+		xs_freq = np.arange(len(two_frc_curve), dtype=np.float64) / float(img_size)
+
+		def _draw_curve(curve, title):
+			frc_res = None
+			threshold_fn = None
+			try:
+				frc_res, _, threshold_fn = frc.frc_res(xs_freq, curve, img_size)
+			except Exception:
+				frc_res = None
+				threshold_fn = None
+
+			fig, ax = plt.subplots(num=title)
+			ax.clear()
+			ax.plot(xs_freq, curve, label='FRC')
+			if threshold_fn is not None:
+				ax.plot(xs_freq, threshold_fn(xs_freq), label='Threshold')
+			if frc_res is not None:
+				ax.axvline(float(frc_res), color='r', linestyle='--', label=f'Resolution {float(frc_res):.4f}')
+			ax.set_xlabel('Spatial Frequency (pixel^-1)')
+			ax.set_ylabel('FRC')
+			ax.set_title(title)
+			ax.legend()
+			fig.tight_layout()
+			return fig
+
+		fig1 = _draw_curve(two_frc_curve, 'Fourier Ring Correlation (two consecutive frames)')
+		fig2 = _draw_curve(one_frc_curve, 'Fourier Ring Correlation (single frame)')
+
+		plt.show(block=False)
+		for fig in (fig1, fig2):
+			try:
+				fig.canvas.draw_idle()
+			except Exception:
+				pass
+		try:
+			plt.pause(0.001)
+		except Exception:
+			pass
 
 	def _finish_preview_without_camera(self):
 		self.preview_mode = False
@@ -1618,12 +1869,6 @@ class CameraGUI(QMainWindow):
 					return
 
 				if self.reset_display_average_on_next_frame:
-					if hasattr(self.camera_app, 'circular_buffer'):
-						self.camera_app.circular_buffer.fill(0)
-					if hasattr(self.camera_app, 'current_buffer_item'):
-						self.camera_app.current_buffer_item = 0
-					if hasattr(self.camera_app, 'buffer_loop_reached'):
-						self.camera_app.buffer_loop_reached = False
 					self.reset_display_average_on_next_frame = False
 
 				if self.reset_fps_on_next_frame:
@@ -1678,23 +1923,6 @@ class CameraGUI(QMainWindow):
 		return frame
 
 	def process_frame_for_display(self, frame):
-		if self.camera_app.live_speck and hasattr(self.camera_app, 'enable_live_speckle') and self.camera_app.enable_live_speckle:
-			frame = self.camera_app.std_filter_frame(frame)
-			if hasattr(self.camera_app, 'circular_buffer'):
-				self.camera_app.circular_buffer[self.camera_app.current_buffer_item, :, :] = frame
-				self.camera_app.current_buffer_item += 1
-				self.camera_app.current_buffer_item %= self.camera_app.buffer_size
-				if (not self.camera_app.buffer_loop_reached) and self.camera_app.current_buffer_item == 0:
-					self.camera_app.buffer_loop_reached = True
-
-				if self.camera_app.buffer_loop_reached:
-					frame = self.camera_app.circular_buffer.mean(axis=0)
-				else:
-					filled = max(1, self.camera_app.current_buffer_item)
-					frame = self.camera_app.circular_buffer[:filled, :, :].mean(axis=0)
-				clipped = np.clip(frame, self.camera_app.vmin, self.camera_app.vmax)
-				frame = ((clipped - self.camera_app.vmin) / (self.camera_app.vmax - self.camera_app.vmin)) * 255
-
 		if self.camera_app.removeBackground and getattr(self.camera_app, 'backgroundImg', None) is not None:
 			bg_ref = self._align_reference_to_frame(self.camera_app.backgroundImg, frame.shape, avoid_zero=False)
 			frame = frame - bg_ref
@@ -1948,19 +2176,19 @@ class CameraGUI(QMainWindow):
 			self.update_status(f"Error stopping Teensy before experiment start: {e}.")
 			return
 
-		self.camera_app.set_saving(True)
 		started = self.camera_app.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id)
 		if not started:
-			self.camera_app.set_saving(False)
 			self.update_status('Error: Failed to start experiment subprocess.')
 			return
+		self._last_plotted_metadata_key = None
+		self.camera_app.active_save_filename = None
 		self.load_and_display_exp_config()
 		self.reset_display_average_on_next_frame = True
 		self.reset_fps_on_next_frame = True
 		self.exp_btn.setEnabled(False)
 		self.stop_exp_btn.setEnabled(True)
 		self.trigger_btn.setEnabled(False)
-		self.update_status(f"Experiment started: {exp_name}.")
+		self.update_status(f"Experiment start requested: {exp_name}. Waiting for worker confirmation...")
 
 	def stop_experiment(self):
 		if self.camera_app:
@@ -2198,17 +2426,6 @@ class CameraGUI(QMainWindow):
 					self.camera_app.toggle_background_removal()
 				self.update_status('Background subtraction disabled.')
  
-	def toggle_speckle(self, state):
-		if self.camera_app:
-			if state == Qt.CheckState.Checked.value:
-				self.camera_app.toggle_speckle()
-				self.update_status("Live speckle imaging enabled.")
-
-			else:
-				if self.camera_app.enable_live_speckle:
-					self.camera_app.toggle_speckle()
-				self.update_status('Live speckle imaging disabled.')			
-
 	def toggle_dfof(self, state):
 		if self.camera_app:
 			if state == Qt.CheckState.Checked.value:
@@ -2299,6 +2516,14 @@ class CameraGUI(QMainWindow):
 
 		img1, img2 = frames
 
+		# Prefer the original in-process numpy/matplotlib plotting path.
+		try:
+			self._plot_frc_numpy(img1, img2)
+			self.update_status('Opened Fourier Ring Correlation plots.')
+			return
+		except Exception as exc:
+			self.update_status(f'Local FRC plot failed ({exc}); launching worker fallback.')
+
 		try:
 			with tempfile.NamedTemporaryFile(suffix="_frc_img1.npy", delete=False) as f1:
 				img1_path = f1.name
@@ -2337,6 +2562,7 @@ class CameraGUI(QMainWindow):
 			self.update_status(
 				f"Launched Fourier Ring Correlation worker (PID {proc.pid}) using {python_exec}."
 			)
+			threading.Thread(target=self._track_frc_worker, args=(proc, log_path), daemon=True).start()
 		except Exception as e:
 			try:
 				if 'log_file' in locals() and not log_file.closed:
@@ -2527,8 +2753,10 @@ class CameraGUI(QMainWindow):
 
 	def update_status(self, message):
 		timestamp = time.strftime("%H:%M:%S")
-		self.status_text.append(f"[{timestamp}] {message}")
+		line = f"[{timestamp}] {message}"
+		self.status_text.append(line)
 		self.status_text.verticalScrollBar().setValue(self.status_text.verticalScrollBar().maximum())
+		print(line, flush=True)
 
 	def closeEvent(self, event):
 		self.histogram_open = False

@@ -15,6 +15,7 @@ import subprocess
 import shutil
 from collections import deque
 import cv2
+import multiprocessing
 from core.experiment_discovery import discover_experiment_types
 try:
     from . import cgrabcallback as _cgrabcallback
@@ -97,7 +98,474 @@ def load_save_root(yaml_file_path=SAVE_SETTINGS_CONFIG_FILE):
     if not save_root:
         raise Exception("SAVE_DIR missing in {}".format(config_path))
 
-    return save_root
+    return os.path.abspath(os.path.expanduser(str(save_root)))
+
+
+def _analyze_timestamp_gaps_worker(timestamps):
+    if timestamps is None or len(timestamps) < 3:
+        return {
+            'num_timestamps': 0 if timestamps is None else int(len(timestamps)),
+            'expected_delta': None,
+            'max_delta': None,
+            'gap_events': 0,
+            'estimated_missing_frames': 0,
+        }
+
+    ts = np.asarray(timestamps, dtype=np.float64)
+    diffs = np.diff(ts)
+    diffs = diffs[diffs > 0]
+
+    if diffs.size == 0:
+        return {
+            'num_timestamps': int(len(timestamps)),
+            'expected_delta': None,
+            'max_delta': None,
+            'gap_events': 0,
+            'estimated_missing_frames': 0,
+        }
+
+    expected_delta = float(np.median(diffs))
+    if expected_delta <= 0:
+        return {
+            'num_timestamps': int(len(timestamps)),
+            'expected_delta': None,
+            'max_delta': float(np.max(diffs)),
+            'gap_events': 0,
+            'estimated_missing_frames': 0,
+        }
+
+    gap_mask = diffs > (1.5 * expected_delta)
+    gap_diffs = diffs[gap_mask]
+    if gap_diffs.size == 0:
+        estimated_missing_frames = 0
+    else:
+        estimated_missing_frames = int(np.maximum(0, np.rint(gap_diffs / expected_delta).astype(np.int64) - 1).sum())
+
+    return {
+        'num_timestamps': int(len(timestamps)),
+        'expected_delta': expected_delta,
+        'max_delta': float(np.max(diffs)),
+        'gap_events': int(gap_diffs.size),
+        'estimated_missing_frames': estimated_missing_frames,
+    }
+
+
+def _bin_frame_worker(frame, bin_size):
+    bs = int(bin_size)
+    if bs <= 1:
+        return frame
+
+    h, w = frame.shape
+    h_b = (h // bs) * bs
+    w_b = (w // bs) * bs
+    if h_b <= 0 or w_b <= 0:
+        raise ValueError(f"Frame too small for BIN_SIZE={bs}: {h}x{w}")
+
+    if h_b != h or w_b != w:
+        frame = frame[:h_b, :w_b]
+
+    data = frame.astype(np.uint16, copy=False)
+    if bs in (2, 4, 8, 16, 32, 64):
+        for _ in range(bs.bit_length() - 1):
+            data = (
+                data[0::2, 0::2]
+                + data[1::2, 0::2]
+                + data[0::2, 1::2]
+                + data[1::2, 1::2]
+            )
+    else:
+        data = data.reshape(h_b // bs, bs, w_b // bs, bs).sum(axis=(1, 3), dtype=np.uint16)
+    return data
+
+
+def _save_worker_loop(config, frame_queue, control_queue, status_queue, stats_queue):
+    save_batch_frames = int(config.get('SAVE_BATCH_FRAMES', 64))
+    save_target_batch_bytes = int(config.get('SAVE_TARGET_BATCH_BYTES', 32 * 1024 * 1024))
+    use_c_binning_cfg = config.get('USE_C_BINNING', True)
+    if isinstance(use_c_binning_cfg, str):
+        use_c_binning = use_c_binning_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+    else:
+        use_c_binning = bool(use_c_binning_cfg)
+    debug_save_binning_timing_cfg = config.get('DEBUG_SAVE_BINNING_TIMING', False)
+    if isinstance(debug_save_binning_timing_cfg, str):
+        debug_save_binning_timing = debug_save_binning_timing_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+    else:
+        debug_save_binning_timing = bool(debug_save_binning_timing_cfg)
+
+    saving = False
+    session = None
+    save_file_handle = None
+    write_batch = []
+    ts_batch = []
+    sys_ts_batch = []
+    temp_batch = []
+    callback_timing_info = None
+
+    session_frames_written = 0
+    session_frame_timestamps = []
+    session_sys_clock_timestamps = []
+    session_sensor_temperatures = []
+    session_preview_frames_saved = 0
+    frames_written_total = 0
+    c_bin_output_buffer = None
+    c_bin_output_shape = None
+    c_bin_timing_count = 0
+    c_bin_timing_total_s = 0.0
+    np_bin_timing_count = 0
+    np_bin_timing_total_s = 0.0
+
+    last_flush_time = time.time()
+    flush_interval_s = 0.5
+    flush_every_n_frames = max(1, save_batch_frames)
+
+    def _publish_status(payload):
+        if status_queue is None:
+            return
+        try:
+            status_queue.put_nowait(payload)
+        except Exception:
+            pass
+
+    def _publish_frames_written():
+        if stats_queue is None:
+            return
+        try:
+            stats_queue.put_nowait({'type': 'frames_written', 'value': int(frames_written_total)})
+        except Exception:
+            pass
+
+    def _save_preview_tiff(frame_bytes):
+        nonlocal session_preview_frames_saved
+        if session_preview_frames_saved >= 2:
+            return
+        if session is None:
+            return
+        try:
+            frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(int(session['height']), int(session['width']))
+            if session['software_mirror_horizontal']:
+                frame = np.ascontiguousarray(frame[:, ::-1])
+
+            frame_idx = int(session_preview_frames_saved)
+            frame_path = os.path.join(session['save_dir'], f"{session['filename']}_frame{frame_idx}.tiff")
+            ok = cv2.imwrite(frame_path, frame, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
+            if not ok:
+                raise OSError(f"cv2.imwrite returned False for {frame_path}")
+
+            if session['bin_exp'] and int(session['bin_size']) > 1:
+                binned_frame = _bin_frame_worker(frame, int(session['bin_size']))
+                binned_path = os.path.join(session['save_dir'], f"{session['filename']}_frame{frame_idx}_binned.tiff")
+                ok_binned = cv2.imwrite(binned_path, binned_frame, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
+                if not ok_binned:
+                    raise OSError(f"cv2.imwrite returned False for {binned_path}")
+
+            session_preview_frames_saved += 1
+        except Exception as exc:
+            print(f"Warning: failed to save frame preview TIFF in worker: {exc}")
+
+    def _report_and_reset_binning_timing():
+        nonlocal c_bin_timing_count, c_bin_timing_total_s, np_bin_timing_count, np_bin_timing_total_s
+        if not debug_save_binning_timing:
+            return
+
+        if c_bin_timing_count > 0:
+            c_mean_ms = (c_bin_timing_total_s / c_bin_timing_count) * 1000.0
+            print(
+                "Save binning timing (C): "
+                f"batches={c_bin_timing_count}, "
+                f"total={c_bin_timing_total_s:.6f}s, "
+                f"mean={c_mean_ms:.3f}ms"
+            )
+        if np_bin_timing_count > 0:
+            np_mean_ms = (np_bin_timing_total_s / np_bin_timing_count) * 1000.0
+            print(
+                "Save binning timing (NumPy): "
+                f"batches={np_bin_timing_count}, "
+                f"total={np_bin_timing_total_s:.6f}s, "
+                f"mean={np_mean_ms:.3f}ms"
+            )
+
+        c_bin_timing_count = 0
+        c_bin_timing_total_s = 0.0
+        np_bin_timing_count = 0
+        np_bin_timing_total_s = 0.0
+
+    def _flush_batch(force_flush=False):
+        nonlocal write_batch, ts_batch, sys_ts_batch, temp_batch
+        nonlocal save_file_handle, last_flush_time, frames_written_total, session_frames_written
+        nonlocal c_bin_output_buffer, c_bin_output_shape
+        nonlocal c_bin_timing_count, c_bin_timing_total_s, np_bin_timing_count, np_bin_timing_total_s
+        if not write_batch:
+            return
+        if session is None:
+            write_batch.clear(); ts_batch.clear(); sys_ts_batch.clear(); temp_batch.clear()
+            return
+        if save_file_handle is None or getattr(save_file_handle, 'closed', False):
+            write_batch.clear(); ts_batch.clear(); sys_ts_batch.clear(); temp_batch.clear()
+            return
+
+        n = len(write_batch)
+        h = int(session['height'])
+        w = int(session['width'])
+        dtype = session['dtype']
+        source = b''.join(write_batch)
+        raw = np.frombuffer(source, dtype=dtype).reshape(n, h, w)
+
+        if session['software_mirror_horizontal']:
+            raw = np.ascontiguousarray(raw[:, :, ::-1])
+
+        if session['bin_exp'] and int(session['bin_size']) > 1:
+            bs = int(session['bin_size'])
+            can_use_c_binning = (
+                use_c_binning
+                and _cgrabcallback is not None
+                and hasattr(_cgrabcallback, 'bin_u8_batch_sum_pow2')
+                and raw.dtype == np.uint8
+                and (bs & (bs - 1)) == 0
+                and (h // bs) > 0
+                and (w // bs) > 0
+            )
+
+            if can_use_c_binning:
+                bin_t0 = time.perf_counter() if debug_save_binning_timing else None
+                out_h = h // bs
+                out_w = w // bs
+                out_shape = (n, out_h, out_w)
+                if c_bin_output_buffer is None or c_bin_output_shape != out_shape:
+                    c_bin_output_buffer = np.empty(out_shape, dtype=np.uint16)
+                    c_bin_output_shape = out_shape
+
+                src_addr = raw.__array_interface__['data'][0]
+                dst_addr = c_bin_output_buffer.__array_interface__['data'][0]
+                _cgrabcallback.bin_u8_batch_sum_pow2(src_addr, n, h, w, bs, dst_addr)
+                if bin_t0 is not None:
+                    c_bin_timing_count += 1
+                    c_bin_timing_total_s += (time.perf_counter() - bin_t0)
+                write_slice = c_bin_output_buffer
+            else:
+                bin_t0 = time.perf_counter() if debug_save_binning_timing else None
+                data = raw.astype(np.uint16, copy=False)
+                if bs in (2, 4, 8, 16, 32, 64):
+                    for _ in range(bs.bit_length() - 1):
+                        data = (
+                            data[:, 0::2, 0::2]
+                            + data[:, 1::2, 0::2]
+                            + data[:, 0::2, 1::2]
+                            + data[:, 1::2, 1::2]
+                        )
+                else:
+                    h_b = (h // bs) * bs
+                    w_b = (w // bs) * bs
+                    if h_b <= 0 or w_b <= 0:
+                        raise ValueError(f"Frame too small for BIN_SIZE={bs}: {h}x{w}")
+                    if h_b != h or w_b != w:
+                        data = data[:, :h_b, :w_b]
+                    data = data.reshape(n, h_b // bs, bs, w_b // bs, bs).sum(axis=(2, 4), dtype=np.uint16)
+                if bin_t0 is not None:
+                    np_bin_timing_count += 1
+                    np_bin_timing_total_s += (time.perf_counter() - bin_t0)
+                write_slice = data
+        else:
+            write_slice = raw
+
+        try:
+            write_slice.tofile(save_file_handle)
+        except Exception as exc:
+            print(f"Warning: failed to write frame batch in worker: {exc}")
+            write_batch.clear(); ts_batch.clear(); sys_ts_batch.clear(); temp_batch.clear()
+            try:
+                save_file_handle.close()
+            except Exception:
+                pass
+            save_file_handle = None
+            return
+
+        session_frame_timestamps.extend(ts_batch)
+        session_sys_clock_timestamps.extend(sys_ts_batch)
+        session_sensor_temperatures.extend(temp_batch)
+        session_frames_written += n
+        frames_written_total += n
+        _publish_frames_written()
+
+        if force_flush or ((time.time() - last_flush_time) >= flush_interval_s):
+            save_file_handle.flush()
+            last_flush_time = time.time()
+
+        write_batch.clear(); ts_batch.clear(); sys_ts_batch.clear(); temp_batch.clear()
+
+    def _write_metadata_and_close():
+        nonlocal save_file_handle, session, callback_timing_info
+        nonlocal session_frames_written, session_frame_timestamps
+        nonlocal session_sys_clock_timestamps, session_sensor_temperatures
+        if session is None:
+            return
+
+        if session_frames_written > 0:
+            camera_gap_stats = _analyze_timestamp_gaps_worker(session_frame_timestamps)
+            system_gap_stats = _analyze_timestamp_gaps_worker(session_sys_clock_timestamps)
+            estimated_total_triggered_frames = session_frames_written + camera_gap_stats['estimated_missing_frames']
+
+            metadata = {
+                'num_frames': session_frames_written,
+                'frame_width': int(session['width']) if not session['bin_exp'] else int(session['width']) // int(session['bin_size']),
+                'frame_height': int(session['height']) if not session['bin_exp'] else int(session['height']) // int(session['bin_size']),
+                'roi': dict(session['roi']),
+                'data_type': session['dtype'] if not session['bin_exp'] else 'uint16',
+                'frame_timestamps': session_frame_timestamps,
+                'sys_clock_timestamps': session_sys_clock_timestamps,
+                'sensor_temperatures_c': session_sensor_temperatures,
+                'frame_exposure': float(session['exposure']),
+                'frame_gain': float(session['analog_gain']),
+                'binned_live': bool(session['bin_exp']),
+                'bin_mode': 'software' if session['bin_exp'] else 'none',
+                'bin_size': int(session['bin_size']),
+                'timestamp_gap_analysis': {
+                    'camera_timestamp': camera_gap_stats,
+                    'system_timestamp': system_gap_stats,
+                    'estimated_total_triggered_frames': estimated_total_triggered_frames,
+                },
+            }
+
+            valid_temps = [float(v) for v in session_sensor_temperatures if v is not None]
+            if valid_temps:
+                metadata['sensor_temperature_stats_c'] = {
+                    'count': int(len(valid_temps)),
+                    'min': float(min(valid_temps)),
+                    'max': float(max(valid_temps)),
+                    'mean': float(sum(valid_temps) / len(valid_temps)),
+                }
+
+            if callback_timing_info and callback_timing_info.get('enabled') and callback_timing_info.get('count', 0) > 0:
+                callback_mean_s = float(callback_timing_info['total_s']) / int(callback_timing_info['count'])
+                metadata['callback_timing'] = {
+                    'enabled': True,
+                    'count': int(callback_timing_info['count']),
+                    'total_seconds': float(callback_timing_info['total_s']),
+                    'mean_ms': float(callback_mean_s * 1000.0),
+                    'max_ms': float(float(callback_timing_info.get('max_s', 0.0)) * 1000.0),
+                    'samples_ms': [float(v * 1000.0) for v in callback_timing_info.get('samples_s', [])],
+                }
+
+            np.save(os.path.join(session['save_dir'], '{}.npy'.format(session['filename'])), metadata)
+
+            cam_gap = metadata['timestamp_gap_analysis']['camera_timestamp']
+            summary = (
+                f"Timestamp gap summary: expected_dt={cam_gap['expected_delta']}, "
+                f"max_dt={cam_gap['max_delta']}, gap_events={cam_gap['gap_events']}, "
+                f"estimated_missing_frames={cam_gap['estimated_missing_frames']}, "
+                f"saved_frames={session_frames_written}, "
+                f"estimated_total_triggered={metadata['timestamp_gap_analysis']['estimated_total_triggered_frames']}"
+            )
+            print(summary)
+            _publish_status({'type': 'status', 'message': summary})
+
+            # Preserve legacy live console summary for callback timing diagnostics.
+            if callback_timing_info and callback_timing_info.get('enabled') and int(callback_timing_info.get('count', 0)) > 0:
+                callback_mean_s = float(callback_timing_info['total_s']) / int(callback_timing_info['count'])
+                callback_summary = (
+                    f"Callback timing: count={int(callback_timing_info['count'])}, "
+                    f"total={float(callback_timing_info['total_s']):.6f}s, "
+                    f"mean={callback_mean_s * 1000.0:.3f}ms, "
+                    f"max={float(callback_timing_info.get('max_s', 0.0)) * 1000.0:.3f}ms"
+                )
+                print(callback_summary)
+                _publish_status({'type': 'status', 'message': callback_summary})
+
+        if save_file_handle is not None and not getattr(save_file_handle, 'closed', True):
+            try:
+                save_file_handle.flush()
+                save_file_handle.close()
+            except Exception:
+                pass
+        save_file_handle = None
+
+        session = None
+        callback_timing_info = None
+        session_frames_written = 0
+        session_frame_timestamps = []
+        session_sys_clock_timestamps = []
+        session_sensor_temperatures = []
+
+    while True:
+        try:
+            while True:
+                cmd = control_queue.get_nowait()
+                if not isinstance(cmd, dict):
+                    continue
+                name = cmd.get('name')
+                payload = cmd.get('payload') or {}
+                if name == 'start_save':
+                    _flush_batch(force_flush=True)
+                    _report_and_reset_binning_timing()
+                    _write_metadata_and_close()
+                    session = dict(payload)
+                    callback_timing_info = None
+                    session_preview_frames_saved = 0
+
+                    file_path = os.path.join(session['save_dir'], session['filename'] + '.bin')
+                    if os.path.exists(file_path):
+                        base = session['filename']
+                        suffix = 1
+                        while True:
+                            candidate = f"{base}_{suffix}"
+                            cpath = os.path.join(session['save_dir'], candidate + '.bin')
+                            mpath = os.path.join(session['save_dir'], candidate + '.npy')
+                            if not os.path.exists(cpath) and not os.path.exists(mpath):
+                                session['filename'] = candidate
+                                file_path = cpath
+                                break
+                            suffix += 1
+                    save_file_handle = open(file_path, 'wb', buffering=64 * 1024 * 1024)
+                    saving = True
+                    _publish_status({'type': 'saving_file', 'filename': session['filename']})
+
+                elif name == 'stop_save':
+                    callback_timing_info = payload.get('callback_timing') if isinstance(payload, dict) else None
+                    saving = False
+                    _flush_batch(force_flush=True)
+                    _report_and_reset_binning_timing()
+                    _write_metadata_and_close()
+
+                elif name == 'quit':
+                    callback_timing_info = payload.get('callback_timing') if isinstance(payload, dict) else None
+                    saving = False
+                    _flush_batch(force_flush=True)
+                    _report_and_reset_binning_timing()
+                    _write_metadata_and_close()
+                    return
+        except queue.Empty:
+            pass
+
+        if not saving:
+            time.sleep(0.005)
+            continue
+
+        if session is not None:
+            h = int(session['height'])
+            w = int(session['width'])
+            raw_itemsize = np.dtype(session['dtype']).itemsize
+            frame_bytes = max(1, h * w * raw_itemsize)
+            if session['bin_exp'] and int(session['bin_size']) > 1:
+                bs = int(session['bin_size'])
+                h_b = (h // bs) * bs
+                w_b = (w // bs) * bs
+                if h_b > 0 and w_b > 0:
+                    frame_bytes = max(1, (h_b // bs) * (w_b // bs) * np.dtype(np.uint16).itemsize)
+            max_frames_by_bytes = max(1, save_target_batch_bytes // frame_bytes)
+            flush_every_n_frames = max(1, min(save_batch_frames, max_frames_by_bytes))
+
+        try:
+            frame_data, count, timestamp, sys_stamp, sensor_temp = frame_queue.get(timeout=0.02)
+        except queue.Empty:
+            _flush_batch(force_flush=True)
+            continue
+
+        write_batch.append(frame_data)
+        _save_preview_tiff(frame_data)
+        ts_batch.append(timestamp)
+        sys_ts_batch.append(sys_stamp)
+        temp_batch.append(None if sensor_temp is None else float(sensor_temp))
+        if len(write_batch) >= flush_every_n_frames:
+            _flush_batch(force_flush=False)
 
 
 
@@ -121,17 +589,30 @@ class App(object):
         self.frame_pool_frames = int(config.get('FRAME_POOL_FRAMES', 256))
         # Keep queue comfortably above pool so pool is the primary capacity knob.
         self.save_queue_max_frames = max(128, ((3 * self.frame_pool_frames) + 1) // 2)
-        self.frame_queue = queue.Queue(maxsize=self.save_queue_max_frames)  # Buffer for save path
-        self.save_thread = threading.Thread(target=self.save_frames)  # Thread for saving frames
+        self.frame_queue = multiprocessing.Queue(maxsize=self.save_queue_max_frames)  # Buffer for save path
+        self.save_control_queue = multiprocessing.Queue()
+        self.save_stats_queue = multiprocessing.Queue()
+        self.save_process = None
         self.frame_count = 0  # To keep track of saved 
         self.frames_written = 0
         self.dropped_save_frames = 0
         self.save_overflow = False
         self.save_batch_frames = int(config.get('SAVE_BATCH_FRAMES', 64))
+        self.save_warmup_seconds = float(config.get('SAVE_WARMUP_SECONDS', 0.0))
+        if self.save_warmup_seconds < 0:
+            self.save_warmup_seconds = 0.0
+        self._save_warmup_deadline = 0.0
+        # mvsdk trigger mode: 0=continuous, 2=hardware trigger (used by GUI).
+        self.current_trigger_mode = 0
         # Cap batch memory to avoid periodic large allocations that can stall writes.
         self.save_target_batch_bytes = int(config.get('SAVE_TARGET_BATCH_BYTES', 32 * 1024 * 1024))
         self.disable_gc_during_acquire = bool(config.get('DISABLE_GC_DURING_ACQUIRE', True))
         self.debug_callback_timing = bool(config.get('DEBUG_CALLBACK_TIMING', False))
+        debug_camera_startup_cfg = config.get('DEBUG_CAMERA_STARTUP_INFO', False)
+        if isinstance(debug_camera_startup_cfg, str):
+            self.debug_camera_startup_info = debug_camera_startup_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            self.debug_camera_startup_info = bool(debug_camera_startup_cfg)
         debug_save_binning_timing_cfg = config.get('DEBUG_SAVE_BINNING_TIMING', False)
         if isinstance(debug_save_binning_timing_cfg, str):
             self.debug_save_binning_timing = debug_save_binning_timing_cfg.strip().lower() in ('1', 'true', 'yes', 'on')
@@ -143,7 +624,6 @@ class App(object):
         self._frame_pool_views = []
         self._frame_pool_ptrs = []
         self._free_frame_slots = queue.SimpleQueue()
-        self.live_speck = config['USE_LIVE_SPECKLE']
         self.exposure = config['EXPOSURE_TIME'] # in ms
         self.analog_gain = float(config['ANALOG_GAIN'])
         self.analog_gain_step = 1.0
@@ -183,6 +663,7 @@ class App(object):
         self.save_dir = None
         self.save_dir_ready = False
         self.save_file_handle = None
+        self._save_filename_in_use = None
         self.exp_status_queue = queue.Queue()
         self.frame_output_queue = frame_output_queue
         self.command_queue = command_queue
@@ -219,6 +700,10 @@ class App(object):
         self._display_frame_buffer = None
         self._display_frame_buffer_ptr = None
         self._display_frame_buffer_addr = None
+        self._pending_display_slot = None
+        self._pending_display_nbytes = 0
+        self._pending_display_frame_index = 0
+        self._pending_display_lock = threading.Lock()
 
         # self.check_and_fix_existing_experiment()
 
@@ -296,30 +781,23 @@ class App(object):
         else:
             message = 'Frame grab implementation: Python fallback (ctypes.memmove, requested).'
 
-        print(message)
-        self._publish_status({
-            'type': 'framegrab_backend',
-            'requested_c': bool(self.use_cgrabcallback),
-            'available_c': bool(_cgrabcallback is not None),
-            'using_c': bool(using_c),
-            'message': message,
-        })
-        self._publish_status({'type': 'status', 'message': message})
+        if self.debug_camera_startup_info:
+            print(message)
+            self._publish_status({
+                'type': 'framegrab_backend',
+                'requested_c': bool(self.use_cgrabcallback),
+                'available_c': bool(_cgrabcallback is not None),
+                'using_c': bool(using_c),
+                'message': message,
+            })
+            self._publish_status({'type': 'status', 'message': message})
 
     def _clear_pending_frames(self):
         while True:
             try:
-                queued = self.frame_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            try:
-                frame_ref = queued[0]
-                if isinstance(frame_ref, tuple) and len(frame_ref) == 2:
-                    slot_idx, _ = frame_ref
-                    self._release_frame_slot(slot_idx)
+                self.frame_queue.get_nowait()
             except Exception:
-                continue
+                break
 
     def _apply_roi(self, payload):
         if not self.hCamera:
@@ -436,6 +914,7 @@ class App(object):
                 mode = int(payload)
                 if self.hCamera:
                     mvsdk.CameraSetTriggerMode(self.hCamera, mode)
+                self.current_trigger_mode = mode
                 self._publish_status({'type': 'trigger_mode', 'mode': mode})
             elif name == 'set_exposure':
                 exposure_ms = float(payload)
@@ -454,8 +933,7 @@ class App(object):
             elif name == 'reset_roi':
                 self._reset_roi()
             elif name == 'set_saving':
-                self.saving = bool(payload)
-                self._publish_status({'type': 'saving', 'value': self.saving})
+                self._set_saving(bool(payload))
             elif name == 'set_display_output_enabled':
                 self.display_output_enabled = bool(payload)
                 self._publish_status({'type': 'display_output_enabled', 'value': self.display_output_enabled})
@@ -474,12 +952,23 @@ class App(object):
                 )
             elif name == 'start_experiment':
                 exp_name, experiment_id, mouse_id = payload
-                self.saving = True
-                self.get_exp_params(exp_name=exp_name, experiment_id=experiment_id, mouse_id=mouse_id, save_outputs=True)
+                self._publish_status({'type': 'status', 'message': f"Worker received start_experiment: {exp_name} ({mouse_id}, {experiment_id})"})
+                started = self.get_exp_params(
+                    exp_name=exp_name,
+                    experiment_id=experiment_id,
+                    mouse_id=mouse_id,
+                    save_outputs=True,
+                )
+                if started:
+                    # Enable saving only after save path preparation has completed.
+                    # This avoids callback enqueue bursts before the save worker session starts.
+                    self._set_saving(True)
+                else:
+                    self._publish_status({'type': 'error', 'message': 'Failed to start experiment.'})
             elif name == 'stop_preview':
                 self.stop_stim()
             elif name == 'stop_experiment':
-                self.saving = False
+                self._set_saving(False)
                 self.stop_stim()
         except Exception as e:
             self._publish_status({'type': 'error', 'message': str(e)})
@@ -494,6 +983,14 @@ class App(object):
             except queue.Empty:
                 break
             self._handle_command(command)
+
+    def _queue_size_safe(self, q):
+        if q is None:
+            return 0
+        try:
+            return int(q.qsize())
+        except (NotImplementedError, AttributeError, OSError):
+            return 0
 
     def _boost_windows_camera_thread_priority(self):
         if (
@@ -601,7 +1098,7 @@ class App(object):
             # Never block the camera callback thread; callback stalls can cause SDK-level drops.
             self.frame_queue.put_nowait(queued_frame)
             return True
-        except queue.Full:
+        except Exception:
             self.save_overflow = True
             return False
 
@@ -657,6 +1154,40 @@ class App(object):
     def _frame_view_from_slot(self, slot_idx, nbytes):
         return self._frame_pool_views[int(slot_idx)][:int(nbytes)]
 
+    def _publish_pending_display_frame(self):
+        slot_idx = None
+        nbytes = 0
+        frame_index = 0
+
+        with self._pending_display_lock:
+            if self._pending_display_slot is None:
+                return
+            slot_idx = self._pending_display_slot
+            nbytes = int(self._pending_display_nbytes)
+            frame_index = int(self._pending_display_frame_index)
+            self._pending_display_slot = None
+            self._pending_display_nbytes = 0
+
+        try:
+            display_frame_data = None
+            if (
+                self.use_mutable_display_buffers
+                and self._display_frame_buffer_addr is not None
+                and nbytes == self.frame_bytes
+            ):
+                src_addr = self._frame_pool_addrs[slot_idx]
+                if self._is_using_c_framegrab() and _cgrabcallback is not None:
+                    _cgrabcallback.fast_memcpy(self._display_frame_buffer_addr, src_addr, nbytes)
+                else:
+                    ctypes.memmove(ctypes.c_void_p(self._display_frame_buffer_addr), ctypes.c_void_p(src_addr), nbytes)
+                display_frame_data = self._display_frame_buffer
+            else:
+                display_frame_data = bytes(self._frame_view_from_slot(slot_idx, nbytes))
+
+            self._put_display_frame(display_frame_data, frame_index)
+        finally:
+            self._release_frame_slot(slot_idx)
+
     def _disable_gc_if_configured(self):
         if not self.disable_gc_during_acquire:
             return
@@ -670,6 +1201,103 @@ class App(object):
             gc.enable()
             print('GC re-enabled after acquisition.')
         self._gc_was_enabled = False
+
+    def _start_save_process(self):
+        if self.save_process is not None and self.save_process.is_alive():
+            return
+        self.save_process = multiprocessing.Process(
+            target=_save_worker_loop,
+            args=(self.config, self.frame_queue, self.save_control_queue, self.status_queue, self.save_stats_queue),
+            daemon=True,
+        )
+        self.save_process.start()
+
+    def _drain_save_stats(self):
+        while True:
+            try:
+                item = self.save_stats_queue.get_nowait()
+            except Exception:
+                break
+            if isinstance(item, dict) and item.get('type') == 'frames_written':
+                self.frames_written = int(item.get('value', self.frames_written))
+
+    def _stop_save_process(self):
+        if self.save_process is None:
+            return
+        callback_timing = {
+            'enabled': bool(self.debug_callback_timing),
+            'count': int(self.session_callback_timing_count),
+            'total_s': float(self.session_callback_timing_total_s),
+            'max_s': float(self.session_callback_timing_max_s),
+            'samples_s': [float(v) for v in self.session_callback_timing_samples_s],
+        }
+        try:
+            self.save_control_queue.put_nowait({'name': 'quit', 'payload': {'callback_timing': callback_timing}})
+        except Exception:
+            pass
+        self.save_process.join(timeout=10.0)
+        if self.save_process.is_alive():
+            self.save_process.terminate()
+            self.save_process.join(timeout=2.0)
+        self.save_process = None
+
+    def _send_start_save_to_worker(self):
+        if not self.save_dir_ready or self.save_dir is None:
+            return
+        roi_width = int(self.roi_width if self.roi_width is not None else self.width)
+        roi_height = int(self.roi_height if self.roi_height is not None else self.height)
+        payload = {
+            'save_dir': str(self.save_dir),
+            'filename': str(self.filename),
+            'height': int(self.height),
+            'width': int(self.width),
+            'dtype': self.dtype,
+            'bin_exp': bool(self.bin_exp),
+            'bin_size': int(self.bin_size),
+            'software_mirror_horizontal': bool(self.software_mirror_horizontal),
+            'exposure': float(self.exposure),
+            'analog_gain': float(self.analog_gain),
+            'roi': {
+                'x': int(self.roi_x),
+                'y': int(self.roi_y),
+                'width': roi_width,
+                'height': roi_height,
+            },
+        }
+        self.save_control_queue.put({'name': 'start_save', 'payload': payload})
+
+    def _send_stop_save_to_worker(self):
+        callback_timing = {
+            'enabled': bool(self.debug_callback_timing),
+            'count': int(self.session_callback_timing_count),
+            'total_s': float(self.session_callback_timing_total_s),
+            'max_s': float(self.session_callback_timing_max_s),
+            'samples_s': [float(v) for v in self.session_callback_timing_samples_s],
+        }
+        self.save_control_queue.put({'name': 'stop_save', 'payload': {'callback_timing': callback_timing}})
+
+    def _set_saving(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self.saving:
+            return
+        self.saving = enabled
+        if self.saving:
+            if self.save_warmup_seconds > 0:
+                self._save_warmup_deadline = time.time() + float(self.save_warmup_seconds)
+                self._publish_status({
+                    'type': 'status',
+                    'message': (
+                        f"Save warmup active for {self.save_warmup_seconds:.2f}s before writing frames."
+                    ),
+                })
+            else:
+                self._save_warmup_deadline = 0.0
+            if self.save_dir_ready:
+                self._send_start_save_to_worker()
+        else:
+            self._save_warmup_deadline = 0.0
+            self._send_stop_save_to_worker()
+        self._publish_status({'type': 'saving', 'value': self.saving})
 
     def _ensure_unique_filename(self):
         if not self.save_dir_ready or self.save_dir is None:
@@ -698,11 +1326,12 @@ class App(object):
 
         gain_min = self.analog_gain_min_units * self.analog_gain_step
         gain_max = self.analog_gain_max_units * self.analog_gain_step
-        print(
-            f"Analog gain scale: step={self.analog_gain_step} "
-            f"units=[{self.analog_gain_min_units}, {self.analog_gain_max_units}] , "
-            f"multiplier=[{gain_min}, {gain_max}]"
-        )
+        if self.debug_camera_startup_info:
+            print(
+                f"Analog gain scale: step={self.analog_gain_step} "
+                f"units=[{self.analog_gain_min_units}, {self.analog_gain_max_units}] , "
+                f"multiplier=[{gain_min}, {gain_max}]"
+            )
 
     def _gain_multiplier_to_units(self, gain_multiplier):
         units = int(round(float(gain_multiplier) / self.analog_gain_step))
@@ -725,7 +1354,8 @@ class App(object):
         # Mono8 is enforced for stability and compatibility.
         mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
         self.dtype = 'uint8'
-        print("Using 8-bit output format (MONO8).")
+        if self.debug_camera_startup_info:
+            print("Using 8-bit output format (MONO8).")
 
         # Mirror handling for frame orientation consistency across display/save.
         # Uses CameraFlipFrameBuffer in the callback path.
@@ -746,10 +1376,12 @@ class App(object):
         self.software_mirror_horizontal = False
 
         if not mirror_h:
-            print("Horizontal mirror disabled (CAMERA_MIRROR_HORIZONTAL=false).")
+            if self.debug_camera_startup_info:
+                print("Horizontal mirror disabled (CAMERA_MIRROR_HORIZONTAL=false).")
             return
 
-        print(f"Horizontal mirror enabled via CameraFlipFrameBuffer (flags={self.mirror_flip_flags}).")
+        if self.debug_camera_startup_info:
+            print(f"Horizontal mirror enabled via CameraFlipFrameBuffer (flags={self.mirror_flip_flags}).")
 
     def _probe_camera_setting(self, key, getter):
         try:
@@ -815,7 +1447,7 @@ class App(object):
             }
 
     def _report_strobe_settings(self):
-        if not self.hCamera:
+        if not self.hCamera or not self.debug_camera_startup_info:
             return
 
         probes = [
@@ -1068,11 +1700,12 @@ class App(object):
                 else:
                     lines.append(f"  {key}={value}: failed (err={err_code}, {err_msg})")
 
-        print('\n'.join(lines))
-        self._publish_status({
-            'type': 'strobe_apply',
-            'results': results,
-        })
+        if self.debug_camera_startup_info:
+            print('\n'.join(lines))
+            self._publish_status({
+                'type': 'strobe_apply',
+                'results': results,
+            })
 
     def experiment_status_callback(self, message):
         if hasattr(self, 'exp_status_queue'):
@@ -1094,10 +1727,12 @@ class App(object):
     def get_exp_params(self, exp_name=None, experiment_id=None, mouse_id=None, preview=False, save_outputs=False):
         if hasattr(self, 'exp_thread') and self.exp_thread and self.exp_thread.is_alive():
             print('\nExperiment selection already in progress.')
+            self._publish_status({'type': 'status', 'message': 'Experiment selection already in progress.'})
             return False
 
         if exp_name is None or experiment_id is None or mouse_id is None:
             print("Missing experiment parameters (exp_name, experiment_id, mouse_id).")
+            self._publish_status({'type': 'error', 'message': 'Missing experiment parameters (exp_name, experiment_id, mouse_id).'})
             return False
 
         exp_name = (exp_name or '').strip()
@@ -1107,6 +1742,7 @@ class App(object):
             experiment_id, mouse_id = self._normalize_preview_identity(experiment_id, mouse_id)
 
         if not exp_name or not experiment_id or not mouse_id:
+            self._publish_status({'type': 'error', 'message': 'Invalid experiment parameters; name, experiment_id, and mouse_id are required.'})
             return False
 
         self.exp_name = exp_name
@@ -1114,15 +1750,26 @@ class App(object):
         self.mouse_id = mouse_id
         self.filename = f"{mouse_id}_{experiment_id}"
 
+        # Prepare save path synchronously so folder creation failures are reported immediately.
+        save_dir_prepared = False
+        if save_outputs:
+            try:
+                self._prepare_save_directory(mouse_id, experiment_id)
+                save_dir_prepared = True
+                self._publish_status({'type': 'status', 'message': f"Save directory ready: {self.save_dir}"})
+            except Exception as exc:
+                self._publish_status({'type': 'error', 'message': f"Failed to prepare save directory: {exc}"})
+                return False
+
         self.exp_thread = threading.Thread(
             target=self.run_exp,
-            args=(exp_name, experiment_id, mouse_id, preview, bool(save_outputs)),
+            args=(exp_name, experiment_id, mouse_id, preview, bool(save_outputs), save_dir_prepared),
             daemon=True,
         )
         self.exp_thread.start()
         return True
 
-    def run_exp(self, exp_name, experiment_id, mouse_id, preview=False, save_outputs=False):
+    def run_exp(self, exp_name, experiment_id, mouse_id, preview=False, save_outputs=False, save_dir_prepared=False):
         try:
             self.exp_name = exp_name
             self.experiment_id = experiment_id
@@ -1133,7 +1780,7 @@ class App(object):
             elif preview and save_outputs:
                 self.experiment_status_callback("Preview mode active: experiment files will be saved.")
 
-            if save_outputs:
+            if save_outputs and not save_dir_prepared:
                 self._prepare_save_directory(mouse_id, experiment_id)
 
             if not preview:
@@ -1169,6 +1816,8 @@ class App(object):
         self.save_dir = save_dir
         self.save_dir_ready = True
         self._ensure_unique_filename()
+        if self.saving:
+            self._send_start_save_to_worker()
 
     def _copy_teensy_params_to_save_dir(self):
         if not self.save_dir_ready or self.save_dir is None:
@@ -1302,19 +1951,26 @@ class App(object):
                         except Exception as write_error:
                             print(f"\nFailed to send STOP to stim process: {write_error}.")
 
-                        try:
-                            self.stim_progress.wait(timeout=5.0)
-                            print("\nStim stopped gracefully.")
-                        except subprocess.TimeoutExpired:
+                        # wf_main may need several seconds to stop teensy/sensors and flush outputs.
+                        graceful_deadline_s = 15.0
+                        wait_step_s = 0.5
+                        waited_s = 0.0
+                        while self.stim_progress.poll() is None and waited_s < graceful_deadline_s:
+                            time.sleep(wait_step_s)
+                            waited_s += wait_step_s
+
+                        if self.stim_progress.poll() is None:
                             print("\nStim process did not exit after STOP; forcing terminate...")
                             self.stim_progress.terminate()
                             try:
-                                self.stim_progress.wait(timeout=2.0)
+                                self.stim_progress.wait(timeout=3.0)
                             except subprocess.TimeoutExpired:
                                 print("\nStim process still running; forcing kill...")
                                 self.stim_progress.kill()
                                 self.stim_progress.wait(timeout=2.0)
                             print("\nStim terminated.")
+                        else:
+                            print("\nStim stopped gracefully.")
                     else:
                         print("\nStim process already finished.")
                 except (OSError, subprocess.TimeoutExpired) as e:
@@ -1326,7 +1982,7 @@ class App(object):
 
         if self.saving:
             print("Stopping frame saving and finalizing metadata...")
-            self.saving = False
+            self._set_saving(False)
             if self.hCamera:
                 try:
                     mvsdk.CameraSetTriggerMode(self.hCamera, 0)
@@ -1392,16 +2048,6 @@ class App(object):
 
             self.status_callback = None
             self.trial_callback = None     
-
-    def setup_live_speckle_variables(self):
-        self.buffer_size = self.config['BUFFER_SIZE']
-        self.circular_buffer = np.zeros((self.buffer_size, self.height//self.bin_size, self.width//self.bin_size), dtype=np.float32)
-        self.mean_image = np.zeros((self.height//self.bin_size, self.width//self.bin_size), dtype=np.float32)
-        self.backgroundImg = np.zeros((self.height//self.bin_size, self.width//self.bin_size), dtype=np.float32)
-
-        self.current_buffer_item = 0
-        self.enable_live_speckle = False
-        self.buffer_loop_reached = False
 
     def _write_metadata(self):
         if self.session_frames_written <= 0 or not self.save_dir_ready or self.save_dir is None:
@@ -1973,14 +2619,13 @@ class App(object):
         self._report_strobe_settings()
         self._publish_ready_state()
 
-        print(f"Camera resolution: {self.width}x{self.height}")
-
-        if self.live_speck:
-            self.setup_live_speckle_variables()
+        if self.debug_camera_startup_info:
+            print(f"Camera resolution: {self.width}x{self.height}")
 
         # Let the SDK's internal image capture thread start working
         mvsdk.CameraPlay(self.hCamera)
         self._configure_frame_pool()
+        self._start_save_process()
         self._disable_gc_if_configured()
 
         # Set the capture callback function
@@ -1993,6 +2638,8 @@ class App(object):
         # main loop to print info from the camera
         while not self.quit:
             self._process_command_queue()
+            self._drain_save_stats()
+            self._publish_pending_display_frame()
             current_time = time.time()
             if self.last_stats_time is None:
                 self.last_stats_time = current_time
@@ -2018,7 +2665,7 @@ class App(object):
                 'type': 'stats',
                 'frame_count': self.frame_count,
                 'frames_written': self.frames_written,
-                'save_queue_size': self.frame_queue.qsize(),
+                'save_queue_size': self._queue_size_safe(self.frame_queue),
                 'display_queue_size': 0,
                 'average_fps': float(average_fps),
                 'sensor_temperature': sensor_temp,
@@ -2026,7 +2673,7 @@ class App(object):
 
             # Print stats, reusing the same terminal line
             msg = "Save Q: {}, Frames Saved: {}, Save Drop: {}, Frames Disp: {}, Average FPS: {:.2f}".format(
-                self.frame_queue.qsize(), self.frames_written, self.dropped_save_frames, self.frame_count, average_fps)
+                self._queue_size_safe(self.frame_queue), self.frames_written, self.dropped_save_frames, self.frame_count, average_fps)
             if _stats_written:
                 sys.stdout.write('\033[F\033[2K' + msg + '\n')
             else:
@@ -2038,8 +2685,10 @@ class App(object):
         print("\n")  # Ensure to move to a new line after quitting
         print("Main thread received quit order.")
         while not self.frame_queue.empty():
-            print("\rWaiting for queue to empty... Queue Size: {}".format(self.frame_queue.qsize()), end='')
+            print("\rWaiting for queue to empty... Queue Size: {}".format(self._queue_size_safe(self.frame_queue)), end='')
             time.sleep(0.1)
+
+        self._stop_save_process()
 
         print("\n")  # Ensure to move to a new line after quitting
         # Uninitialize camera
@@ -2071,14 +2720,10 @@ class App(object):
 
         frame_nbytes = int(FrameHead.uBytes)
         frame_slot = None
+        save_frame_data = None
         display_frame_data = None
         wants_display = self.frame_output_queue is not None and self.display_output_enabled
-        use_mutable_display = (
-            wants_display
-            and self.use_mutable_display_buffers
-            and frame_nbytes == self.frame_bytes
-            and self._display_frame_buffer_addr is not None
-        )
+        defer_display_from_pool = False
 
         if self.saving and self._frame_pool_ptrs:
             frame_slot = self._acquire_frame_slot()
@@ -2098,21 +2743,28 @@ class App(object):
             else:
                 ctypes.memmove(self._frame_pool_ptrs[frame_slot], pRawData, nbytes)
 
-            # Reuse pooled bytes for display when possible (avoid a second SDK-buffer copy).
+            # Defer display materialization to the worker main loop to keep callback hot path short.
             if wants_display:
-                if use_mutable_display:
-                    src_addr = self._frame_pool_addrs[frame_slot]
-                    if self._is_using_c_framegrab() and _cgrabcallback is not None:
-                        _cgrabcallback.fast_memcpy(self._display_frame_buffer_addr, src_addr, nbytes)
-                    else:
-                        ctypes.memmove(ctypes.c_void_p(self._display_frame_buffer_addr), ctypes.c_void_p(src_addr), nbytes)
-                    display_frame_data = self._display_frame_buffer
-                else:
-                    # Freeze an immutable snapshot directly from the pooled slot.
-                    # This avoids an extra slot->display-buffer copy before publishing.
-                    display_frame_data = bytes(self._frame_view_from_slot(frame_slot, nbytes))
+                stale_slot = None
+                with self._pending_display_lock:
+                    stale_slot = self._pending_display_slot
+                    self._pending_display_slot = int(frame_slot)
+                    self._pending_display_nbytes = int(nbytes)
+                    self._pending_display_frame_index = int(self.frame_count)
+                if stale_slot is not None:
+                    self._release_frame_slot(stale_slot)
+                defer_display_from_pool = True
+            save_frame_data = bytes(self._frame_view_from_slot(frame_slot, nbytes))
+            if not defer_display_from_pool:
+                self._release_frame_slot(frame_slot)
+                frame_slot = None
         elif wants_display:
             src_addr = ctypes.cast(pRawData, ctypes.c_void_p).value
+            use_mutable_display = (
+                self.use_mutable_display_buffers
+                and frame_nbytes == self.frame_bytes
+                and self._display_frame_buffer_addr is not None
+            )
             if use_mutable_display:
                 if self._is_using_c_framegrab() and _cgrabcallback is not None:
                     _cgrabcallback.fast_memcpy(self._display_frame_buffer_addr, src_addr, frame_nbytes)
@@ -2131,7 +2783,16 @@ class App(object):
 
         if self.saving:
             frame_timestamp = time.time()
-            queued_ref = (frame_slot, min(frame_nbytes, self.frame_bytes))
+            if frame_timestamp < self._save_warmup_deadline:
+                # Continuous-mode startup warmup: drop only from save path while
+                # keeping callback/display active.
+                if timing_active:
+                    self._record_callback_timing(time.perf_counter() - callback_t0)
+                if wants_display and display_frame_data is not None:
+                    self._put_display_frame(display_frame_data, self.frame_count)
+                self.frame_count += 1
+                return
+            queued_ref = save_frame_data
             if not self._enqueue_save_frame(
                 queued_ref,
                 self.frame_count,
@@ -2139,7 +2800,6 @@ class App(object):
                 frame_timestamp,
                 self.latest_sensor_temperature,
             ):
-                self._release_frame_slot(frame_slot)
                 self.dropped_save_frames += 1
                 if timing_active:
                     self._record_callback_timing(time.perf_counter() - callback_t0)
@@ -2157,13 +2817,12 @@ def main():
 
 def run_camera_worker(config, frame_output_queue=None, command_queue=None, status_queue=None):
     app = App(config, frame_output_queue=frame_output_queue, command_queue=command_queue, status_queue=status_queue)
-    app.save_thread.start()
     try:
         app.main()
     finally:
         app.quit = True
-        if app.save_thread.is_alive():
-            app.save_thread.join(timeout=10.0)
+        if app.save_process is not None:
+            app._stop_save_process()
         app._restore_gc_state()
 
 if __name__ == '__main__':

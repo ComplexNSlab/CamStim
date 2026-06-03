@@ -1,4 +1,5 @@
 import sys
+import os
 import threading
 import subprocess
 import yaml
@@ -105,6 +106,20 @@ def _stop_movement_sensor(proc):
             pass
 
 
+def _force_exit_if_still_running(delay_s=8.0):
+    """Fail-safe: if STOP cleanup hangs, exit the worker process anyway."""
+    try:
+        sleep(float(delay_s))
+    except Exception:
+        return
+    if stop_flag:
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(0)
+
+
 def execute_exp(exp_name, experiment_id, mouse_id, skip_teensy=False, preview=False, save_outputs=None):
     data_aq = ExperimentDAQ(experiment_id, bool_DEBUG)
     teensy_board = None
@@ -159,6 +174,10 @@ def listen_for_stop(teensy_board, exp, movement_proc):
         if line.strip().upper() == "STOP":
             print("\nReceived STOP command via subprocess.", flush=True)
             stop_flag = True
+
+            # If experiment teardown blocks, force process exit after a grace period
+            # so the parent does not need to terminate this worker.
+            threading.Thread(target=_force_exit_if_still_running, args=(8.0,), daemon=True).start()
 
             # Stop movement sensor first so it exits before Teensy is stopped.
             _stop_movement_sensor(movement_proc)

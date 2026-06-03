@@ -1,4 +1,37 @@
 
+# Version [0.3.0]
+
+# 2026-06-03
+
+- Fixed Image Processing control overlap in `camstim.py`:
+	- Corrected grid positions so `Enable dFoF`, `Highlight 0/255 Pixels`, and `Live Display Updates` no longer occupy the same cell.
+
+- Reworked frame-save pipeline architecture in `utils/simple_cam_mx.py` for high-throughput recording stability:
+	- Split responsibilities so camera callback acquisition stays minimal and save/write work runs in a dedicated save subprocess.
+	- Kept callback hot path focused on frame capture + queue handoff, with deferred display materialization moved out of the callback.
+	- Re-enabled active-path native C binning in the save worker (with automatic NumPy fallback when unsupported).
+	- Restored save-path binning timing diagnostics in the active worker when `DEBUG_SAVE_BINNING_TIMING` is enabled.
+	- Added save startup warmup gating (`SAVE_WARMUP_SECONDS`) to intentionally skip initial write frames during startup transients while keeping acquisition/display active.
+	- Hardened save startup sequencing and save-directory readiness handling to reduce early-run enqueue/write races.
+	- Added `DEBUG_CAMERA_STARTUP_INFO`-gated startup diagnostics for camera initialization and backend selection.
+
+- Restored original in-process NumPy/matplotlib Fourier Ring Correlation plotting in `camstim.py`:
+	- FRC button now prefers local plotting (`frc` + matplotlib) for interactive plot windows, matching original behavior.
+	- Worker-based FRC execution is retained as a fallback path only when local plotting fails.
+
+- Improved FRC reliability and diagnosability across `camstim.py` and `utils/frc_worker.py`:
+	- Added worker lifecycle tracking and status propagation back to GUI status text.
+	- Fixed status-queue polling so preview/FRC worker messages are drained continuously during runtime.
+	- Added matplotlib backend handling in `utils/frc_worker.py` (interactive backend attempts first, headless-safe fallback).
+
+- Added GUI fallback display for headless FRC outputs in `camstim.py`:
+	- When worker mode saves PNG figures (e.g., no interactive backend), camstim now opens an `FRC Results` window and displays saved images automatically.
+
+- Removed all remaining live speckle feature wiring from active app paths:
+	- Deleted live speckle GUI controls and processing paths from `camstim.py`.
+	- Removed live speckle worker setup/state from `utils/simple_cam_mx.py`.
+	- Removed `USE_LIVE_SPECKLE` and `BUFFER_SIZE` from `config_files/cam_config.yaml`.
+
 # Version [0.2.4]
 
 # 2026-05-29

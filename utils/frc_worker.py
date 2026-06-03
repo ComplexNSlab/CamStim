@@ -8,9 +8,31 @@ from __future__ import annotations
 
 import argparse
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
+
+
+def _configure_matplotlib_backend() -> str:
+    import matplotlib
+
+    forced_backend = os.environ.get("CAMSTIM_FRC_MPL_BACKEND", "").strip()
+    if forced_backend:
+        matplotlib.use(forced_backend, force=True)
+
+    backend = str(matplotlib.get_backend() or "")
+    if "agg" not in backend.lower():
+        return backend
+
+    for candidate in ("QtAgg", "TkAgg"):
+        try:
+            matplotlib.use(candidate, force=True)
+            return str(matplotlib.get_backend() or candidate)
+        except Exception:
+            continue
+
+    return str(matplotlib.get_backend() or backend)
 
 
 def _plot_frc_curve(frc, frc_curve, img_size, figure_title):
@@ -43,6 +65,9 @@ def _plot_frc_curve(frc, frc_curve, img_size, figure_title):
 def run_frc_worker(img1_path: Path, img2_path: Path) -> int:
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+    backend = _configure_matplotlib_backend()
+    print(f"FRC worker matplotlib backend: {backend}", flush=True)
+
     import frc
     import matplotlib.pyplot as plt
 
@@ -70,6 +95,25 @@ def run_frc_worker(img1_path: Path, img2_path: Path) -> int:
         img_size=img_size,
         figure_title="Fourier Ring Correlation (single frame)",
     )
+
+    # In headless backends, save plots to disk instead of attempting a GUI window.
+    if "agg" in str(backend).lower():
+        out_dir = Path(tempfile.gettempdir()) / f"camstim_frc_{os.getpid()}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        saved_paths = []
+        for fig_num in plt.get_fignums():
+            fig = plt.figure(fig_num)
+            title = (fig.get_label() or f"figure_{fig_num}").strip() or f"figure_{fig_num}"
+            safe_title = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in title)
+            out_path = out_dir / f"{safe_title}.png"
+            fig.savefig(out_path, dpi=150)
+            saved_paths.append(str(out_path))
+        print("FRC worker is running without an interactive display backend.", flush=True)
+        print("Saved FRC figures to:", flush=True)
+        for path in saved_paths:
+            print(path, flush=True)
+        plt.close('all')
+        return 0
 
     # Block until the user closes the plot window.
     plt.show()

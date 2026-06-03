@@ -1,7 +1,3 @@
-# Whether to use the live speckle feature
-USE_LIVE_SPECKLE: false
-BUFFER_SIZE: 10
-
 # Debug option: run experiments without initializing the Teensy board.
 DEBUG_SKIP_TEENSY: true
 
@@ -41,6 +37,9 @@ BIN_SIZE: 16
 SAVE_BATCH_FRAMES: 64
 # Upper bound on raw frame bytes per batch (helps avoid long periodic write stalls).
 SAVE_TARGET_BATCH_BYTES: 33554432
+# Skip writing this many seconds at start-of-save to avoid startup transients
+# at very high frame rates (applies regardless of trigger mode).
+SAVE_WARMUP_SECONDS: 2.0
 # Preallocated callback frame slots for save path (2048x2048x8-bit ~= 4 MiB each).
 # 256 slots ~= 1 GiB preallocated.
 FRAME_POOL_FRAMES: 1536
@@ -49,6 +48,9 @@ FRAME_POOL_FRAMES: 1536
 DISABLE_GC_DURING_ACQUIRE: true
 # Debug: measure callback wall time during active recording and store summary in metadata.
 DEBUG_CALLBACK_TIMING: true
+# Debug: print verbose camera startup diagnostics (gain scale, strobe report,
+# media/resolution capabilities, etc.) and publish detailed startup status payloads.
+DEBUG_CAMERA_STARTUP_INFO: false
 
 # Apply horizontal mirror to each grabbed frame via CameraFlipFrameBuffer.
 # Set to true when the camera is mounted so the raw image is left-right flipped.
