@@ -17,12 +17,54 @@ MpuSample mpu1;
 MpuSample mpu2;
 
 const uint8_t TICK_PIN = 2;
+const unsigned long STARTUP_HIGH_MS = 3000;
 const unsigned long TICK_PERIOD_MS = 1000;
 const unsigned long TICK_HIGH_MS = 100;
 
 unsigned long lastPulseStartMs = 0;
 unsigned long pulseHighStartMs = 0;
+unsigned long startupHighStartMs = 0;
 bool pulseActive = false;
+bool recordingEnabled = false;
+bool startupHighActive = false;
+
+void handle_command(const char *cmd) {
+  if (cmd[0] == 'S') {
+    recordingEnabled = true;
+    startupHighActive = true;
+    startupHighStartMs = millis();
+    pulseActive = false;
+    lastPulseStartMs = startupHighStartMs;
+    pulseHighStartMs = startupHighStartMs;
+    digitalWrite(TICK_PIN, HIGH);
+  } else if (cmd[0] == 'Q') {
+    recordingEnabled = false;
+    startupHighActive = false;
+    pulseActive = false;
+    digitalWrite(TICK_PIN, LOW);
+  }
+}
+
+void poll_serial_commands() {
+  static char commandBuffer[16];
+  static uint8_t commandLen = 0;
+
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (commandLen > 0) {
+        commandBuffer[commandLen] = '\0';
+        handle_command(commandBuffer);
+        commandLen = 0;
+      }
+      continue;
+    }
+
+    if (commandLen < sizeof(commandBuffer) - 1) {
+      commandBuffer[commandLen++] = c;
+    }
+  }
+}
 
 void wake_mpu(uint8_t addr) {
   Wire.beginTransmission(addr);
@@ -73,7 +115,46 @@ void setup() {
 }
 
 void loop() {
+  poll_serial_commands();
+
+  if (!recordingEnabled) {
+    delay(20);
+    return;
+  }
+
   unsigned long now = millis();
+
+  if (startupHighActive) {
+    if (now - startupHighStartMs < STARTUP_HIGH_MS) {
+      bool ok1 = read_mpu(MPU1_ADDR, mpu1);
+      bool ok2 = read_mpu(MPU2_ADDR, mpu2);
+      if (!ok1 || !ok2) {
+        delay(20);
+        return;
+      }
+
+      Serial.print(mpu1.ax); Serial.print(" ");
+      Serial.print(mpu1.ay); Serial.print(" ");
+      Serial.print(mpu1.az); Serial.print(" ");
+      Serial.print(mpu1.gx); Serial.print(" ");
+      Serial.print(mpu1.gy); Serial.print(" ");
+      Serial.print(mpu1.gz); Serial.print(" ");
+      Serial.print(mpu2.ax); Serial.print(" ");
+      Serial.print(mpu2.ay); Serial.print(" ");
+      Serial.print(mpu2.az); Serial.print(" ");
+      Serial.print(mpu2.gx); Serial.print(" ");
+      Serial.print(mpu2.gy); Serial.print(" ");
+      Serial.print(mpu2.gz); Serial.print(" ");
+      Serial.println(1);
+
+      delay(20);
+      return;
+    }
+
+    startupHighActive = false;
+    digitalWrite(TICK_PIN, LOW);
+    lastPulseStartMs = now;
+  }
 
   // Start a new pulse every second (non-blocking).
   if (!pulseActive && (now - lastPulseStartMs >= TICK_PERIOD_MS)) {

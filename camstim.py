@@ -613,6 +613,8 @@ class CameraGUI(QMainWindow):
 		self.experiment_list_cache = None
 		self.last_display_frame = None
 		self.frc_result_windows = []
+		self.qc_result_windows = []
+		self.qc_matplotlib_windows = []
 		self.select_roi_action = None
 		self.reset_roi_action = None
 		self.framegrab_backend_cb = None
@@ -728,16 +730,19 @@ class CameraGUI(QMainWindow):
 		self.frc_result_windows.append(viewer)
 
 	def _plot_latest_experiment_metadata(self):
-		if self.camera_app is None:
+		self._plot_latest_experiment_metadata_for_context(self.camera_app)
+
+	def _plot_latest_experiment_metadata_for_context(self, camera_context):
+		if camera_context is None:
 			return
 		if plt is None:
 			self.update_status('Metadata plot skipped: matplotlib is not available in this environment.')
 			return
 
-		mouse_id = (getattr(self.camera_app, 'mouse_id', None) or '').strip()
-		experiment_id = (getattr(self.camera_app, 'experiment_id', None) or '').strip()
-		exp_name = (getattr(self.camera_app, 'exp_name', None) or '').strip()
-		filename = (getattr(self.camera_app, 'active_save_filename', None) or '').strip()
+		mouse_id = (getattr(camera_context, 'mouse_id', None) or '').strip()
+		experiment_id = (getattr(camera_context, 'experiment_id', None) or '').strip()
+		exp_name = (getattr(camera_context, 'exp_name', None) or '').strip()
+		filename = (getattr(camera_context, 'active_save_filename', None) or '').strip()
 
 		if not mouse_id or not experiment_id:
 			return
@@ -794,15 +799,115 @@ class CameraGUI(QMainWindow):
 
 		fig.suptitle(title_text)
 		fig.tight_layout()
-		plt.show(block=False)
+
+		backend_name = ''
 		try:
-			fig.canvas.draw_idle()
-			plt.pause(0.001)
+			backend_name = str(plt.get_backend() or '')
 		except Exception:
-			pass
+			backend_name = ''
+		is_non_interactive = any(token in backend_name.lower() for token in ('agg', 'pdf', 'svg', 'ps', 'template'))
+		opened_interactive = False
+		opened_via_qt_canvas = False
+
+		if not is_non_interactive:
+			try:
+				plt.show(block=False)
+				fig.canvas.draw_idle()
+				plt.pause(0.001)
+				opened_interactive = True
+			except Exception as exc:
+				self.update_status(f'Metadata interactive plot backend failed ({backend_name}): {exc}. Trying Qt canvas fallback.')
+
+		if not opened_interactive:
+			opened_via_qt_canvas = self._show_qc_matplotlib_figure(fig, f"Experiment Summary - {title_text}")
+			if opened_via_qt_canvas:
+				opened_interactive = True
+				self.update_status(f'Opened metadata summary in Qt matplotlib canvas (backend: {backend_name or "unknown"}).')
+
+		if not opened_interactive:
+			image_path = meta_path.with_name(f"{filename}_qc_summary.png")
+			try:
+				fig.savefig(str(image_path), dpi=150, bbox_inches='tight')
+			except Exception as exc:
+				self.update_status(f'Failed to save metadata summary plot ({image_path}): {exc}.')
+			else:
+				self._show_qc_saved_figure(image_path)
+				self.update_status(f'Saved metadata summary plot to {image_path} (backend: {backend_name or "unknown"}).')
+
+		if not opened_via_qt_canvas:
+			try:
+				plt.close(fig)
+			except Exception:
+				pass
 
 		self._last_plotted_metadata_key = plot_key
-		self.update_status(f'Opened metadata summary plot from {meta_path}.')
+		if opened_interactive:
+			self.update_status(f'Opened metadata summary plot from {meta_path}.')
+		else:
+			self.update_status(f'Metadata summary saved from {meta_path}; interactive window was unavailable.')
+
+	def _show_qc_matplotlib_figure(self, fig, window_title):
+		try:
+			from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+			from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+		except Exception:
+			try:
+				from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+				from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+			except Exception:
+				return False
+
+		try:
+			viewer = QWidget(self, Qt.WindowType.Window)
+			viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+			viewer.setWindowTitle(window_title)
+
+			layout = QVBoxLayout()
+			viewer.setLayout(layout)
+
+			canvas = FigureCanvas(fig)
+			toolbar = NavigationToolbar(canvas, viewer)
+			layout.addWidget(toolbar)
+			layout.addWidget(canvas)
+			canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+			canvas.setFocus()
+
+			viewer.resize(1100, 860)
+			viewer.show()
+			self.qc_matplotlib_windows.append((viewer, toolbar, canvas, fig))
+			return True
+		except Exception:
+			return False
+
+	def _show_qc_saved_figure(self, image_path):
+		path_obj = Path(image_path)
+		if not path_obj.is_file():
+			return
+
+		viewer = QWidget(self, Qt.WindowType.Window)
+		viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+		viewer.setWindowTitle('Experiment QC Results')
+
+		layout = QVBoxLayout()
+		viewer.setLayout(layout)
+
+		title_label = QLabel(path_obj.name)
+		layout.addWidget(title_label)
+
+		image_label = QLabel()
+		image_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+		pixmap = QPixmap(str(path_obj))
+		if pixmap.isNull():
+			image_label.setText(f'Could not load image: {path_obj}')
+		else:
+			if pixmap.width() > 1000:
+				pixmap = pixmap.scaledToWidth(1000, Qt.TransformationMode.SmoothTransformation)
+			image_label.setPixmap(pixmap)
+		layout.addWidget(image_label)
+
+		viewer.resize(1060, 840)
+		viewer.show()
+		self.qc_result_windows.append(viewer)
 
 	def init_ui(self):
 		self.setWindowTitle(f'camstim {self.app_version}')
@@ -1811,6 +1916,7 @@ class CameraGUI(QMainWindow):
 
 	def stop_camera(self):
 		if self.camera_app:
+			stopped_camera_app = self.camera_app
 			self.video_label.set_roi_mode_enabled(False)
 			self.disable_hardware_trigger()
 			if self.teensy_controller is not None:
@@ -1829,6 +1935,8 @@ class CameraGUI(QMainWindow):
 			self.camera_app.stop()
 			self.timer.stop()
 			self.stats_timer.stop()
+			if self.plot_experiment_qc:
+				self._plot_latest_experiment_metadata_for_context(stopped_camera_app)
 			self.camera_app = None
 
 		self.start_btn.setEnabled(True)

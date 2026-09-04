@@ -485,6 +485,29 @@ def _save_worker_loop(config, frame_queue, control_queue, status_queue, stats_qu
         session_sys_clock_timestamps = []
         session_sensor_temperatures = []
 
+    def _drain_frame_queue_into_batch(timeout_s=0.0):
+        drained = 0
+        while True:
+            try:
+                if drained == 0 and timeout_s and timeout_s > 0:
+                    frame_data, count, timestamp, sys_stamp, sensor_temp = frame_queue.get(timeout=float(timeout_s))
+                else:
+                    frame_data, count, timestamp, sys_stamp, sensor_temp = frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            write_batch.append(frame_data)
+            _save_preview_tiff(frame_data)
+            ts_batch.append(timestamp)
+            sys_ts_batch.append(sys_stamp)
+            temp_batch.append(None if sensor_temp is None else float(sensor_temp))
+            drained += 1
+
+            if len(write_batch) >= flush_every_n_frames:
+                _flush_batch(force_flush=False)
+
+        return drained
+
     while True:
         try:
             while True:
@@ -494,6 +517,7 @@ def _save_worker_loop(config, frame_queue, control_queue, status_queue, stats_qu
                 name = cmd.get('name')
                 payload = cmd.get('payload') or {}
                 if name == 'start_save':
+                    _drain_frame_queue_into_batch(timeout_s=0.0)
                     _flush_batch(force_flush=True)
                     _report_and_reset_binning_timing()
                     _write_metadata_and_close()
@@ -520,15 +544,17 @@ def _save_worker_loop(config, frame_queue, control_queue, status_queue, stats_qu
 
                 elif name == 'stop_save':
                     callback_timing_info = payload.get('callback_timing') if isinstance(payload, dict) else None
-                    saving = False
+                    _drain_frame_queue_into_batch(timeout_s=0.1)
                     _flush_batch(force_flush=True)
+                    saving = False
                     _report_and_reset_binning_timing()
                     _write_metadata_and_close()
 
                 elif name == 'quit':
                     callback_timing_info = payload.get('callback_timing') if isinstance(payload, dict) else None
-                    saving = False
+                    _drain_frame_queue_into_batch(timeout_s=0.1)
                     _flush_batch(force_flush=True)
+                    saving = False
                     _report_and_reset_binning_timing()
                     _write_metadata_and_close()
                     return

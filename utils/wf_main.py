@@ -49,6 +49,7 @@ def _start_movement_sensor(experiment_id, mouse_id, exp, preview=False):
 
     movement_cfg = _load_yaml(CONFIG_DIR / 'movementSensor.yaml')
     sensor_port = movement_cfg.get('MOVEMENT_SENSOR_PORT', movement_cfg.get('port'))
+    sensor_baud = int(movement_cfg.get('MOVEMENT_SENSOR_BAUD', movement_cfg.get('baud', 115200)))
     plot_flag = '1' if _as_bool(movement_cfg.get('PLOT', False)) else '0'
     window_seconds = movement_cfg.get('WINDOW_SECONDS', 30)
     if not sensor_port:
@@ -66,6 +67,7 @@ def _start_movement_sensor(experiment_id, mouse_id, exp, preview=False):
         '--window-seconds', str(window_seconds),
         '--file', str(output_csv),
         '--port', str(sensor_port),
+        '--baud', str(sensor_baud),
     ]
     proc = subprocess.Popen(
         cmd,
@@ -73,7 +75,10 @@ def _start_movement_sensor(experiment_id, mouse_id, exp, preview=False):
         stdin=subprocess.PIPE,
         text=True,
     )
-    print(f'\nMovement sensor started on {sensor_port}, saving to {output_csv}.')
+    if proc.stdin is not None:
+        proc.stdin.write('START_RECORDING\n')
+        proc.stdin.flush()
+    print(f'\nMovement sensor started on {sensor_port} @ {sensor_baud}, saving to {output_csv}.')
     return proc
 
 
@@ -83,6 +88,8 @@ def _stop_movement_sensor(proc):
 
     try:
         if proc.poll() is None and proc.stdin is not None:
+            proc.stdin.write('STOP_RECORDING\n')
+            proc.stdin.flush()
             proc.stdin.write('STOP\n')
             proc.stdin.flush()
 

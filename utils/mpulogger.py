@@ -2,7 +2,7 @@
 """MPU serial logger with optional plotting and graceful shutdown support.
 
 Graceful stop methods:
-- write "STOP" to stdin
+- write "START_RECORDING", "STOP_RECORDING", or "STOP" to stdin
 - send SIGINT/SIGTERM
 - close plot window (when plotting)
 """
@@ -21,6 +21,19 @@ from datetime import datetime
 from pathlib import Path
 
 import serial
+
+
+def _send_device_command(ser: serial.Serial, command: str) -> None:
+    ser.write(f'{command}\n'.encode())
+    ser.flush()
+
+
+def _stop_device_recording(ser: serial.Serial) -> None:
+    _send_device_command(ser, 'Q')
+
+
+def _start_device_recording(ser: serial.Serial) -> None:
+    _send_device_command(ser, 'S')
 
 
 class OnlineZScore:
@@ -64,11 +77,19 @@ def _install_signal_handlers(stop_event: threading.Event) -> None:
     signal.signal(signal.SIGTERM, _handler)
 
 
-def _start_stdin_listener(stop_event: threading.Event) -> threading.Thread:
+def _start_stdin_listener(stop_event: threading.Event, ser: serial.Serial) -> threading.Thread:
     def _listen() -> None:
         try:
             for line in sys.stdin:
-                if line.strip().upper() == 'STOP':
+                command = line.strip().upper()
+                if command == 'START_RECORDING':
+                    _start_device_recording(ser)
+                    print('Received START_RECORDING command.', flush=True)
+                elif command == 'STOP_RECORDING':
+                    _stop_device_recording(ser)
+                    print('Received STOP_RECORDING command.', flush=True)
+                elif command == 'STOP':
+                    _stop_device_recording(ser)
                     print('Received STOP command.', flush=True)
                     stop_event.set()
                     break
@@ -81,12 +102,15 @@ def _start_stdin_listener(stop_event: threading.Event) -> threading.Thread:
     return t
 
 
+_NUMBER_RE = re.compile(r'[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?')
+
+
 def _parse_sensor_line(line: str):
-    # Accept whitespace/comma/mixed formatting by extracting signed integers.
-    nums = re.findall(r'-?\d+', line.replace('\x00', ''))
+    # Accept whitespace/comma/mixed formatting by extracting signed numeric tokens.
+    nums = _NUMBER_RE.findall(line.replace('\x00', ''))
     if len(nums) >= 13:
         try:
-            ax1, ay1, az1, gx1, gy1, gz1, ax2, ay2, az2, gx2, gy2, gz2, t_sensor = map(int, nums[:13])
+            ax1, ay1, az1, gx1, gy1, gz1, ax2, ay2, az2, gx2, gy2, gz2, t_sensor = map(float, nums[:13])
         except ValueError:
             return None
         return {
@@ -108,7 +132,7 @@ def _parse_sensor_line(line: str):
     if len(nums) < 7:
         return None
     try:
-        ax1, ay1, az1, gx1, gy1, gz1, t_sensor = map(int, nums[:7])
+        ax1, ay1, az1, gx1, gy1, gz1, t_sensor = map(float, nums[:7])
     except ValueError:
         return None
     return {
@@ -136,14 +160,33 @@ def _logger_loop(
     sample_buffer: deque,
     buffer_lock: threading.Lock,
 ) -> None:
+    parsed_rows = 0
+    dropped_rows = 0
+    last_parse_warning_t = time.monotonic()
+    last_nonempty_line = ''
+
     while not stop_event.is_set():
         raw = ser.readline()
         if not raw:
             time.sleep(0.001)
             continue
 
-        parsed = _parse_sensor_line(raw.decode(errors='ignore').strip())
+        line = raw.decode(errors='replace').strip()
+        if line:
+            last_nonempty_line = line
+
+        parsed = _parse_sensor_line(line)
         if parsed is None:
+            dropped_rows += 1
+            now = time.monotonic()
+            if now - last_parse_warning_t >= 5.0:
+                preview = last_nonempty_line[:180] if last_nonempty_line else '<none>'
+                print(
+                    f"MPU parse warning: parsed_rows={parsed_rows}, dropped_rows={dropped_rows}, "
+                    f"last_line='{preview}'",
+                    flush=True,
+                )
+                last_parse_warning_t = now
             continue
 
         ax1 = parsed['ax1']
@@ -162,6 +205,7 @@ def _logger_loop(
         t = datetime.now().timestamp()
         writer.writerow([t, ax1, ay1, az1, gx1, gy1, gz1, ax2, ay2, az2, gx2, gy2, gz2, t_sensor])
         csv_file.flush()
+        parsed_rows += 1
         with buffer_lock:
             # Keep live plot behavior on MPU1 for continuity with previous UI.
             sample_buffer.append((t, ax1, ay1, az1, t_sensor))
@@ -254,13 +298,19 @@ def main() -> int:
     args = parse_args()
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)
-    _start_stdin_listener(stop_event)
 
     output_file = Path(args.file) if args.file else Path(datetime.now().strftime('mpu6050_%Y%m%d_%H%M%S.csv'))
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    ser = serial.Serial(args.port, args.baud, timeout=0)
+    # Use a finite timeout to avoid partial-line churn with non-blocking readline.
+    ser = serial.Serial(args.port, args.baud, timeout=0.2)
+    # Arduino-class boards often reset on serial open; give firmware time to boot
+    # before sending control commands.
+    time.sleep(2.0)
     ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    _stop_device_recording(ser)
+    _start_stdin_listener(stop_event, ser)
 
     csv_file = output_file.open('w', newline='')
     writer = csv.writer(csv_file)
@@ -276,7 +326,9 @@ def main() -> int:
     buffer_lock = threading.Lock()
 
     print(f"Saving to {output_file}", flush=True)
+    print(f"Serial: {args.port} @ {args.baud}", flush=True)
     print(f"Plotting: {'ON' if args.plot else 'OFF'}", flush=True)
+    print('Recording initialized in STOPPED state.', flush=True)
 
     logger_thread = threading.Thread(
         target=_logger_loop,

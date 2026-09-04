@@ -1,5 +1,7 @@
 #port: "COM7" # port the teensy board is connected to via USB
 port: "/dev/tty.usbserial-A50285BI"
+# Serial baud for movement sensor stream.
+baud: 115200
 # Enable live plotting in mpulogger (true/false).
 PLOT: true
 # Plot time window in seconds.
