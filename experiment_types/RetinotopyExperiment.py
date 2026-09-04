@@ -132,6 +132,7 @@ class RetinotopyExperiment(BaseExperiment):
                                             fullscr=False,
                                             waitBlanking=True,
                                             useFBO=False)
+        self.measure_actual_refresh_rate()
         
         self.stim = psychopy.visual.ImageStim(
             self.window,

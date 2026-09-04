@@ -32,6 +32,8 @@ class BaseExperiment(ABC):
         self.monitor = None
         self.monitor_settings = None
         self.window = None
+        self.measured_refresh_rate = None
+        self.measured_frame_period = None
 
         self.exp_parameters = None
         self.exp_parameters_filename = self.resolve_config_path(exp_config_filename)
@@ -69,6 +71,7 @@ class BaseExperiment(ABC):
         self.daq.ni_log_filename = self.ni_log_filename
 
         self.create_photodiode_square()
+        self.measure_actual_refresh_rate()
 
         # Common exp log    
         self.exp_log.log['daq_sampling_rate'] = self.daq.sampling_rate
@@ -202,6 +205,70 @@ class BaseExperiment(ABC):
 
         
         #self.window.gammaRamp = monitor_gamma_lut
+
+    def measure_actual_refresh_rate(self):
+        if self.window is None:
+            return None
+
+        measured_refresh_rate = None
+        measured_frame_period = None
+
+        try:
+            measured_refresh_rate = self.window.getActualFrameRate(
+                nIdentical=20,
+                nMaxFrames=max(int(self.refresh_rate * 2), 120),
+                nWarmUpFrames=20,
+                threshold=1,
+            )
+        except Exception as exc:
+            self.update_status('Unable to measure actual refresh rate: {}'.format(exc))
+
+        try:
+            measured_frame_period = getattr(self.window, 'monitorFramePeriod', None)
+            if measured_frame_period:
+                measured_frame_period = float(measured_frame_period)
+            else:
+                measured_frame_period = None
+        except Exception:
+            measured_frame_period = None
+
+        if measured_refresh_rate is None and measured_frame_period:
+            measured_refresh_rate = 1.0 / measured_frame_period
+
+        if measured_refresh_rate is not None:
+            measured_refresh_rate = float(measured_refresh_rate)
+
+        self.measured_refresh_rate = measured_refresh_rate
+        self.measured_frame_period = measured_frame_period
+
+        if hasattr(self, 'exp_log') and self.exp_log is not None:
+            self.exp_log.log['configured_refresh_rate_hz'] = float(self.refresh_rate)
+            self.exp_log.log['measured_refresh_rate_hz'] = measured_refresh_rate
+            self.exp_log.log['measured_frame_period_s'] = measured_frame_period
+
+        if measured_refresh_rate is None:
+            self.update_status(
+                'Configured refresh rate: {:.3f} Hz. PsychoPy could not determine the actual rate.'.format(
+                    float(self.refresh_rate)
+                )
+            )
+            return None
+
+        refresh_delta = abs(measured_refresh_rate - float(self.refresh_rate))
+        if hasattr(self, 'exp_log') and self.exp_log is not None:
+            self.exp_log.log['refresh_rate_delta_hz'] = refresh_delta
+
+        status_message = (
+            'Configured refresh rate: {:.3f} Hz. Measured refresh rate: {:.3f} Hz.'.format(
+                float(self.refresh_rate),
+                measured_refresh_rate,
+            )
+        )
+        if refresh_delta > 1.0:
+            status_message += ' Refresh-rate mismatch detected.'
+        self.update_status(status_message)
+
+        return measured_refresh_rate
 
 
     def create_photodiode_square(self):

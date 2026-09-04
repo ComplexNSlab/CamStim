@@ -1,4 +1,24 @@
 
+# Version [0.3.2]
+
+# 2026-09-04
+
+- Fixed retinotopy refresh-rate handling (`external/WarpedVisualStim/WarpedVisualStim/MonitorSetup.py`, `experiment_types/RetinotopyExperiment.py`):
+	- WarpedVisualStim monitor setup now preserves the configured `monitor_refresh_rate` instead of forcing 60 Hz.
+	- Retinotopy timing calculations now use the YAML-configured refresh rate consistently for sweep and flicker scheduling.
+
+- Added runtime PsychoPy refresh-rate verification (`core/BaseExperiment.py`, `experiment_types/RetinotopyExperiment.py`):
+	- Experiments now measure actual display refresh after window creation when PsychoPy can determine it.
+	- Logs now include configured vs measured refresh values and warn when they differ materially.
+
+# 2026-06-03
+
+- Added explicit movement-sensor recording control (`utils/mpu6050plot/mpu6050plot.ino`, `utils/mpulogger.py`, `utils/wf_main.py`):
+	- Arduino MPU firmware now accepts `S` / `Q` serial commands to start and stop sample emission.
+	- `mpulogger.py` now initializes the device in a stopped state and forwards `START_RECORDING` / `STOP_RECORDING` commands to the sensor controller.
+	- Experiment startup now ensures movement logging is stopped first, then starts recording in the normal experiment start order.
+	- Experiment shutdown now stops movement recording before Teensy shutdown.
+
 # Version [0.3.1]
 
 # 2026-06-03

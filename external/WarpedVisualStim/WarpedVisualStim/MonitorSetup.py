@@ -110,7 +110,7 @@ class Monitor(object):
         self.gamma = gamma
         self.gamma_grid = gamma_grid
         self.luminance = luminance
-        self.refresh_rate = 60
+        self.refresh_rate = float(refresh_rate)
 
         # distance form projection point of the eye to bottom of the monitor
         self.C2B_cm = self.mon_height_cm - self.C2T_cm
